@@ -16,6 +16,10 @@ The project is split into three crates:
   `bevy_nds`. It contains no FFI, no allocator and no panic handler: just
   components and systems.
 
+<p align="center">
+  <img src="docs/cube-demo.png" alt="The hardware-rendered 3D cube on the top screen with the live HUD below" width="320">
+</p>
+
 ```
         ┌────────────────────────────┐
         │ Bevy 3D on Nintendo DS      │
