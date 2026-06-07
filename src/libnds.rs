@@ -5,6 +5,7 @@
 //! console, read the input keys and synchronise to the display refresh.
 
 #![allow(non_camel_case_types)]
+#![allow(dead_code)]
 
 use core::ffi::{c_char, c_int, c_void};
 
@@ -23,8 +24,8 @@ unsafe extern "C" {
     pub fn consoleDemoInit() -> *mut c_void;
     /// Clear the active console.
     pub fn consoleClear();
-    /// printf to the active console (integer-only variant from libnds).
-    pub fn iprintf(fmt: *const c_char, ...) -> c_int;
+    /// printf to the active console (libnds redirects stdout to the console).
+    pub fn printf(fmt: *const c_char, ...) -> c_int;
     /// Block until the next vertical blank (~60 Hz), pacing the game loop.
     pub fn swiWaitForVBlank();
     /// Latch the current button state; call once per frame before reading keys.

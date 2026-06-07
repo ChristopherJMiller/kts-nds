@@ -31,12 +31,14 @@ fn main() {
     // BlocksDS ARM9 crt0 + linker script.
     println!("cargo:rustc-link-arg=-specs={blocksds}/sys/crts/ds_arm9.specs");
 
-    // libnds (ARM9 build) and newlib C library. Grouped to resolve the
-    // circular references between them.
+    // libnds (ARM9 build), newlib C library and libgcc (provides the atomic
+    // barrier helpers the BlocksDS specs alias). Grouped to resolve circular
+    // references between them.
     println!("cargo:rustc-link-search=native={blocksds}/libs/libnds/lib");
     println!("cargo:rustc-link-arg=-Wl,--start-group");
     println!("cargo:rustc-link-arg=-lnds9");
     println!("cargo:rustc-link-arg=-lc");
+    println!("cargo:rustc-link-arg=-lgcc");
     println!("cargo:rustc-link-arg=-Wl,--end-group");
 
     println!("cargo:rerun-if-env-changed=BLOCKSDS");

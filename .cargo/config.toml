@@ -11,10 +11,11 @@ target = "armv5te-nintendo-ds.json"
 [unstable]
 build-std = ["core", "compiler_builtins", "alloc"]
 build-std-features = ["compiler-builtins-mem"]
+# Newer nightly cargo requires opting in to JSON target spec files.
+json-target-spec = true
 
 [target.armv5te-nintendo-ds]
 rustflags = [
-  # Single ARM9 core: let portable-atomic provide CAS without outline atomics.
+  # Single ARM9 core; portable-atomic gets CAS from our critical-section impl.
   "--cfg", "portable_atomic_no_outline_atomics",
-  "--cfg", "portable_atomic_unsafe_assume_single_core",
 ]

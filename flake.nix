@@ -52,7 +52,7 @@
             rustToolchain
             blocksds
             pkgs.just
-            pkgs.melonDS
+            pkgs.melonds
             # bindgen / general build helpers
             pkgs.pkg-config
           ];

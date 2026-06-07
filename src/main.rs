@@ -45,7 +45,7 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     // Best-effort: show that we panicked, then spin.
     unsafe {
         libnds::consoleClear();
-        libnds::iprintf(c"PANIC".as_ptr());
+        libnds::printf(c"PANIC".as_ptr());
     }
     let _ = info;
     loop {
@@ -136,17 +136,17 @@ fn render(query: Query<&Position, With<Player>>) {
     unsafe {
         libnds::consoleClear();
         // Title on the top row.
-        libnds::iprintf(c"  Bevy ECS on Nintendo DS".as_ptr());
+        libnds::printf(c"  Bevy ECS on Nintendo DS".as_ptr());
         for pos in &query {
             // ANSI cursor move to (row, col) is 1-based, then draw the marker.
-            libnds::iprintf(
+            libnds::printf(
                 c"\x1b[%d;%dH@".as_ptr(),
                 (pos.y + 1) as c_int,
                 (pos.x + 1) as c_int,
             );
         }
         // Hint line at the bottom.
-        libnds::iprintf(c"\x1b[24;0HD-pad: move the @".as_ptr());
+        libnds::printf(c"\x1b[24;0HD-pad: move the @".as_ptr());
     }
 }
 

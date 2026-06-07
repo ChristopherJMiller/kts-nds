@@ -34,10 +34,10 @@ rom profile="debug": (_build profile)
     : "${BLOCKSDS:?Run 'nix develop' first so BLOCKSDS is set}"
     elf="{{target_dir}}/{{profile}}/bevy-ds.elf"
     ndstool="$BLOCKSDS/tools/ndstool/ndstool"
-    arm7="$BLOCKSDS/sys/arm7/main_core/arm7.elf"
+    arm7="$BLOCKSDS/sys/arm7/main_core/arm7_minimal.elf"
     [ -f "$arm7" ] || arm7="$BLOCKSDS/sys/arm7/main_core/arm7_maxmod.elf"
     "$ndstool" -c "{{rom}}" -7 "$arm7" -9 "$elf" \
-        -t "Bevy DS" -h 0x200
+        -h 0x200 -g BEVY ME "Bevy DS"
     echo "Wrote {{rom}} from $elf"
 
 # Build a ROM (debug by default) and run it in the melonDS emulator.
