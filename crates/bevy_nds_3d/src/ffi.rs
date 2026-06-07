@@ -30,6 +30,10 @@ const REG_POWERCNT: *mut u16 = 0x0400_0304 as *mut u16;
 pub const MODE_0_3D: u32 = (1 << 16) | (1 << 8) | (1 << 3);
 /// `POWER_3D_CORE | POWER_MATRIX` (the low 16 bits actually written to POWERCNT).
 const POWER_3D: u16 = (1 << 3) | (1 << 2);
+/// `POWER_SWAP_LCDS` (`BIT(15)`): when set the main engine drives the **top**
+/// LCD, when clear it drives the **bottom** (the sub engine always takes the
+/// other). See `<nds/system.h>` (`lcdMainOnTop` / `lcdMainOnBottom`).
+const POWER_SWAP_LCDS: u16 = 1 << 15;
 
 // --- Geometry Engine command registers (see <nds/arm9/video.h>) --------------
 
@@ -93,6 +97,25 @@ pub mod gl {
             let p = read_volatile(REG_POWERCNT) | POWER_3D;
             write_volatile(REG_POWERCNT, p);
             write_volatile(REG_DISPCNT, MODE_0_3D);
+        }
+    }
+
+    /// Choose which physical LCD the main engine (and thus the 3D output) drives.
+    /// `true` puts it on the top screen, `false` on the bottom; the sub engine
+    /// (text consoles) always takes the other screen. This is a single coupled
+    /// hardware toggle — both engines swap together.
+    ///
+    /// # Safety
+    /// Must run on the DS with the display hardware initialised.
+    pub unsafe fn set_main_lcd_on_top(on_top: bool) {
+        unsafe {
+            let p = read_volatile(REG_POWERCNT);
+            let p = if on_top {
+                p | POWER_SWAP_LCDS
+            } else {
+                p & !POWER_SWAP_LCDS
+            };
+            write_volatile(REG_POWERCNT, p);
         }
     }
 

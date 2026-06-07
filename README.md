@@ -4,26 +4,38 @@ Running the [Bevy](https://bevyengine.org/) engine's ECS on the **Nintendo DS**,
 packaged into a bootable `.nds` ROM and previewed on an emulator — all from a
 reproducible Nix dev shell.
 
-The project is split into two crates:
+The project is split into three crates:
 
 - **`bevy_nds`** (`crates/bevy_nds`) — a reusable library that wires Bevy's
   `no_std` ECS/App core to the DS hardware (via [libnds](https://github.com/blocksds/libnds))
   and exposes it as idiomatic Bevy **plugins**, **components** and **resources**.
+- **`bevy_nds_3d`** (`crates/bevy_nds_3d`) — an additive rendering backend that
+  drives the DS **hardware 3D engine**, exposing `Transform3d`, `DsMesh` and a
+  `Camera3d` resource. Depends on `bevy_nds` for the platform layer.
 - **`bevy-ds`** (the root crate) — the game, a *pure-Bevy consumer* of
   `bevy_nds`. It contains no FFI, no allocator and no panic handler: just
   components and systems.
 
 ```
         ┌────────────────────────────┐
-        │ Bevy ECS on Nintendo DS    │   top screen  (main 2D engine)
-        │ t=  12s   held=0           │   ← live HUD from the Time/input resources
+        │ Bevy 3D on Nintendo DS      │
+        │ t=  12s  fps=60  cube=bottom│   text console (sub engine)
+        │                            │   ← live HUD from the Time/Fps/input resources
+        │ D-pad: move (crosses screens)│
+        │ ABXY: rotate the cube       │
         ├────────────────────────────┤
-        │                            │
-        │             @              │   bottom screen (sub 2D engine)
-        │                            │   ← Bevy entity, moved by the D-pad
-        │ D-pad: move the @          │
+        │        ▟█▙                  │   3D engine (main engine + 3D core)
+        │       ▟███▙                 │   ← a Bevy entity: hardware-rendered cube
+        │        ▜█▛                  │     the D-pad moves, ABXY rotate
         └────────────────────────────┘
 ```
+
+The 3D core is hard-wired to the DS **main** 2D engine; a single coupled bit
+(`POWER_SWAP_LCDS`) chooses which physical LCD the main engine drives, and the
+sub engine always takes the other. So the cube and the text console live on
+*opposite* screens, and a `Display3d` resource flips which is which. In the demo,
+walking the cube off the edge of one screen swaps the LCDs, so the cube reappears
+on the other glass and the HUD rides along to the screen the cube just left.
 
 ## How it works
 
@@ -40,6 +52,7 @@ think about the hardware:
 | Vertical-blank @ ~60 Hz  | a `set_runner` frame loop + a real `Time` resource (hardware timer)  | `TimePlugin`        |
 | —                        | a smoothed `Fps` resource for diagnostics                            | `DiagnosticsPlugin` |
 | Tiled text background    | `Glyph` / `DsText` + `TilePos`, drawn by an extraction system        | `RenderPlugin`      |
+| 3D geometry engine       | `Transform3d` + `DsMesh` + a `Camera3d` resource (in `bevy_nds_3d`)  | `Ds3dPlugin`        |
 
 `DsPlugins` bundles them all; `bevy_nds::run(app)` installs the runner and owns
 the frame loop (`swiWaitForVBlank` → `app.update()`).
@@ -181,7 +194,8 @@ pub extern "C" fn main() -> core::ffi::c_int {
 }
 ```
 
-See `src/main.rs` for the full example (two screens, D-pad movement and a HUD).
+See `src/main.rs` for the full example: a hardware 3D cube the D-pad walks
+between both screens (`Display3d` LCD swap), ABXY rotation, and a live HUD.
 
 ## Build details
 

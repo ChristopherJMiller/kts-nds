@@ -39,6 +39,7 @@ use core::f32::consts::TAU;
 use bevy_app::prelude::*;
 use bevy_ecs::prelude::*;
 use bevy_math::Vec3;
+use bevy_nds::DsScreen;
 
 mod ffi;
 
@@ -198,7 +199,7 @@ impl Transform3d {
 }
 
 /// The (single) 3D camera. The DS has one projection matrix and the 3D core
-/// only drives the top screen, so this is a resource, not a component.
+/// only drives one screen at a time, so this is a resource, not a component.
 #[derive(Resource, Clone, Copy)]
 pub struct Camera3d {
     /// Vertical field of view, in degrees.
@@ -220,6 +221,36 @@ impl Default for Camera3d {
             // Pulled back along +Z, looking toward the origin.
             position: Vec3::new(0.0, 0.0, 3.0),
         }
+    }
+}
+
+/// Which physical LCD shows the 3D output.
+///
+/// The DS 3D core is wired to the *main* 2D engine, and a single hardware bit
+/// selects which LCD the main engine drives (the *sub* engine — the text
+/// consoles — always takes the other). So this picks the 3D screen, but the two
+/// engines swap *together*: moving 3D to one screen sends the text to the other.
+/// Mutate it at runtime and the change is applied automatically.
+#[derive(Resource, Clone, Copy, PartialEq, Eq)]
+pub struct Display3d {
+    /// The screen the 3D output is drawn on.
+    pub screen: DsScreen,
+}
+
+impl Default for Display3d {
+    fn default() -> Self {
+        // Matches the DS power-on default: main engine -> top screen.
+        Self {
+            screen: DsScreen::Top,
+        }
+    }
+}
+
+/// Apply the [`Display3d`] LCD assignment whenever it changes (and once at
+/// startup, since `Added` resources count as changed).
+fn apply_display(display: Res<Display3d>) {
+    if display.is_changed() {
+        unsafe { gl::set_main_lcd_on_top(display.screen == DsScreen::Top) };
     }
 }
 
@@ -290,20 +321,22 @@ fn render_3d(camera: Res<Camera3d>, meshes: Query<(&Transform3d, &DsMesh)>) {
 }
 
 /// Drives the DS hardware 3D engine, rendering [`DsMesh`] + [`Transform3d`]
-/// entities to the top screen through a [`Camera3d`]. Add it *after*
-/// `bevy_nds`'s `DsPlugins`.
+/// entities through a [`Camera3d`]. The 3D output goes to the screen selected by
+/// the [`Display3d`] resource (top by default). Add it *after* `bevy_nds`'s
+/// `DsPlugins`.
 pub struct Ds3dPlugin;
 
 impl Plugin for Ds3dPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<Camera3d>()
+            .init_resource::<Display3d>()
             .add_systems(Startup, init_3d)
-            .add_systems(Last, render_3d);
+            .add_systems(Last, (apply_display, render_3d).chain());
     }
 }
 
 /// Common imports for games using the 3D backend.
 pub mod prelude {
-    pub use crate::{Camera3d, Ds3dPlugin, DsMesh, Transform3d, Vertex};
+    pub use crate::{Camera3d, Display3d, Ds3dPlugin, DsMesh, Transform3d, Vertex};
     pub use bevy_math::Vec3;
 }
