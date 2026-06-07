@@ -52,7 +52,13 @@
             rustToolchain
             blocksds
             pkgs.just
+            # Primary emulator for interactive use.
             pkgs.melonds
+            # Headless preview: desmume (SDL frontend) + Xvfb + ImageMagick let
+            # `just preview` boot the ROM and capture a screenshot with no GUI.
+            pkgs.desmume
+            pkgs.xvfb
+            pkgs.imagemagick
             # bindgen / general build helpers
             pkgs.pkg-config
           ];

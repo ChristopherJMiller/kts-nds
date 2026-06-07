@@ -45,6 +45,26 @@ rom profile="debug": (_build profile)
 run profile="debug": (rom profile)
     melonDS "{{rom}}"
 
+# Headlessly boot the ROM in desmume and save a screenshot — handy for quickly
+# seeing what the ROM renders without a GUI (also usable in CI).
+# Usage: `just preview` or `just preview release`. Output: preview.png
+# Override with OUT=foo.png, WAIT=12 (seconds), DISP=:99.
+preview profile="debug": (rom profile)
+    #!/usr/bin/env bash
+    set -euo pipefail
+    out="${OUT:-preview.png}"
+    wait_s="${WAIT:-10}"
+    disp="${DISP:-:99}"
+    echo "Booting {{rom}} in desmume (headless) on $disp …"
+    timeout $((wait_s + 20)) Xvfb "$disp" -screen 0 256x384x24 >/tmp/bevy-ds-xvfb.log 2>&1 &
+    sleep 2
+    DISPLAY="$disp" SDL_VIDEODRIVER=x11 \
+        timeout $((wait_s + 6)) desmume-cli --nojoy "{{rom}}" >/tmp/bevy-ds-emu.log 2>&1 &
+    sleep "$wait_s"
+    DISPLAY="$disp" import -window root "$out"
+    echo "Saved $out (emulator log: /tmp/bevy-ds-emu.log)"
+    wait 2>/dev/null || true
+
 # Remove build artifacts and the generated ROM.
 clean:
     cargo clean
