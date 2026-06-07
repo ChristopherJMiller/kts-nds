@@ -34,6 +34,7 @@
 
 extern crate alloc;
 
+mod diagnostics;
 mod ffi;
 mod input;
 mod render;
@@ -42,6 +43,7 @@ mod runtime;
 mod screen;
 mod time;
 
+pub use diagnostics::{DiagnosticsPlugin, Fps};
 pub use input::{DsButton, InputPlugin};
 pub use render::{DsText, Glyph, RenderPlugin, TilePos};
 pub use runner::{DsPlugins, run};
@@ -50,6 +52,7 @@ pub use time::TimePlugin;
 
 /// Common imports for games built on `bevy_nds`.
 pub mod prelude {
+    pub use crate::diagnostics::Fps;
     pub use crate::input::DsButton;
     pub use crate::render::{DsText, Glyph, TilePos};
     pub use crate::runner::{DsPlugins, run};

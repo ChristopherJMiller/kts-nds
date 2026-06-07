@@ -7,6 +7,7 @@
 
 use bevy_app::{App, AppExit, PluginGroup, PluginGroupBuilder};
 
+use crate::diagnostics::DiagnosticsPlugin;
 use crate::ffi;
 use crate::input::InputPlugin;
 use crate::render::RenderPlugin;
@@ -33,6 +34,7 @@ impl PluginGroup for DsPlugins {
         PluginGroupBuilder::start::<Self>()
             .add(VideoPlugin)
             .add(TimePlugin)
+            .add(DiagnosticsPlugin)
             .add(InputPlugin)
             .add(RenderPlugin)
     }

@@ -84,6 +84,11 @@ unsafe extern "C" {
     pub fn scanKeys();
     /// Buttons currently held down (bitfield of `KEY_*`).
     pub fn keysHeld() -> u32;
+    /// Start a free-running hardware timer (uses timers `timer` and `timer+1`
+    /// as a 32-bit cascade) counting at the bus clock.
+    pub fn cpuStartTiming(timer: c_int);
+    /// Bus-clock ticks elapsed since [`cpuStartTiming`].
+    pub fn cpuGetTiming() -> u32;
 }
 
 unsafe extern "C" {

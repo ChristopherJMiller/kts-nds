@@ -12,7 +12,7 @@
 
 extern crate alloc;
 
-use alloc::format;
+use core::fmt::Write;
 
 use bevy_app::prelude::*;
 use bevy_ecs::prelude::*;
@@ -82,15 +82,19 @@ fn move_player(input: Res<ButtonInput<DsButton>>, mut query: Query<&mut TilePos,
     }
 }
 
-/// Refresh the top-screen HUD from the `Time` and input resources.
+/// Refresh the top-screen HUD from the `Time`, `Fps` and input resources.
 fn update_hud(
     time: Res<Time>,
+    fps: Res<Fps>,
     input: Res<ButtonInput<DsButton>>,
     mut query: Query<&mut DsText, With<Hud>>,
 ) {
     let secs = time.elapsed_secs() as u32;
+    let fps = fps.0;
     let held = input.get_pressed().count();
     for mut text in &mut query {
-        text.0 = format!("t={secs:>4}s   held={held}");
+        // Reuse the existing String's capacity instead of allocating anew.
+        text.0.clear();
+        let _ = write!(text.0, "t={secs:>4}s  fps={fps:>2.0}  held={held}");
     }
 }
