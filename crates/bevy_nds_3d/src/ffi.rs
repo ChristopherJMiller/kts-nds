@@ -39,6 +39,7 @@ const POWER_SWAP_LCDS: u16 = 1 << 15;
 
 const GFX_COLOR: *mut u32 = 0x0400_0480 as *mut u32;
 const GFX_VERTEX16: *mut u32 = 0x0400_048C as *mut u32;
+const GFX_NORMAL: *mut u32 = 0x0400_0484 as *mut u32;
 const GFX_CLEAR_DEPTH: *mut u16 = 0x0400_0354 as *mut u16;
 const GFX_POLY_FORMAT: *mut u32 = 0x0400_04A4 as *mut u32;
 const GFX_BEGIN: *mut u32 = 0x0400_0500 as *mut u32;
@@ -46,10 +47,17 @@ const GFX_END: *mut u32 = 0x0400_0504 as *mut u32;
 const GFX_FLUSH: *mut u32 = 0x0400_0540 as *mut u32;
 const GFX_VIEWPORT: *mut u32 = 0x0400_0580 as *mut u32;
 
+// Lighting / material command registers (see <nds/arm9/video.h>).
+const GFX_LIGHT_VECTOR: *mut u32 = 0x0400_04C8 as *mut u32;
+const GFX_LIGHT_COLOR: *mut u32 = 0x0400_04CC as *mut u32;
+const GFX_DIFFUSE_AMBIENT: *mut u32 = 0x0400_04C0 as *mut u32;
+const GFX_SPECULAR_EMISSION: *mut u32 = 0x0400_04C4 as *mut u32;
+
 const MATRIX_CONTROL: *mut u32 = 0x0400_0440 as *mut u32;
 const MATRIX_PUSH: *mut u32 = 0x0400_0444 as *mut u32;
 const MATRIX_POP: *mut u32 = 0x0400_0448 as *mut u32;
 const MATRIX_TRANSLATE: *mut i32 = 0x0400_0470 as *mut i32;
+const MATRIX_SCALE: *mut i32 = 0x0400_046C as *mut i32;
 const MATRIX_IDENTITY: *mut u32 = 0x0400_0454 as *mut u32;
 
 // --- GL enums / constants (see <nds/arm9/videoGL.h>) -------------------------
@@ -63,10 +71,43 @@ pub const GL_PROJECTION: u32 = 0;
 pub const GL_MODELVIEW: u32 = 2;
 /// Don't cull any polygons (`POLY_CULL_NONE = 3 << 6`).
 pub const POLY_CULL_NONE: u32 = 3 << 6;
+/// Cull back-facing polygons (`POLY_CULL_BACK = 2 << 6`).
+pub const POLY_CULL_BACK: u32 = 2 << 6;
 
 /// `POLY_ALPHA(n) = n << 16`: polygon alpha (0-31) for `glPolyFmt`.
 pub const fn poly_alpha(n: u32) -> u32 {
     n << 16
+}
+
+/// `POLY_FORMAT_LIGHT{i} = BIT(i)`: enable hardware light `i` (0-3) for the
+/// following polygons. OR these into the polygon format.
+pub const fn poly_light(id: u32) -> u32 {
+    1 << id
+}
+
+/// Pack a 0-255-per-channel RGB colour into the DS 15-bit `RGB15` format (5 bits
+/// per channel), used by light and material colour registers.
+pub const fn rgb15(r: u8, g: u8, b: u8) -> u32 {
+    (r as u32 >> 3) | ((g as u32 >> 3) << 5) | ((b as u32 >> 3) << 10)
+}
+
+/// Convert a normalised float component to the DS 10-bit signed `v10` fixed
+/// format (1.0 maps to `0x1FF`), as `floattov10` does in `<nds/arm9/videoGL.h>`.
+pub fn float_to_v10(v: f32) -> u32 {
+    let x = if v >= 1.0 {
+        0x1FF
+    } else if v <= -1.0 {
+        0x3FF // -1.0 in 10-bit two's complement (0x400 - 1 region)
+    } else {
+        ((v * 512.0) as i32) & 0x3FF
+    };
+    x as u32
+}
+
+/// Pack three `v10` normal/direction components into a single command word
+/// (`NORMAL_PACK`), 10 bits each.
+pub fn normal_pack(x: f32, y: f32, z: f32) -> u32 {
+    float_to_v10(x) | (float_to_v10(y) << 10) | (float_to_v10(z) << 20)
 }
 
 unsafe extern "C" {
@@ -159,6 +200,15 @@ pub mod gl {
         }
     }
 
+    /// Multiply the current matrix by a scale, components in 20.12 fixed.
+    pub unsafe fn scale(x: i32, y: i32, z: i32) {
+        unsafe {
+            write_volatile(MATRIX_SCALE, x);
+            write_volatile(MATRIX_SCALE, y);
+            write_volatile(MATRIX_SCALE, z);
+        }
+    }
+
     /// Set the polygon attributes for following polygons.
     pub unsafe fn poly_fmt(params: u32) {
         unsafe { write_volatile(GFX_POLY_FORMAT, params) }
@@ -186,6 +236,35 @@ pub mod gl {
         unsafe {
             write_volatile(GFX_VERTEX16, xy);
             write_volatile(GFX_VERTEX16, z as u16 as u32);
+        }
+    }
+
+    /// Set the current normal (triggers the per-vertex lighting calculation for
+    /// the following vertex when lighting is enabled). `packed` is a
+    /// [`normal_pack`] word.
+    pub unsafe fn normal(packed: u32) {
+        unsafe { write_volatile(GFX_NORMAL, packed) }
+    }
+
+    /// Configure directional light `id` (0-3): its `color` (RGB15) and its
+    /// direction (a [`normal_pack`] word). The direction is transformed by the
+    /// current modelview matrix, so set lights after loading the view.
+    pub unsafe fn light(id: u32, color: u32, direction: u32) {
+        unsafe {
+            write_volatile(GFX_LIGHT_VECTOR, (id << 30) | direction);
+            write_volatile(GFX_LIGHT_COLOR, (id << 30) | color);
+        }
+    }
+
+    /// Set the material's diffuse and ambient reflection colours (RGB15). With
+    /// `set_vertex_color`, the diffuse colour also seeds the vertex colour so a
+    /// lit, untextured surface shows the material colour. Specular and emission
+    /// are cleared.
+    pub unsafe fn material(diffuse: u32, ambient: u32, set_vertex_color: bool) {
+        let svc = if set_vertex_color { 1 << 15 } else { 0 };
+        unsafe {
+            write_volatile(GFX_DIFFUSE_AMBIENT, diffuse | svc | (ambient << 16));
+            write_volatile(GFX_SPECULAR_EMISSION, 0);
         }
     }
 

@@ -14,6 +14,7 @@ description = "Hardware-accelerated 3D for bevy_nds, driving the Nintendo DS 3D 
 
 [dependencies]
 bevy_nds = { path = "../bevy_nds" }
+bevy_nds_3d_macros = { path = "../bevy_nds_3d_macros" }
 
 bevy_app = { version = "0.16", default-features = false, features = [
   "critical-section",

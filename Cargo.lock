@@ -181,7 +181,12 @@ dependencies = [
  "bevy_ecs",
  "bevy_math",
  "bevy_nds",
+ "bevy_nds_3d_macros",
 ]
+
+[[package]]
+name = "bevy_nds_3d_macros"
+version = "0.1.0"
 
 [[package]]
 name = "bevy_platform"

@@ -1,0 +1,13 @@
+[package]
+name = "bevy_nds_3d_macros"
+version = "0.1.0"
+edition = "2024"
+description = "Compile-time model loaders for bevy_nds_3d (e.g. include_obj! to bake an OBJ into the ROM)."
+
+# A proc-macro crate, so it compiles for the *host* and runs at build time —
+# it never ships in the DS ROM. It parses model files on the host and emits a
+# `&'static` mesh that the game crate embeds, which is how `bevy_nds_3d` works
+# around the DS having no runtime filesystem / asset server.
+
+[lib]
+proc-macro = true

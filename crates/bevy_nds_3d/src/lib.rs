@@ -33,6 +33,7 @@
 
 extern crate alloc;
 
+use alloc::borrow::Cow;
 use alloc::vec::Vec;
 use core::f32::consts::TAU;
 
@@ -66,27 +67,67 @@ fn rad_to_angle(rad: f32) -> i32 {
 }
 
 /// A single coloured vertex in model space. Colour channels are 0-255 (the DS
-/// keeps the top 5 bits).
+/// keeps the top 5 bits). `normal` is the surface normal used for hardware
+/// lighting; it is ignored for unlit meshes (and is `Vec3::ZERO` by default).
 #[derive(Clone, Copy)]
 pub struct Vertex {
     pub pos: Vec3,
+    pub normal: Vec3,
     pub color: [u8; 3],
 }
 
 impl Vertex {
+    /// An unlit vertex (no normal); use this for flat vertex-coloured meshes.
     pub const fn new(pos: Vec3, color: [u8; 3]) -> Self {
-        Self { pos, color }
+        Self {
+            pos,
+            normal: Vec3::ZERO,
+            color,
+        }
+    }
+
+    /// A vertex carrying a surface normal, for hardware-lit meshes. The normal
+    /// should be unit length (the lit render path does not renormalise).
+    pub const fn with_normal(pos: Vec3, normal: Vec3, color: [u8; 3]) -> Self {
+        Self { pos, normal, color }
+    }
+
+    /// Construct from raw component arrays. This is the const-friendly form the
+    /// `include_obj!` macro emits (it avoids needing `Vec3` in generated code).
+    pub const fn from_raw(pos: [f32; 3], normal: [f32; 3], color: [u8; 3]) -> Self {
+        Self {
+            pos: Vec3::new(pos[0], pos[1], pos[2]),
+            normal: Vec3::new(normal[0], normal[1], normal[2]),
+            color,
+        }
     }
 }
 
 /// A drawable mesh: a flat list of triangles. Small by design — the DS has a
 /// hard per-frame budget of a couple thousand polygons.
+///
+/// `tris` is a [`Cow`] so a mesh can either own its triangles (e.g. [`DsMesh::cube`])
+/// or borrow `&'static` data baked into the ROM at compile time (e.g. the
+/// `include_obj!` macro), with no per-spawn heap copy in the latter case.
 #[derive(Component, Clone, Default)]
 pub struct DsMesh {
-    pub tris: Vec<[Vertex; 3]>,
+    pub tris: Cow<'static, [[Vertex; 3]]>,
+    /// When set, the mesh is drawn with the DS hardware lighting pipeline
+    /// (per-vertex normals + the [`DsLights`] resource + a [`DsMaterial`]).
+    /// When clear, vertices use their flat [`Vertex::color`] directly.
+    pub lit: bool,
 }
 
 impl DsMesh {
+    /// Build a mesh that borrows `&'static` triangle data (no allocation). This
+    /// is what the `include_obj!` macro emits for compile-time-embedded models.
+    pub const fn from_static(tris: &'static [[Vertex; 3]], lit: bool) -> Self {
+        Self {
+            tris: Cow::Borrowed(tris),
+            lit,
+        }
+    }
+
     /// An axis-aligned cube of side `2 * half`, with each face a distinct
     /// flat colour. Handy as a "hello, triangle" for the 3D pipeline.
     pub fn cube(half: f32) -> Self {
@@ -168,16 +209,21 @@ impl DsMesh {
                 Vertex::new(c[3], color),
             ]);
         }
-        Self { tris }
+        Self {
+            tris: Cow::Owned(tris),
+            lit: false,
+        }
     }
 }
 
 /// Position and orientation of a 3D entity. The DS-native analogue of Bevy's
-/// `Transform`: rotation is Euler angles (radians), applied X then Y then Z.
+/// `Transform`: rotation is Euler angles (radians), applied X then Y then Z, and
+/// `scale` is a per-axis multiplier (use [`Vec3::splat`] for uniform scale).
 #[derive(Component, Clone, Copy)]
 pub struct Transform3d {
     pub translation: Vec3,
     pub rotation: Vec3,
+    pub scale: Vec3,
 }
 
 impl Default for Transform3d {
@@ -185,6 +231,7 @@ impl Default for Transform3d {
         Self {
             translation: Vec3::ZERO,
             rotation: Vec3::ZERO,
+            scale: Vec3::ONE,
         }
     }
 }
@@ -194,7 +241,14 @@ impl Transform3d {
         Self {
             translation,
             rotation: Vec3::ZERO,
+            scale: Vec3::ONE,
         }
+    }
+
+    /// Set a uniform scale, builder-style.
+    pub const fn with_scale(mut self, scale: f32) -> Self {
+        self.scale = Vec3::splat(scale);
+        self
     }
 }
 
@@ -246,6 +300,56 @@ impl Default for Display3d {
     }
 }
 
+/// A single hardware directional light: a direction and a colour. The DS has up
+/// to four, applied per vertex in hardware.
+#[derive(Clone, Copy)]
+pub struct DirectionalLight {
+    /// The direction the light travels (it is normalised before use). A surface
+    /// whose normal faces the *opposite* way is lit brightest.
+    pub direction: Vec3,
+    /// Light colour, 0-255 per channel.
+    pub color: [u8; 3],
+}
+
+/// The scene's (up to four) hardware directional lights. Only meshes with
+/// [`DsMesh::lit`] set are affected. Mutate at runtime to move the lights.
+#[derive(Resource, Clone)]
+pub struct DsLights {
+    pub lights: [Option<DirectionalLight>; 4],
+}
+
+impl Default for DsLights {
+    fn default() -> Self {
+        // A single white key light from the upper front, so lit meshes read as
+        // solid out of the box.
+        let mut lights = [None; 4];
+        lights[0] = Some(DirectionalLight {
+            direction: Vec3::new(-0.4, -0.5, -0.77),
+            color: [255, 255, 255],
+        });
+        Self { lights }
+    }
+}
+
+/// Reflective material for a lit [`DsMesh`]. Lit meshes without one fall back to
+/// [`DsMaterial::default`]. Ignored by unlit meshes (which use vertex colours).
+#[derive(Component, Clone, Copy)]
+pub struct DsMaterial {
+    /// Diffuse reflection colour (the main surface colour under direct light).
+    pub diffuse: [u8; 3],
+    /// Ambient reflection colour (the colour in shadow / fill light).
+    pub ambient: [u8; 3],
+}
+
+impl Default for DsMaterial {
+    fn default() -> Self {
+        Self {
+            diffuse: [200, 200, 210],
+            ambient: [40, 40, 55],
+        }
+    }
+}
+
 /// Apply the [`Display3d`] LCD assignment whenever it changes (and once at
 /// startup, since `Added` resources count as changed).
 fn apply_display(display: Res<Display3d>) {
@@ -269,8 +373,14 @@ fn init_3d() {
 
 /// Submit every [`DsMesh`] to the 3D hardware each frame, transformed by its
 /// [`Transform3d`] via the hardware matrix stack and viewed through [`Camera3d`].
+/// Lit meshes are shaded by the [`DsLights`] resource using their per-vertex
+/// normals and (optional) [`DsMaterial`]; unlit meshes use flat vertex colours.
 /// Runs in [`Last`], after game systems have updated transforms.
-fn render_3d(camera: Res<Camera3d>, meshes: Query<(&Transform3d, &DsMesh)>) {
+fn render_3d(
+    camera: Res<Camera3d>,
+    lights: Res<DsLights>,
+    meshes: Query<(&Transform3d, &DsMesh, Option<&DsMaterial>)>,
+) {
     let aspect = to_fix(256.0 / 192.0);
     let fovy = rad_to_angle(camera.fov_degrees * (TAU / 360.0));
 
@@ -291,9 +401,23 @@ fn render_3d(camera: Res<Camera3d>, meshes: Query<(&Transform3d, &DsMesh)>) {
             to_fix(-camera.position.z),
         );
 
-        gl::poly_fmt(ffi::poly_alpha(31) | ffi::POLY_CULL_NONE);
+        // Configure the directional lights in view space (their direction is
+        // latched relative to the current modelview, before any per-object
+        // transform) and remember which ones to enable on lit polygons.
+        let mut light_mask = 0u32;
+        for (id, light) in lights.lights.iter().enumerate() {
+            if let Some(light) = light {
+                let d = light.direction.normalize_or_zero();
+                gl::light(
+                    id as u32,
+                    ffi::rgb15(light.color[0], light.color[1], light.color[2]),
+                    ffi::normal_pack(d.x, d.y, d.z),
+                );
+                light_mask |= ffi::poly_light(id as u32);
+            }
+        }
 
-        for (transform, mesh) in &meshes {
+        for (transform, mesh, mat) in &meshes {
             gl::push_matrix();
             gl::translate(
                 to_fix(transform.translation.x),
@@ -303,15 +427,44 @@ fn render_3d(camera: Res<Camera3d>, meshes: Query<(&Transform3d, &DsMesh)>) {
             ffi::glRotatef32i(rad_to_angle(transform.rotation.x), 1 << 12, 0, 0);
             ffi::glRotatef32i(rad_to_angle(transform.rotation.y), 0, 1 << 12, 0);
             ffi::glRotatef32i(rad_to_angle(transform.rotation.z), 0, 0, 1 << 12);
+            gl::scale(
+                to_fix(transform.scale.x),
+                to_fix(transform.scale.y),
+                to_fix(transform.scale.z),
+            );
 
-            gl::begin(ffi::GL_TRIANGLES);
-            for tri in &mesh.tris {
-                for v in tri {
-                    gl::color3b(v.color[0], v.color[1], v.color[2]);
-                    gl::vertex_v16(to_v16(v.pos.x), to_v16(v.pos.y), to_v16(v.pos.z));
+            if mesh.lit {
+                let m = mat.copied().unwrap_or_default();
+                gl::material(
+                    ffi::rgb15(m.diffuse[0], m.diffuse[1], m.diffuse[2]),
+                    ffi::rgb15(m.ambient[0], m.ambient[1], m.ambient[2]),
+                    true,
+                );
+                gl::poly_fmt(ffi::poly_alpha(31) | ffi::POLY_CULL_BACK | light_mask);
+
+                gl::begin(ffi::GL_TRIANGLES);
+                for tri in mesh.tris.iter() {
+                    for v in tri {
+                        // Normals are expected to be unit length (the include_obj!
+                        // macro normalises at build time), so no runtime sqrt here.
+                        let n = v.normal;
+                        gl::normal(ffi::normal_pack(n.x, n.y, n.z));
+                        gl::vertex_v16(to_v16(v.pos.x), to_v16(v.pos.y), to_v16(v.pos.z));
+                    }
                 }
+                gl::end();
+            } else {
+                gl::poly_fmt(ffi::poly_alpha(31) | ffi::POLY_CULL_NONE);
+
+                gl::begin(ffi::GL_TRIANGLES);
+                for tri in mesh.tris.iter() {
+                    for v in tri {
+                        gl::color3b(v.color[0], v.color[1], v.color[2]);
+                        gl::vertex_v16(to_v16(v.pos.x), to_v16(v.pos.y), to_v16(v.pos.z));
+                    }
+                }
+                gl::end();
             }
-            gl::end();
 
             gl::pop_matrix(1);
         }
@@ -330,6 +483,7 @@ impl Plugin for Ds3dPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<Camera3d>()
             .init_resource::<Display3d>()
+            .init_resource::<DsLights>()
             .add_systems(Startup, init_3d)
             .add_systems(Last, (apply_display, render_3d).chain());
     }
@@ -337,6 +491,10 @@ impl Plugin for Ds3dPlugin {
 
 /// Common imports for games using the 3D backend.
 pub mod prelude {
-    pub use crate::{Camera3d, Display3d, Ds3dPlugin, DsMesh, Transform3d, Vertex};
+    pub use crate::{
+        Camera3d, DirectionalLight, Display3d, Ds3dPlugin, DsLights, DsMaterial, DsMesh,
+        Transform3d, Vertex,
+    };
     pub use bevy_math::Vec3;
+    pub use bevy_nds_3d_macros::include_obj;
 }

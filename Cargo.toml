@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/bevy_nds", "crates/bevy_nds_3d"]
+members = ["crates/bevy_nds", "crates/bevy_nds_3d", "crates/bevy_nds_3d_macros"]
 resolver = "2"
 
 [package]
