@@ -1,0 +1,20 @@
+# Cargo configuration for building Nintendo DS ROMs.
+#
+# The DS ARM9 core is a Tier 3, no_std target, so we build the standard library
+# facade (core/alloc) from source with build-std. Linker flags that depend on
+# the BlocksDS install path are injected by build.rs using the $BLOCKSDS env var
+# (set by the Nix dev shell), so this file stays free of machine-specific paths.
+
+[build]
+target = "armv5te-nintendo-ds.json"
+
+[unstable]
+build-std = ["core", "compiler_builtins", "alloc"]
+build-std-features = ["compiler-builtins-mem"]
+
+[target.armv5te-nintendo-ds]
+rustflags = [
+  # Single ARM9 core: let portable-atomic provide CAS without outline atomics.
+  "--cfg", "portable_atomic_no_outline_atomics",
+  "--cfg", "portable_atomic_unsafe_assume_single_core",
+]

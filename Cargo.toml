@@ -1,0 +1,33 @@
+[package]
+name = "bevy-ds"
+version = "0.1.0"
+edition = "2024"
+
+# Nintendo DS homebrew built around Bevy's no_std ECS. The full Bevy renderer
+# (wgpu/winit) cannot run on the DS, so we use Bevy's ECS + App core and drive
+# the hardware through libnds (see src/libnds.rs).
+
+[dependencies]
+# Bevy's App + ECS core, configured for no_std. `critical-section` provides the
+# synchronization primitives Bevy needs on bare metal; we supply the actual
+# implementation in src/main.rs.
+bevy_app = { version = "0.16", default-features = false, features = [
+  "critical-section",
+] }
+bevy_ecs = { version = "0.16", default-features = false, features = [
+  "critical-section",
+] }
+
+# critical-section implementation hook (single-core: toggle the DS interrupt
+# master enable register). `restore-state-bool` matches our acquire/release.
+critical-section = { version = "1.1", features = ["restore-state-bool"] }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
