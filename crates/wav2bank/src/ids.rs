@@ -66,6 +66,20 @@ pub fn emit_rust(defines: &[Define]) -> String {
     s
 }
 
+/// Convert a sample's file stem to the constant name `mmutil` would assign:
+/// upper-cased, non-alphanumerics turned to `_`, with an `SFX_` prefix.
+pub fn sample_const_name(stem: &str) -> String {
+    let mut s = String::from("SFX_");
+    for c in stem.chars() {
+        if c.is_ascii_alphanumeric() {
+            s.push(c.to_ascii_uppercase());
+        } else {
+            s.push('_');
+        }
+    }
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -109,5 +123,12 @@ mod tests {
     fn output_is_deterministic() {
         let d = parse_header(SAMPLE);
         assert_eq!(emit_rust(&d), emit_rust(&d));
+    }
+
+    #[test]
+    fn sample_const_names_match_mmutil() {
+        assert_eq!(sample_const_name("piano_loop"), "SFX_PIANO_LOOP");
+        assert_eq!(sample_const_name("blip_select"), "SFX_BLIP_SELECT");
+        assert_eq!(sample_const_name("hit-01"), "SFX_HIT_01");
     }
 }

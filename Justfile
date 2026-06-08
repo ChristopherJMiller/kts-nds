@@ -54,7 +54,7 @@ test *args:
     host="$(rustc -vV | sed -n 's/^host: //p')"; \
     cargo test -p bevy_nds_3d_obj -p obj2dl -p bevy_nds_3d_macros \
         --target "$host" {{args}}
-    cargo test -p bevy_nds -p bevy_nds_3d_cull -p wav2bank \
+    cargo test -p bevy_nds -p bevy_nds_3d_cull -p wav2bank -p bevy_nds_audio \
         --target "$(rustc -vV | sed -n 's/^host: //p')" \
         --config 'unstable.build-std=["std","panic_unwind","proc_macro"]' \
         --config 'profile.dev.panic="unwind"' \

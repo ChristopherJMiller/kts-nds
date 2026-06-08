@@ -86,18 +86,43 @@ fn collect_wavs(dir: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(wavs)
 }
 
+/// Predict the generated sound-ID constants *without* running `mmutil`, by
+/// replicating its naming and ordering (music sources first, then sfx, each
+/// sorted by name; ids are assigned `0..N`).
+///
+/// Used as an offline fallback so dependent code still compiles when `mmutil`
+/// is unavailable (e.g. `cargo check` outside `nix develop`).
+pub fn predict_ids(src_dir: &Path) -> Result<Vec<ids::Define>, String> {
+    let music = collect_wavs(&src_dir.join(MUSIC_DIR))?;
+    let sfx = collect_wavs(&src_dir.join(SFX_DIR))?;
+    let mut out = Vec::new();
+    for (i, path) in music.iter().chain(sfx.iter()).enumerate() {
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| format!("bad file name: {}", path.display()))?;
+        out.push(ids::Define {
+            name: ids::sample_const_name(stem),
+            value: i as u32,
+        });
+    }
+    Ok(out)
+}
+
 /// Bake the `audio/` tree at `src_dir` into `out_bin` (+ generated `out_ids_rs`)
 /// using `mmutil`.
 ///
-/// `music/*.wav` get a forward loop injected (written to a work directory beside
-/// `out_bin`) so they loop as background music; `sfx/*.wav` are used as-is. IDs
-/// are assigned music-first then sfx, each group sorted by name, so the
-/// generated constants are stable across builds.
+/// `music/*.wav` get a forward loop injected (written to `work_dir`) so they
+/// loop as background music; `sfx/*.wav` are used as-is. IDs are assigned
+/// music-first then sfx, each group sorted by name, so the generated constants
+/// are stable across builds. `work_dir` must be outside any directory packed
+/// into the ROM (the loop-patched copies are an implementation detail).
 pub fn build_dir(
     src_dir: &Path,
     out_bin: &Path,
     out_ids_rs: &Path,
     mmutil: &Path,
+    work_dir: &Path,
 ) -> Result<Built, String> {
     let music = collect_wavs(&src_dir.join(MUSIC_DIR))?;
     let sfx = collect_wavs(&src_dir.join(SFX_DIR))?;
@@ -105,12 +130,9 @@ pub fn build_dir(
         return Err(format!("no .wav files under {}", src_dir.display()));
     }
 
-    // A work directory (beside the soundbank) holds the loop-patched copies we
-    // hand to mmutil, keeping the source tree pristine.
-    let work = out_bin
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join(".wav2bank-work");
+    // A work directory holds the loop-patched copies we hand to mmutil, keeping
+    // the source tree pristine. The caller places it outside the ROM tree.
+    let work = work_dir.to_path_buf();
     std::fs::create_dir_all(&work)
         .map_err(|e| format!("could not create {}: {e}", work.display()))?;
     if let Some(parent) = out_ids_rs.parent() {

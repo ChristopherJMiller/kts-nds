@@ -1,9 +1,13 @@
-//! Build script with two jobs:
+//! Build script with three jobs:
 //!
 //! 1. **Compile model assets.** Bakes every `assets/*.obj` into a display-list
 //!    blob under `build/nitrofs/` (via the `obj2dl` library), which `just rom`
 //!    packs into the ROM filesystem (NitroFS) for runtime loading.
-//! 2. **Inject DS link arguments** using the BlocksDS install located via the
+//! 2. **Compile audio assets.** Bakes `audio/{music,sfx}/*.wav` into
+//!    `build/nitrofs/soundbank.bin` (via the `wav2bank` library, which wraps
+//!    `mmutil`) and emits a Rust module of the sound IDs into `OUT_DIR` for the
+//!    game to `include!`.
+//! 3. **Inject DS link arguments** using the BlocksDS install located via the
 //!    `$BLOCKSDS` environment variable (set by the Nix dev shell). Keeping these
 //!    out of the target JSON means the spec file path stays correct on Nix,
 //!    where BlocksDS lives in the store rather than at `/opt/wonderful`.
@@ -13,11 +17,14 @@ use std::path::PathBuf;
 
 /// Source directory of uncompiled model assets (`*.obj`).
 const ASSET_DIR: &str = "assets";
+/// Source directory of uncompiled audio assets (`music/*.wav`, `sfx/*.wav`).
+const AUDIO_DIR: &str = "audio";
 /// Output directory for compiled NitroFS assets (gitignored; packed by `just rom`).
 const NITROFS_DIR: &str = "build/nitrofs";
 
 fn main() {
     compile_assets();
+    compile_audio();
     emit_link_args();
 }
 
@@ -47,6 +54,62 @@ fn compile_assets() {
             }
         }
         Err(e) => println!("cargo:warning=asset compilation failed: {e}"),
+    }
+}
+
+/// Bake `audio/{music,sfx}/*.wav` into `build/nitrofs/soundbank.bin` (via the
+/// `wav2bank` library, which wraps `mmutil`) and write the generated sound-ID
+/// constants to `$OUT_DIR/sounds.rs` for the game to `include!`.
+///
+/// `mmutil` is only available inside `nix develop`. When it is missing (e.g. a
+/// plain `cargo check` outside the shell) we still emit a *predicted* IDs module
+/// so the game keeps compiling; only the soundbank blob is skipped.
+fn compile_audio() {
+    let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let src = manifest.join(AUDIO_DIR);
+    let out_bin = manifest.join(NITROFS_DIR).join("soundbank.bin");
+    let out_ids = PathBuf::from(env::var("OUT_DIR").unwrap()).join("sounds.rs");
+    // The loop-patch scratch dir must stay out of the NitroFS tree, or its temp
+    // WAVs would be packed into the ROM.
+    let work = PathBuf::from(env::var("OUT_DIR").unwrap()).join("wav2bank-work");
+
+    println!("cargo:rerun-if-changed={}", src.display());
+    println!("cargo:rerun-if-env-changed=BLOCKSDS");
+    println!("cargo:rerun-if-env-changed=MMUTIL");
+
+    if !src.is_dir() {
+        write_predicted_ids(&src, &out_ids);
+        return;
+    }
+
+    match wav2bank::find_mmutil() {
+        Some(mmutil) => match wav2bank::build_dir(&src, &out_bin, &out_ids, &mmutil, &work) {
+            Ok(built) => {
+                for input in &built.inputs {
+                    println!("cargo:rerun-if-changed={}", input.display());
+                }
+            }
+            Err(e) => {
+                println!("cargo:warning=soundbank baking failed: {e}");
+                write_predicted_ids(&src, &out_ids);
+            }
+        },
+        None => {
+            println!(
+                "cargo:warning=mmutil not found (run inside `nix develop`); \
+                 soundbank.bin not baked — audio will be silent in the ROM"
+            );
+            write_predicted_ids(&src, &out_ids);
+        }
+    }
+}
+
+/// Emit the predicted sound-ID module (no `mmutil`), so the game still compiles.
+fn write_predicted_ids(src: &std::path::Path, out_ids: &std::path::Path) {
+    let defines = wav2bank::predict_ids(src).unwrap_or_default();
+    let rust = wav2bank::ids::emit_rust(&defines);
+    if let Err(e) = std::fs::write(out_ids, rust) {
+        println!("cargo:warning=could not write {}: {e}", out_ids.display());
     }
 }
 
@@ -82,10 +145,13 @@ fn emit_link_args() {
 
     // libnds (ARM9 build), newlib C library and libgcc (provides the atomic
     // barrier helpers the BlocksDS specs alias). Grouped to resolve circular
-    // references between them.
+    // references between them. `libmm9` (maxmod, ARM9) provides the audio mixer
+    // commands that `bevy_nds_audio` calls; it lives in its own lib dir.
     println!("cargo:rustc-link-search=native={blocksds}/libs/libnds/lib");
+    println!("cargo:rustc-link-search=native={blocksds}/libs/maxmod/lib");
     println!("cargo:rustc-link-arg=-Wl,--start-group");
     println!("cargo:rustc-link-arg=-lnds9");
+    println!("cargo:rustc-link-arg=-lmm9");
     println!("cargo:rustc-link-arg=-lc");
     println!("cargo:rustc-link-arg=-lgcc");
     println!("cargo:rustc-link-arg=-Wl,--end-group");

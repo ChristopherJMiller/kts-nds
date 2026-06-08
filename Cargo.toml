@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/bevy_nds", "crates/bevy_nds_3d", "crates/bevy_nds_3d_macros", "crates/bevy_nds_3d_obj", "crates/obj2dl", "crates/bevy_nds_3d_cull", "crates/wav2bank"]
+members = ["crates/bevy_nds", "crates/bevy_nds_3d", "crates/bevy_nds_3d_macros", "crates/bevy_nds_3d_obj", "crates/obj2dl", "crates/bevy_nds_3d_cull", "crates/wav2bank", "crates/bevy_nds_audio"]
 resolver = "2"
 
 [package]
@@ -14,6 +14,7 @@ edition = "2024"
 [dependencies]
 bevy_nds = { path = "crates/bevy_nds" }
 bevy_nds_3d = { path = "crates/bevy_nds_3d" }
+bevy_nds_audio = { path = "crates/bevy_nds_audio" }
 
 bevy_app = { version = "0.16", default-features = false, features = [
   "critical-section",
@@ -34,6 +35,9 @@ bevy_time = { version = "0.16", default-features = false, features = [
 # build time, so they can be packed into the ROM filesystem (NitroFS) and loaded
 # at runtime. Shares the encoder with `include_obj!`, so output is identical.
 obj2dl = { path = "crates/obj2dl" }
+# Bakes `audio/{music,sfx}/*.wav` into `build/nitrofs/soundbank.bin` (via mmutil)
+# plus a generated Rust module of the sound IDs, included by the game.
+wav2bank = { path = "crates/wav2bank" }
 
 [profile.dev]
 panic = "abort"
@@ -55,6 +59,9 @@ opt-level = 3
 opt-level = 3
 
 [profile.dev.package.bevy_nds_3d_cull]
+opt-level = 3
+
+[profile.dev.package.bevy_nds_audio]
 opt-level = 3
 
 [profile.dev.package.bevy_nds_3d_macros]

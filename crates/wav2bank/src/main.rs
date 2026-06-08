@@ -49,7 +49,7 @@ fn run() -> Result<(), String> {
         .or_else(wav2bank::find_mmutil)
         .ok_or("mmutil not found (set $BLOCKSDS, $MMUTIL or --mmutil; run inside `nix develop`)")?;
 
-    let built = wav2bank::build_dir(&input, &output, &ids, &mmutil)?;
+    let built = wav2bank::build_dir(&input, &output, &ids, &mmutil, &work_dir(&output))?;
     eprintln!(
         "wav2bank: {} sound(s) -> {} (+ {})",
         built.inputs.len(),
@@ -57,6 +57,17 @@ fn run() -> Result<(), String> {
         built.ids_rs.display()
     );
     Ok(())
+}
+
+/// A scratch directory for loop-patched copies, kept out of the output tree.
+fn work_dir(output: &std::path::Path) -> PathBuf {
+    let mut dir = std::env::temp_dir();
+    let stem = output
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("soundbank");
+    dir.push(format!("wav2bank-{stem}"));
+    dir
 }
 
 fn print_usage() {

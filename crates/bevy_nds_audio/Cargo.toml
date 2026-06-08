@@ -1,0 +1,25 @@
+[package]
+name = "bevy_nds_audio"
+version = "0.1.0"
+edition = "2024"
+description = "Maxmod-backed audio for bevy_nds, mixing music & sound effects on the Nintendo DS ARM7 (no_std)."
+
+# An additive audio backend for `bevy_nds`. Sound on the DS is mixed on the
+# ARM7 core by maxmod (over the FIFO/IPC); this crate wraps the maxmod ARM9 API
+# (`-lmm9`) and exposes it as ordinary Bevy resources/events, so games play a
+# looping module/sample and fire one-shot effects without touching FFI. It
+# depends on `bevy_nds` for the platform layer (runtime, the vblank frame loop)
+# and adds no allocator / panic handler of its own. The soundbank is produced
+# host-side by the `wav2bank` crate and loaded at runtime from NitroFS.
+
+[lib]
+
+[dependencies]
+bevy_nds = { path = "../bevy_nds" }
+
+bevy_app = { version = "0.16", default-features = false, features = [
+  "critical-section",
+] }
+bevy_ecs = { version = "0.16", default-features = false, features = [
+  "critical-section",
+] }

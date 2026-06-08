@@ -46,8 +46,10 @@ dependencies = [
  "bevy_input",
  "bevy_nds",
  "bevy_nds_3d",
+ "bevy_nds_audio",
  "bevy_time",
  "obj2dl",
+ "wav2bank",
 ]
 
 [[package]]
@@ -205,6 +207,15 @@ dependencies = [
 [[package]]
 name = "bevy_nds_3d_obj"
 version = "0.1.0"
+
+[[package]]
+name = "bevy_nds_audio"
+version = "0.1.0"
+dependencies = [
+ "bevy_app",
+ "bevy_ecs",
+ "bevy_nds",
+]
 
 [[package]]
 name = "bevy_platform"
