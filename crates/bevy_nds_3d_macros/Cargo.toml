@@ -11,3 +11,6 @@ description = "Compile-time model loaders for bevy_nds_3d (e.g. include_obj! to 
 
 [lib]
 proc-macro = true
+
+[dependencies]
+bevy_nds_3d_obj = { path = "../bevy_nds_3d_obj" }

@@ -1,0 +1,20 @@
+[package]
+name = "obj2dl"
+version = "0.1.0"
+edition = "2024"
+description = "Bakes Wavefront OBJ models into Bevy-DS display-list assets (.dl) for NitroFS. Usable as a build.rs library or a CLI."
+
+# A host-side tool, never shipped in the ROM. It wraps the shared encoder in
+# `bevy_nds_3d_obj` so the runtime NitroFS path, the compile-time `include_obj!`
+# macro, and `build.rs` asset compilation all produce byte-identical display
+# lists. Exposes a library (for build scripts) and a CLI (for one-off use).
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "obj2dl"
+path = "src/main.rs"
+
+[dependencies]
+bevy_nds_3d_obj = { path = "../bevy_nds_3d_obj" }

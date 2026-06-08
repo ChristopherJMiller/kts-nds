@@ -1,0 +1,8 @@
+[package]
+name = "bevy_nds_3d_obj"
+version = "0.1.0"
+edition = "2024"
+
+# Host-only library: parses Wavefront OBJ and bakes it into a libnds display
+# list. Shared by the `include_obj!` proc-macro (compile-time embedding) and the
+# `obj2dl` converter (NitroFS assets), so the packing math lives in one place.

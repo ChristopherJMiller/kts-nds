@@ -4,3 +4,4 @@ result-*
 *.nds
 *.png
 !docs/*.png
+/build

@@ -47,6 +47,7 @@ dependencies = [
  "bevy_nds",
  "bevy_nds_3d",
  "bevy_time",
+ "obj2dl",
 ]
 
 [[package]]
@@ -186,6 +187,13 @@ dependencies = [
 
 [[package]]
 name = "bevy_nds_3d_macros"
+version = "0.1.0"
+dependencies = [
+ "bevy_nds_3d_obj",
+]
+
+[[package]]
+name = "bevy_nds_3d_obj"
 version = "0.1.0"
 
 [[package]]
@@ -603,6 +611,13 @@ name = "nonmax"
 version = "0.5.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "610a5acd306ec67f907abe5567859a3c693fb9886eb1f012ab8f2a47bef3db51"
+
+[[package]]
+name = "obj2dl"
+version = "0.1.0"
+dependencies = [
+ "bevy_nds_3d_obj",
+]
 
 [[package]]
 name = "once_cell"

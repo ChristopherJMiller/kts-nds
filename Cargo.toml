@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/bevy_nds", "crates/bevy_nds_3d", "crates/bevy_nds_3d_macros"]
+members = ["crates/bevy_nds", "crates/bevy_nds_3d", "crates/bevy_nds_3d_macros", "crates/bevy_nds_3d_obj", "crates/obj2dl"]
 resolver = "2"
 
 [package]
@@ -28,6 +28,12 @@ bevy_input = { version = "0.16", default-features = false, features = [
 bevy_time = { version = "0.16", default-features = false, features = [
   "critical-section",
 ] }
+
+[build-dependencies]
+# Compiles `assets/*.obj` into display-list blobs under `build/nitrofs/` at
+# build time, so they can be packed into the ROM filesystem (NitroFS) and loaded
+# at runtime. Shares the encoder with `include_obj!`, so output is identical.
+obj2dl = { path = "crates/obj2dl" }
 
 [profile.dev]
 panic = "abort"

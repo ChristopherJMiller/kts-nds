@@ -34,12 +34,15 @@ check:
 # lang-item clash) and `panic = "unwind"` matches the test harness. The first
 # run compiles `std`, so it is slow; later runs are fast.
 #
-# `bevy_nds_3d_macros` is an ordinary host proc-macro crate, so its tests run
-# natively with no special flags.
+# `bevy_nds_3d_macros` is an ordinary host proc-macro crate, and the
+# `bevy_nds_3d_obj` (shared OBJ encoder) and `obj2dl` (asset baker) crates are
+# ordinary host libraries, so their tests run natively with no special flags.
 #
 # Usage: `just test` (all) or `just test <filter>` (e.g. `just test render`).
 test *args:
-    cargo test -p bevy_nds_3d_macros {{args}}
+    host="$(rustc -vV | sed -n 's/^host: //p')"; \
+    cargo test -p bevy_nds_3d_obj -p obj2dl -p bevy_nds_3d_macros \
+        --target "$host" {{args}}
     cargo test -p bevy_nds --target "$(rustc -vV | sed -n 's/^host: //p')" \
         --config 'unstable.build-std=["std","panic_unwind","proc_macro"]' \
         --config 'profile.dev.panic="unwind"' \
