@@ -96,16 +96,40 @@ mod tests {
     fn parses_all_numeric_defines() {
         let d = parse_header(SAMPLE);
         assert_eq!(d.len(), 5);
-        assert_eq!(d[0], Define { name: "SFX_PIANO_LOOP".into(), value: 0 });
-        assert_eq!(d[1], Define { name: "SFX_BLIP_SELECT".into(), value: 1 });
-        assert_eq!(d[3], Define { name: "MSL_NSAMPS".into(), value: 2 });
+        assert_eq!(
+            d[0],
+            Define {
+                name: "SFX_PIANO_LOOP".into(),
+                value: 0
+            }
+        );
+        assert_eq!(
+            d[1],
+            Define {
+                name: "SFX_BLIP_SELECT".into(),
+                value: 1
+            }
+        );
+        assert_eq!(
+            d[3],
+            Define {
+                name: "MSL_NSAMPS".into(),
+                value: 2
+            }
+        );
     }
 
     #[test]
     fn ignores_non_numeric_and_blank_lines() {
         let h = "#define FOO bar\n\n// comment\n#define SFX_X 3\n#pragma once\n";
         let d = parse_header(h);
-        assert_eq!(d, vec![Define { name: "SFX_X".into(), value: 3 }]);
+        assert_eq!(
+            d,
+            vec![Define {
+                name: "SFX_X".into(),
+                value: 3
+            }]
+        );
     }
 
     #[test]

@@ -65,7 +65,10 @@ pub fn include_obj(input: TokenStream) -> TokenStream {
     let source = match fs::read_to_string(&full) {
         Ok(s) => s,
         Err(e) => {
-            return compile_error(&format!("include_obj!: could not read {}: {e}", full.display()));
+            return compile_error(&format!(
+                "include_obj!: could not read {}: {e}",
+                full.display()
+            ));
         }
     };
 
@@ -94,8 +97,12 @@ fn emit(model: &bevy_nds_3d_obj::Model, full: &std::path::Path) -> String {
          const WORDS: &[u32] = &[{words}\n    ];\n    \
          ::bevy_nds_3d::DsMesh::from_baked(WORDS, \
          [{}f32,{}f32,{}f32], [{}f32,{}f32,{}f32])\n}}\n",
-        fl(min[0]), fl(min[1]), fl(min[2]),
-        fl(max[0]), fl(max[1]), fl(max[2]),
+        fl(min[0]),
+        fl(min[1]),
+        fl(min[2]),
+        fl(max[0]),
+        fl(max[1]),
+        fl(max[2]),
         path = full.display().to_string(),
         words = bevy_nds_3d_obj::format_words_rust(&model.words),
     )
@@ -116,10 +123,13 @@ fn parse_args(input: TokenStream) -> Result<Args, String> {
     let mut trees = input.into_iter().peekable();
 
     let path = match trees.next() {
-        Some(TokenTree::Literal(lit)) => unquote(&lit.to_string())
-            .ok_or_else(|| "include_obj!: first argument must be a string-literal path".to_string())?,
+        Some(TokenTree::Literal(lit)) => unquote(&lit.to_string()).ok_or_else(|| {
+            "include_obj!: first argument must be a string-literal path".to_string()
+        })?,
         _ => {
-            return Err("include_obj! expects a path, e.g. include_obj!(\"assets/model.obj\")".into());
+            return Err(
+                "include_obj! expects a path, e.g. include_obj!(\"assets/model.obj\")".into(),
+            );
         }
     };
 
@@ -191,7 +201,11 @@ fn parse_f32_triple(stream: &TokenStream) -> Result<[f32; 3], String> {
                 pending_neg = false;
                 i += 1;
             }
-            other => return Err(format!("include_obj!: unexpected token `{other}` in offset")),
+            other => {
+                return Err(format!(
+                    "include_obj!: unexpected token `{other}` in offset"
+                ));
+            }
         }
     }
     if i != 3 {

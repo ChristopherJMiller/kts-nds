@@ -313,10 +313,7 @@ fn display_list(tris: &[Tri], compress: bool) -> (Vec<u32>, [[f32; 3]; 2]) {
 /// Pack four FIFO command IDs into one little-endian word (`c0` in the low byte),
 /// matching libnds' `FIFO_COMMAND_PACK`.
 fn fifo_pack(cmds: [u8; 4]) -> u32 {
-    (cmds[0] as u32)
-        | ((cmds[1] as u32) << 8)
-        | ((cmds[2] as u32) << 16)
-        | ((cmds[3] as u32) << 24)
+    (cmds[0] as u32) | ((cmds[1] as u32) << 8) | ((cmds[2] as u32) << 16) | ((cmds[3] as u32) << 24)
 }
 
 /// Encode `(command, args)` ops into the display-list `u32` stream: a leading
@@ -385,7 +382,10 @@ mod tests {
     fn fifo_pack_is_little_endian() {
         assert_eq!(fifo_pack([0x40, 0x21, 0x23, 0x41]), 0x4123_2140);
         // NOP padding lands in the high bytes.
-        assert_eq!(fifo_pack([FIFO_END, FIFO_NOP, FIFO_NOP, FIFO_NOP]), 0x0000_0041);
+        assert_eq!(
+            fifo_pack([FIFO_END, FIFO_NOP, FIFO_NOP, FIFO_NOP]),
+            0x0000_0041
+        );
     }
 
     /// One triangle → BEGIN + 3×(NORMAL, VERTEX16) + END = 8 ops, packed four to
@@ -446,11 +446,21 @@ mod tests {
     #[test]
     fn center_recentres_bounds() {
         let src = "v 0 0 0\nv 2 0 0\nv 0 2 0\nf 1 2 3\n";
-        let m = obj_to_display_list(src, &Options { center: true, ..Default::default() }).unwrap();
+        let m = obj_to_display_list(
+            src,
+            &Options {
+                center: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         // Original midpoint was (0.666, 0.666, 0); after centring, bounds are
         // symmetric about the origin on each axis.
         for k in 0..3 {
-            assert!((m.aabb[0][k] + m.aabb[1][k]).abs() < 1e-4, "axis {k} not centred");
+            assert!(
+                (m.aabb[0][k] + m.aabb[1][k]).abs() < 1e-4,
+                "axis {k} not centred"
+            );
         }
     }
 
@@ -470,8 +480,14 @@ mod tests {
     fn compress_shrinks_display_list() {
         let src = "v 0 0 0\nv 1 0 0\nv 0 1 0\nvn 0 0 1\nf 1//1 2//1 3//1\n";
         let plain = obj_to_display_list(src, &Options::default()).unwrap();
-        let packed =
-            obj_to_display_list(src, &Options { compress: true, ..Default::default() }).unwrap();
+        let packed = obj_to_display_list(
+            src,
+            &Options {
+                compress: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         // One triangle = 3 vertices; compression saves one word per vertex.
         assert_eq!(plain.words.len() - packed.words.len(), 3);
         assert_eq!(plain.aabb, packed.aabb);

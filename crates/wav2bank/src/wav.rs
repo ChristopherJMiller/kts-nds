@@ -44,7 +44,9 @@ fn read_u32(bytes: &[u8], off: usize) -> Option<u32> {
 
 /// Read a little-endian `u16` at `off`, or `None` if out of range.
 fn read_u16(bytes: &[u8], off: usize) -> Option<u16> {
-    bytes.get(off..off + 2).map(|b| u16::from_le_bytes([b[0], b[1]]))
+    bytes
+        .get(off..off + 2)
+        .map(|b| u16::from_le_bytes([b[0], b[1]]))
 }
 
 /// Parse the `fmt ` and `data` chunks of a RIFF/WAVE file.

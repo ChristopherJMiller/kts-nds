@@ -61,6 +61,7 @@ concepts so game code doesn't deal with it directly:
 | —                        | a smoothed `Fps` resource for diagnostics                            | `DiagnosticsPlugin` |
 | Tiled text background    | `Glyph` / `DsText` + `TilePos`, drawn by an extraction system        | `RenderPlugin`      |
 | 3D geometry engine       | `Transform3d` + `DsMesh` + a `Camera3d` resource (in `bevy_nds_3d`)  | `Ds3dPlugin`        |
+| ARM7 sound (maxmod)      | `Music` resource (looping) + `PlaySfx` events (in `bevy_nds_audio`)  | `AudioPlugin`       |
 
 `DsPlugins` bundles all of it, and `bevy_nds::run(app)` installs the runner that
 owns the frame loop (`swiWaitForVBlank` → `app.update()`).
@@ -139,8 +140,10 @@ For the smaller, faster build, append `release`, e.g. `just run release`.
 
 The hardware-independent logic has unit tests: the render diffing, the
 timer-tick→nanoseconds conversion, the FPS smoothing, the button-mask mapping
-(`bevy_nds`), the OBJ→display-list packing (`bevy_nds_3d_obj`), and the
-view-frustum culling math (`bevy_nds_3d_cull`). They run on the host, not the DS:
+(`bevy_nds`), the OBJ→display-list packing (`bevy_nds_3d_obj`), the
+view-frustum culling math (`bevy_nds_3d_cull`), the WAV loop-injection and
+soundbank-ID parsing (`wav2bank`), and the audio volume/panning quantisation
+(`bevy_nds_audio`). They run on the host, not the DS:
 
 ```sh
 just test          # run all host unit tests
@@ -184,10 +187,34 @@ crates/bevy_nds_3d/             hardware 3D backend (Transform3d, DsMesh, Camera
 crates/bevy_nds_3d_obj/         host OBJ -> display-list encoder (shared packing math)
 crates/bevy_nds_3d_macros/      include_obj! proc-macro (bakes a model into the ROM)
 crates/bevy_nds_3d_cull/        pure, host-testable view-frustum culling math
+crates/bevy_nds_audio/          maxmod audio backend (Music resource, PlaySfx events)
+  src/lib.rs                      AudioPlugin, Music/PlaySfx API, soundbank loading
+  src/ffi.rs                      FFI to the maxmod ARM9 API (+ soundEnable, nitroFSInit)
+  src/sfx.rs                      pure, host-testable volume/panning + load bookkeeping
+crates/wav2bank/                host CLI/lib: WAV -> soundbank.bin via mmutil (used by build.rs)
 crates/obj2dl/                  host CLI/lib: OBJ -> .dl NitroFS asset (used by build.rs)
 assets/                         uncompiled source models (e.g. teapot.obj)
-build/nitrofs/                  compiled .dl assets, packed into the ROM (gitignored)
+audio/                          uncompiled source sounds (music/*.wav, sfx/*.wav)
+build/nitrofs/                  compiled .dl + soundbank.bin, packed into the ROM (gitignored)
 ```
+
+### Audio pipeline
+
+Sound on the DS is mixed on the **ARM7** core by [maxmod], driven from the ARM9
+over the FIFO/IPC — so audio is the project's first second-core dependency: the
+ROM must embed the maxmod ARM7 core (`just rom` selects `arm7_maxmod.elf`) and
+link against `-lmm9`. Like models, sounds are baked host-side: `wav2bank` wraps
+BlocksDS's `mmutil` to turn `audio/{music,sfx}/*.wav` into a single
+`soundbank.bin`, emitting a Rust module of the generated `SFX_*` IDs that the
+game `include!`s (so it never hard-codes indices). `build.rs` runs it into
+`build/nitrofs/soundbank.bin`, which `just rom` packs into the ROM; maxmod loads
+it from `nitro:/` at runtime. Music loops because `wav2bank` injects a
+forward-loop `smpl` chunk into `music/*.wav` before baking (maxmod only loops a
+PCM sample that carries one). Game code plays sound through ordinary Bevy: a
+declarative `Music` resource (looping background track) and one-shot `PlaySfx`
+events, with no FFI.
+
+[maxmod]: https://maxmod.devkitpro.org/
 
 ### Asset pipeline
 
@@ -235,8 +262,8 @@ pub extern "C" fn main() -> core::ffi::c_int {
 ```
 
 `src/main.rs` is the full example: the hardware-lit teapot loaded from NitroFS,
-D-pad movement across both screens (the `Display3d` swap), ABXY rotation, and the
-HUD.
+D-pad movement across both screens (the `Display3d` swap), ABXY rotation, looping
+maxmod music with a click SFX on teapot selection (`AudioPlugin`), and the HUD.
 
 ## Build details
 

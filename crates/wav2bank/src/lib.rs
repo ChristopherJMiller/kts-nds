@@ -145,10 +145,10 @@ pub fn build_dir(
     let mut prepared = Vec::new();
     let mut inputs = Vec::new();
     for path in music.iter() {
-        let bytes = std::fs::read(path)
-            .map_err(|e| format!("could not read {}: {e}", path.display()))?;
-        let looped = wav::inject_forward_loop(&bytes)
-            .map_err(|e| format!("{}: {e}", path.display()))?;
+        let bytes =
+            std::fs::read(path).map_err(|e| format!("could not read {}: {e}", path.display()))?;
+        let looped =
+            wav::inject_forward_loop(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
         let dst = work.join(path.file_name().unwrap());
         std::fs::write(&dst, &looped)
             .map_err(|e| format!("could not write {}: {e}", dst.display()))?;
@@ -157,8 +157,7 @@ pub fn build_dir(
     }
     for path in sfx.iter() {
         let dst = work.join(path.file_name().unwrap());
-        std::fs::copy(path, &dst)
-            .map_err(|e| format!("could not copy {}: {e}", path.display()))?;
+        std::fs::copy(path, &dst).map_err(|e| format!("could not copy {}: {e}", path.display()))?;
         prepared.push(dst);
         inputs.push(path.clone());
     }

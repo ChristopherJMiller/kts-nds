@@ -57,12 +57,30 @@ impl Frustum {
             planes: [
                 // Looking down -Z: a point is inside when -z ∈ [near, far] and
                 // |x| ≤ -z·thx, |y| ≤ -z·th.
-                Plane { n: [1.0, 0.0, -thx], d: 0.0 }, // left
-                Plane { n: [-1.0, 0.0, -thx], d: 0.0 }, // right
-                Plane { n: [0.0, 1.0, -th], d: 0.0 },  // bottom
-                Plane { n: [0.0, -1.0, -th], d: 0.0 }, // top
-                Plane { n: [0.0, 0.0, -1.0], d: -near }, // near
-                Plane { n: [0.0, 0.0, 1.0], d: far },  // far
+                Plane {
+                    n: [1.0, 0.0, -thx],
+                    d: 0.0,
+                }, // left
+                Plane {
+                    n: [-1.0, 0.0, -thx],
+                    d: 0.0,
+                }, // right
+                Plane {
+                    n: [0.0, 1.0, -th],
+                    d: 0.0,
+                }, // bottom
+                Plane {
+                    n: [0.0, -1.0, -th],
+                    d: 0.0,
+                }, // top
+                Plane {
+                    n: [0.0, 0.0, -1.0],
+                    d: -near,
+                }, // near
+                Plane {
+                    n: [0.0, 0.0, 1.0],
+                    d: far,
+                }, // far
             ],
         }
     }
@@ -102,9 +120,18 @@ pub fn world_aabb(
     rotation_radians: [f32; 3],
     scale: [f32; 3],
 ) -> ([f32; 3], [f32; 3]) {
-    let (sx, cx) = (libm::sinf(rotation_radians[0]), libm::cosf(rotation_radians[0]));
-    let (sy, cy) = (libm::sinf(rotation_radians[1]), libm::cosf(rotation_radians[1]));
-    let (sz, cz) = (libm::sinf(rotation_radians[2]), libm::cosf(rotation_radians[2]));
+    let (sx, cx) = (
+        libm::sinf(rotation_radians[0]),
+        libm::cosf(rotation_radians[0]),
+    );
+    let (sy, cy) = (
+        libm::sinf(rotation_radians[1]),
+        libm::cosf(rotation_radians[1]),
+    );
+    let (sz, cz) = (
+        libm::sinf(rotation_radians[2]),
+        libm::cosf(rotation_radians[2]),
+    );
 
     let mut min = [f32::INFINITY; 3];
     let mut max = [f32::NEG_INFINITY; 3];
@@ -112,9 +139,21 @@ pub fn world_aabb(
     for i in 0..8 {
         // Pick this corner from min/max along each axis.
         let c = [
-            if i & 1 == 0 { local_min[0] } else { local_max[0] },
-            if i & 2 == 0 { local_min[1] } else { local_max[1] },
-            if i & 4 == 0 { local_min[2] } else { local_max[2] },
+            if i & 1 == 0 {
+                local_min[0]
+            } else {
+                local_max[0]
+            },
+            if i & 2 == 0 {
+                local_min[1]
+            } else {
+                local_max[1]
+            },
+            if i & 4 == 0 {
+                local_min[2]
+            } else {
+                local_max[2]
+            },
         ];
         // Scale.
         let s = [c[0] * scale[0], c[1] * scale[1], c[2] * scale[2]];

@@ -22,11 +22,7 @@ pub use bevy_nds_3d_obj::Options;
 pub const ASSET_EXT: &str = "dl";
 
 /// Bake a single OBJ file into a `.dl` asset, creating parent directories.
-pub fn convert_file(
-    input: &Path,
-    output: &Path,
-    opts: &Options,
-) -> Result<usize, String> {
+pub fn convert_file(input: &Path, output: &Path, opts: &Options) -> Result<usize, String> {
     let source = std::fs::read_to_string(input)
         .map_err(|e| format!("could not read {}: {e}", input.display()))?;
     let model = bevy_nds_3d_obj::obj_to_display_list(&source, opts)
@@ -58,11 +54,7 @@ pub struct Built {
 /// All models use the same [`Options`]; per-model settings are the job of the
 /// compile-time `include_obj!` path. Returns the list of compiled assets so a
 /// `build.rs` can emit `cargo:rerun-if-changed` lines for each source.
-pub fn build_dir(
-    src_dir: &Path,
-    dst_dir: &Path,
-    opts: &Options,
-) -> Result<Vec<Built>, String> {
+pub fn build_dir(src_dir: &Path, dst_dir: &Path, opts: &Options) -> Result<Vec<Built>, String> {
     let mut built = Vec::new();
     let entries = std::fs::read_dir(src_dir)
         .map_err(|e| format!("could not read {}: {e}", src_dir.display()))?;
