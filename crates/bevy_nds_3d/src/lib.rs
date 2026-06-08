@@ -39,7 +39,7 @@ use core::f32::consts::TAU;
 
 use bevy_app::prelude::*;
 use bevy_ecs::prelude::*;
-use bevy_math::Vec3;
+use bevy_math::{Mat4, Vec3};
 use bevy_nds::DsScreen;
 use bevy_nds_3d_cull::{Frustum, world_aabb};
 
@@ -65,6 +65,19 @@ fn to_v16(v: f32) -> i16 {
 /// Convert radians to DS angle units.
 fn rad_to_angle(rad: f32) -> i32 {
     (rad * (ANGLE_FULL_CIRCLE / TAU)) as i32
+}
+
+/// Compose an object's model matrix on the CPU (`T · Rx · Ry · Rz · S`, matching
+/// the order the Geometry Engine would apply the individual ops) and convert it
+/// to a column-major 20.12 fixed-point 4x4 for `MTX_MULT_4x4`. Sending one
+/// matrix replaces five separate GE matrix commands per object.
+fn model_matrix(transform: &Transform3d) -> [i32; 16] {
+    let m = Mat4::from_translation(transform.translation)
+        * Mat4::from_rotation_x(transform.rotation.x)
+        * Mat4::from_rotation_y(transform.rotation.y)
+        * Mat4::from_rotation_z(transform.rotation.z)
+        * Mat4::from_scale(transform.scale);
+    m.to_cols_array().map(to_fix)
 }
 
 /// A single coloured vertex in model space. Colour channels are 0-255 (the DS
@@ -596,19 +609,7 @@ fn render_3d(
             }
 
             gl::push_matrix();
-            gl::translate(
-                to_fix(transform.translation.x),
-                to_fix(transform.translation.y),
-                to_fix(transform.translation.z),
-            );
-            ffi::glRotatef32i(rad_to_angle(transform.rotation.x), 1 << 12, 0, 0);
-            ffi::glRotatef32i(rad_to_angle(transform.rotation.y), 0, 1 << 12, 0);
-            ffi::glRotatef32i(rad_to_angle(transform.rotation.z), 0, 0, 1 << 12);
-            gl::scale(
-                to_fix(transform.scale.x),
-                to_fix(transform.scale.y),
-                to_fix(transform.scale.z),
-            );
+            gl::mult_matrix_4x4(&model_matrix(transform));
 
             if mesh.lit {
                 let m = mat.copied().unwrap_or_default();

@@ -30,10 +30,12 @@ There are several crates:
 </p>
 
 The demo renders a hardware-lit Utah teapot on one screen and a text HUD on the
-other. The D-pad moves the teapot, ABXY rotate it, and moving it off the edge
-sends it to the other screen. The model is loaded at runtime from the ROM
-filesystem (NitroFS), falling back to a copy baked into the binary if the
-filesystem is unavailable — the HUD shows which path was taken.
+other, with a smaller second teapot spinning beside it (two independent model
+matrices composed on the CPU each frame). The D-pad moves the player's teapot,
+ABXY rotate it, and moving it off the edge sends it to the other screen. The
+models are loaded at runtime from the ROM filesystem (NitroFS), falling back to a
+copy baked into the binary if the filesystem is unavailable — the HUD shows which
+path was taken.
 
 The screen-crossing follows from the hardware layout: the 3D core is attached to
 the main 2D engine, and the `POWER_SWAP_LCDS` bit selects which physical LCD that

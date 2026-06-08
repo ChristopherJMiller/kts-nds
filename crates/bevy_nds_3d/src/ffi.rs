@@ -57,7 +57,7 @@ const MATRIX_CONTROL: *mut u32 = 0x0400_0440 as *mut u32;
 const MATRIX_PUSH: *mut u32 = 0x0400_0444 as *mut u32;
 const MATRIX_POP: *mut u32 = 0x0400_0448 as *mut u32;
 const MATRIX_TRANSLATE: *mut i32 = 0x0400_0470 as *mut i32;
-const MATRIX_SCALE: *mut i32 = 0x0400_046C as *mut i32;
+const MATRIX_MULT_4X4: *mut i32 = 0x0400_0460 as *mut i32;
 const MATRIX_IDENTITY: *mut u32 = 0x0400_0454 as *mut u32;
 
 // --- GL enums / constants (see <nds/arm9/videoGL.h>) -------------------------
@@ -118,9 +118,6 @@ unsafe extern "C" {
     /// Load a perspective projection. `fovy` is in DS angle units
     /// (`degrees * 32768 / 360`); `aspect`, `znear`, `zfar` are 20.12 fixed.
     pub fn gluPerspectivef32(fovy: c_int, aspect: c_int, znear: c_int, zfar: c_int);
-    /// Multiply the current matrix by a rotation of `angle` (DS angle units)
-    /// about the axis `(x, y, z)`.
-    pub fn glRotatef32i(angle: c_int, x: i32, y: i32, z: i32);
     /// Send a packed display list to the Geometry Engine via asynchronous DMA.
     /// The first word of `list` is the body length in `u32`s, followed by the
     /// packed command stream. See `<nds/arm9/videoGL.h>`.
@@ -232,12 +229,15 @@ pub mod gl {
         }
     }
 
-    /// Multiply the current matrix by a scale, components in 20.12 fixed.
-    pub unsafe fn scale(x: i32, y: i32, z: i32) {
+    /// Multiply the current matrix by a full 4x4 matrix (`MTX_MULT_4x4`),
+    /// column-major, each component in 20.12 fixed. Composing an object's
+    /// transform on the CPU and sending it as one matrix replaces the separate
+    /// translate/rotate/rotate/rotate/scale Geometry Engine commands.
+    pub unsafe fn mult_matrix_4x4(m: &[i32; 16]) {
         unsafe {
-            write_volatile(MATRIX_SCALE, x);
-            write_volatile(MATRIX_SCALE, y);
-            write_volatile(MATRIX_SCALE, z);
+            for &word in m {
+                write_volatile(MATRIX_MULT_4X4, word);
+            }
         }
     }
 
