@@ -76,8 +76,11 @@ rom profile="debug": (_build profile)
     : "${BLOCKSDS:?Run 'nix develop' first so BLOCKSDS is set}"
     elf="{{target_dir}}/{{profile}}/bevy-ds.elf"
     ndstool="$BLOCKSDS/tools/ndstool/ndstool"
-    arm7="$BLOCKSDS/sys/arm7/main_core/arm7_minimal.elf"
-    [ -f "$arm7" ] || arm7="$BLOCKSDS/sys/arm7/main_core/arm7_maxmod.elf"
+    # Audio is mixed on the ARM7 by maxmod, so the ROM must embed the maxmod ARM7
+    # core (the `minimal` core has no sound). Prefer it; fall back to minimal only
+    # if this BlocksDS install somehow lacks it (audio would then be silent).
+    arm7="$BLOCKSDS/sys/arm7/main_core/arm7_maxmod.elf"
+    [ -f "$arm7" ] || arm7="$BLOCKSDS/sys/arm7/main_core/arm7_minimal.elf"
     nitrofs_args=()
     [ -d build/nitrofs ] && nitrofs_args=(-d build/nitrofs)
     "$ndstool" -c "{{rom}}" -7 "$arm7" -9 "$elf" \

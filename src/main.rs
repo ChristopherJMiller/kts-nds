@@ -2,8 +2,9 @@
 //!
 //! Everything here is ordinary Bevy — components, systems, resources. The DS
 //! itself is handled entirely by the [`bevy_nds`] library via [`DsPlugins`]
-//! (the platform layer) and [`bevy_nds_3d`] via [`Ds3dPlugin`] (the hardware 3D
-//! backend): this file contains no FFI, no allocator and no panic handler.
+//! (the platform layer), [`bevy_nds_3d`] via [`Ds3dPlugin`] (the hardware 3D
+//! backend) and [`bevy_nds_audio`] via [`AudioPlugin`] (maxmod sound): this
+//! file contains no FFI, no allocator and no panic handler.
 //!
 //! A hardware-rendered, hardware-*lit* Utah teapot starts on the bottom screen,
 //! with a smaller second teapot spinning beside it. The model is loaded at
@@ -14,6 +15,8 @@
 //! and when it runs off the top or bottom edge it *travels to the other screen*
 //! (a coupled LCD swap, since the DS 3D core is wired to the main engine). ABXY
 //! tumble it so you can watch the hardware lighting play across the surface.
+//! Looping piano music plays from the baked soundbank (START toggles it), and
+//! tapping a teapot fires a click SFX.
 
 #![no_std]
 #![no_main]
@@ -26,6 +29,15 @@ use bevy_app::prelude::*;
 use bevy_ecs::prelude::*;
 use bevy_nds::prelude::*;
 use bevy_nds_3d::prelude::*;
+use bevy_nds_audio::prelude::*;
+
+/// Numeric sound IDs generated at build time by `wav2bank` from the soundbank
+/// header (e.g. `SFX_PIANO_LOOP`, `SFX_BLIP_SELECT`), so game code never hard-codes
+/// indices. Written to `$OUT_DIR/sounds.rs` by `build.rs`.
+mod sounds {
+    #![allow(dead_code)] // mmutil also emits MSL_* bank-metadata counts we don't use.
+    include!(concat!(env!("OUT_DIR"), "/sounds.rs"));
+}
 
 /// Program entry point, called by the BlocksDS crt0.
 #[unsafe(no_mangle)]
@@ -34,6 +46,7 @@ pub extern "C" fn main() -> core::ffi::c_int {
     app.add_plugins(DsPlugins)
         .add_plugins(Ds3dPlugin)
         .add_plugins(NitroFsPlugin)
+        .add_plugins(AudioPlugin)
         .add_plugins(GamePlugin);
     bevy_nds::run(app)
 }
@@ -59,6 +72,8 @@ impl Plugin for GamePlugin {
                 update_pick_hud,
                 update_gesture_hud,
                 poke_picked,
+                toggle_music,
+                update_audio_hud,
             ),
         );
     }
@@ -90,11 +105,15 @@ struct PickHud;
 #[derive(Component)]
 struct GestureHud;
 
+/// A status line reflecting the music state (playing/muted).
+#[derive(Component)]
+struct AudioHud;
+
 /// World-space Y past which the model has left the screen and crosses to the
 /// other one. Sized to the camera frustum so the model is fully off-screen first.
 const EDGE: f32 = 1.6;
 
-fn setup(mut commands: Commands, nitrofs: Res<NitroFs>) {
+fn setup(mut commands: Commands, nitrofs: Res<NitroFs>, mut music: ResMut<Music>) {
     // The Utah teapot. We prefer to load it at runtime from the ROM filesystem
     // (NitroFS) — `build.rs` bakes `assets/teapot.obj` into `nitro:/teapot.dl`,
     // which `just rom` packs into the ROM. This keeps large models out of the
@@ -174,6 +193,12 @@ fn setup(mut commands: Commands, nitrofs: Res<NitroFs>) {
     ));
     commands.spawn((
         DsScreen::Bottom,
+        TilePos::new(2, 9),
+        AudioHud,
+        DsText::new("music: --"),
+    ));
+    commands.spawn((
+        DsScreen::Bottom,
         TilePos::new(2, 20),
         DsText::new("tap a teapot to pick it"),
     ));
@@ -185,8 +210,14 @@ fn setup(mut commands: Commands, nitrofs: Res<NitroFs>) {
     commands.spawn((
         DsScreen::Bottom,
         TilePos::new(5, 22),
-        DsText::new("ABXY: rotate the teapot"),
+        DsText::new("ABXY: rotate  START: mute"),
     ));
+
+    // Kick off the looping piano background music. `Music` is declarative — the
+    // audio backend reconciles the hardware to this each frame — so starting it
+    // here in `Startup` is safe regardless of when the soundbank finishes
+    // mounting in `PreStartup`.
+    music.play(SoundId(sounds::SFX_PIANO_LOOP));
 }
 
 /// Move the model with the D-pad. When it runs off the top or bottom edge, swap
@@ -299,8 +330,14 @@ fn update_pick_hud(
 }
 
 /// Tapping a teapot gives it a visible nudge, proving the pick is the real
-/// entity: the picked teapot (and only it) tumbles on each fresh pen-down.
-fn poke_picked(touches: Res<Touches>, pick: Res<TouchPick>, mut query: Query<&mut Transform3d>) {
+/// entity: the picked teapot (and only it) tumbles on each fresh pen-down. The
+/// same pen-down fires a click SFX so selecting an object is audible.
+fn poke_picked(
+    touches: Res<Touches>,
+    pick: Res<TouchPick>,
+    mut sfx: EventWriter<PlaySfx>,
+    mut query: Query<&mut Transform3d>,
+) {
     if !touches.any_just_pressed() {
         return;
     }
@@ -308,6 +345,39 @@ fn poke_picked(touches: Res<Touches>, pick: Res<TouchPick>, mut query: Query<&mu
         && let Ok(mut transform) = query.get_mut(entity)
     {
         transform.rotation.y += core::f32::consts::FRAC_PI_2;
+        sfx.write(PlaySfx::new(SoundId(sounds::SFX_BLIP_SELECT)));
+    }
+}
+
+/// Toggle the background music on and off with START, demonstrating the
+/// declarative [`Music`] resource: setting/clearing the desired track is all the
+/// game does; the backend reconciles the hardware.
+fn toggle_music(input: Res<ButtonInput<DsButton>>, mut music: ResMut<Music>) {
+    if input.just_pressed(DsButton::Start) {
+        if music.is_playing() {
+            music.stop();
+        } else {
+            music.play(SoundId(sounds::SFX_PIANO_LOOP));
+        }
+    }
+}
+
+/// Reflect the music state on its HUD line.
+fn update_audio_hud(
+    audio: Res<Audio>,
+    music: Res<Music>,
+    mut query: Query<&mut DsText, With<AudioHud>>,
+) {
+    let state = if !audio.ready {
+        "unavailable"
+    } else if music.is_playing() {
+        "playing"
+    } else {
+        "muted"
+    };
+    for mut text in &mut query {
+        text.0.clear();
+        let _ = write!(text.0, "music: {state}");
     }
 }
 
