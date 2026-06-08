@@ -73,6 +73,9 @@ they don't need (e.g. drop `bevy_nds_text` for a sprite-only game).
 - **`crates/bevy_nds_time`** — drives Bevy's `Time` off the hardware bus-clock timer.
 - **`crates/bevy_nds_diagnostics`** — smoothed `Fps` resource.
 - **`crates/bevy_nds_text`** — tile-console text renderer (`Glyph`/`DsText`/`TilePos`).
+- **`crates/bevy_nds_sprite`** — 2D hardware sprites (OAM) on the sub engine.
+  MVP embeds one 16x16 4bpp sprite + 16-colour palette; the next step is a
+  host-side `grit` wrapper (sibling to `obj2dl` / `wav2bank`).
 - **`crates/bevy_nds_nitrofs`** — mounts the ROM filesystem and exposes
   `read_file` / `flush_dcache`. Shared by 3D, audio, and any future asset loader.
 
@@ -135,6 +138,7 @@ starting in its own crate.
 | Vertical-blank @ 60 Hz   | `set_runner` loop + hardware `Time` resource            | `bevy_nds_runtime::run` + `bevy_nds_time::TimePlugin` |
 | —                        | smoothed `Fps` resource                                 | `bevy_nds_diagnostics::DiagnosticsPlugin`           |
 | Tiled text background    | `Glyph` / `DsText` + `TilePos`, extracted each frame    | `bevy_nds_text::TextRenderPlugin`                   |
+| 2D sprites (OAM)         | `Sprite` component (x, y in pixels)                     | `bevy_nds_sprite::SpritePlugin`                     |
 | 3D geometry engine       | `Transform3d` + `DsMesh` + `Camera3d` resource          | `bevy_nds_3d::Ds3dPlugin`                           |
 | ARM7 sound (maxmod)      | `Music` resource (looping) + `PlaySfx` events           | `bevy_nds_audio::AudioPlugin`                       |
 

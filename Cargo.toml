@@ -8,6 +8,7 @@ members = [
   "crates/bevy_nds_time",
   "crates/bevy_nds_diagnostics",
   "crates/bevy_nds_text",
+  "crates/bevy_nds_sprite",
   "crates/bevy_nds_nitrofs",
   "crates/bevy_nds_3d",
   "crates/bevy_nds_3d_macros",
@@ -32,6 +33,7 @@ edition = "2024"
 bevy_nds = { path = "crates/bevy_nds" }
 bevy_nds_3d = { path = "crates/bevy_nds_3d" }
 bevy_nds_audio = { path = "crates/bevy_nds_audio" }
+bevy_nds_sprite = { path = "crates/bevy_nds_sprite" }
 
 bevy_app = { version = "0.16", default-features = false, features = [
   "critical-section",
@@ -98,6 +100,9 @@ opt-level = 3
 opt-level = 3
 
 [profile.dev.package.bevy_nds_text]
+opt-level = 3
+
+[profile.dev.package.bevy_nds_sprite]
 opt-level = 3
 
 [profile.dev.package.bevy_nds_nitrofs]

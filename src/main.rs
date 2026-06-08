@@ -28,6 +28,7 @@ use bevy_ecs::prelude::*;
 use bevy_nds::prelude::*;
 use bevy_nds_3d::prelude::*;
 use bevy_nds_audio::prelude::*;
+use bevy_nds_sprite::prelude::*;
 
 /// Numeric sound IDs generated at build time by `wav2bank` from the soundbank
 /// header (e.g. `SFX_PIANO_LOOP`, `SFX_BLIP_SELECT`), so game code never hard-codes
@@ -44,6 +45,7 @@ pub extern "C" fn main() -> core::ffi::c_int {
     app.add_plugins(DsPlugins)
         .add_plugins(Ds3dPlugin)
         .add_plugins(AudioPlugin)
+        .add_plugins(SpritePlugin)
         .add_plugins(GamePlugin);
     bevy_nds::run(app)
 }
@@ -67,6 +69,7 @@ impl Plugin for GamePlugin {
                 spin_companion,
                 sync_map_to_world,
                 sync_marker_glyph,
+                sync_marker_sprite,
                 update_hud,
                 update_touch_hud,
                 update_pick_hud,
@@ -277,14 +280,18 @@ fn setup(mut commands: Commands, nitrofs: Res<NitroFs>, mut music: ResMut<Music>
         ));
     }
 
-    // Player marker (`@`) — drawn on top of the underlying floor by the text
-    // renderer (texts compose first, glyphs overlay). `sync_marker_glyph`
-    // updates its `TilePos` from the player's `MapPos` each frame.
+    // Player marker — a tile-console `Glyph` (`@`) that the text renderer
+    // overlays on the static map, PLUS a 16x16 hardware sprite drawn on top
+    // of the same cell by `bevy_nds_sprite`. The sprite proves the OAM
+    // pipeline; the glyph remains as a fallback if the sprite engine isn't
+    // up. Both follow the player's `MapPos` via `sync_marker_*`.
+    let start_tile = cell_to_tile(player_start);
     commands.spawn((
         PlayerMarker,
         DsScreen::Bottom,
-        cell_to_tile(player_start),
+        start_tile,
         Glyph(b'@'),
+        Sprite::at(start_tile.x * 8, start_tile.y * 8),
     ));
 
     // Companion marker (`O`). It doesn't move, so its `TilePos` is static.
@@ -433,6 +440,23 @@ fn sync_marker_glyph(
     };
     for mut tile in &mut marker {
         *tile = cell_to_tile(*pos);
+    }
+}
+
+/// Keep the hardware sprite covering the player's `@` glyph aligned with its
+/// current cell. Same `Changed<MapPos>` gating as the glyph: the sprite only
+/// moves on the frame the player walks.
+fn sync_marker_sprite(
+    player: Query<&MapPos, (With<Player>, Changed<MapPos>)>,
+    mut marker: Query<&mut Sprite, With<PlayerMarker>>,
+) {
+    let Some(pos) = player.iter().next() else {
+        return;
+    };
+    let tile = cell_to_tile(*pos);
+    for mut sprite in &mut marker {
+        sprite.x = tile.x * 8;
+        sprite.y = tile.y * 8;
     }
 }
 

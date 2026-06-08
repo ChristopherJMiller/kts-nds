@@ -1,0 +1,24 @@
+[package]
+name = "bevy_nds_sprite"
+version = "0.1.0"
+edition = "2024"
+description = "2D hardware sprites (OAM) for bevy_nds (no_std)."
+
+# Drives the DS hardware OAM ("sprite" engine) — up to 128 movable image
+# objects per 2D engine, layered on top of the BG layers. Sprites can coexist
+# with `bevy_nds_text`'s tile console (they're a separate display layer) and
+# with `bevy_nds_3d` (which preempts the engine they share into 3D mode, so
+# the sprite layer goes on the *other* engine — typically the sub engine
+# whenever 3D is on the main engine, and vice versa).
+
+[lib]
+
+[dependencies]
+bevy_nds_video = { path = "../bevy_nds_video" }
+
+bevy_app = { version = "0.16", default-features = false, features = [
+  "critical-section",
+] }
+bevy_ecs = { version = "0.16", default-features = false, features = [
+  "critical-section",
+] }

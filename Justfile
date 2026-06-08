@@ -60,6 +60,7 @@ test *args:
         -p bevy_nds_input \
         -p bevy_nds_gesture \
         -p bevy_nds_text \
+        -p bevy_nds_sprite \
         -p bevy_nds_3d_cull \
         -p wav2bank \
         -p bevy_nds_audio \

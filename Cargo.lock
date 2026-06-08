@@ -47,6 +47,7 @@ dependencies = [
  "bevy_nds",
  "bevy_nds_3d",
  "bevy_nds_audio",
+ "bevy_nds_sprite",
  "bevy_time",
  "obj2dl",
  "wav2bank",
@@ -267,6 +268,15 @@ version = "0.1.0"
 dependencies = [
  "bevy_app",
  "critical-section",
+]
+
+[[package]]
+name = "bevy_nds_sprite"
+version = "0.1.0"
+dependencies = [
+ "bevy_app",
+ "bevy_ecs",
+ "bevy_nds_video",
 ]
 
 [[package]]

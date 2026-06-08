@@ -28,6 +28,9 @@ drop `bevy_nds_text` for a sprite-only game).
   resource.
 - **`bevy_nds_text`** (`crates/bevy_nds_text`) — tile-console text renderer,
   expressed as an ECS extraction step (diffed, flicker-free).
+- **`bevy_nds_sprite`** (`crates/bevy_nds_sprite`) — 2D hardware sprites
+  (OAM): up to 128 movable image objects on the sub engine, drawn over the
+  text/tile background.
 - **`bevy_nds_nitrofs`** (`crates/bevy_nds_nitrofs`) — mounts the ROM filesystem
   in `PreStartup` and provides `read_file` / `flush_dcache`. Shared by `bevy_nds_3d`,
   `bevy_nds_audio`, and any future asset-loading subsystem.
@@ -83,6 +86,7 @@ concepts so game code doesn't deal with it directly:
 | Vertical-blank @ ~60 Hz  | a `set_runner` frame loop + a real `Time` resource (hardware timer)   | `bevy_nds_runtime::run` + `bevy_nds_time::TimePlugin` |
 | —                        | a smoothed `Fps` resource for diagnostics                             | `bevy_nds_diagnostics::DiagnosticsPlugin`        |
 | Tiled text background    | `Glyph` / `DsText` + `TilePos`, drawn by an extraction system         | `bevy_nds_text::TextRenderPlugin`                |
+| 2D hardware sprites (OAM) | `Sprite` component (x, y in pixels)                                  | `bevy_nds_sprite::SpritePlugin`                  |
 | 3D geometry engine       | `Transform3d` + `DsMesh` + a `Camera3d` resource                      | `bevy_nds_3d::Ds3dPlugin`                        |
 | ARM7 sound (maxmod)      | `Music` resource (looping) + `PlaySfx` events                         | `bevy_nds_audio::AudioPlugin`                    |
 
@@ -208,6 +212,7 @@ crates/bevy_nds_gesture/        tap/long-press/swipe/drag from the touch stream 
 crates/bevy_nds_time/           real-time Time from the hardware timer (TimePlugin)
 crates/bevy_nds_diagnostics/    smoothed Fps resource (DiagnosticsPlugin)
 crates/bevy_nds_text/           Glyph/DsText/TilePos + diffed render system (TextRenderPlugin)
+crates/bevy_nds_sprite/         OAM (hardware sprites) plugin (SpritePlugin)
 crates/bevy_nds_nitrofs/        NitroFsPlugin + read_file + flush_dcache (shared by 3d/audio)
 crates/bevy_nds_3d/             hardware 3D backend (Transform3d, DsMesh, Camera3d)
   src/lib.rs                      meshes, culling, NitroFS loading, render system
@@ -315,10 +320,10 @@ maxmod music with a click SFX on teapot selection (`AudioPlugin`), and the HUD.
 
 ## Limitations / next steps
 
-- Text rendering goes through the libnds text console. Sprite/tile graphics
-  would use libnds OAM/backgrounds (and `grit` for asset conversion, already in
-  the shell) as a sibling `bevy_nds_sprite` crate, behind the same extraction
-  model as `bevy_nds_text`. Tracked in issue #3.
+- The `bevy_nds_sprite` MVP embeds a single 16x16 4bpp sprite in the crate
+  itself; a host-side `grit` wrapper (mirroring `obj2dl` / `wav2bank`) is the
+  next step, so games can drop PNGs into `assets/sprites/` and have them
+  baked into NitroFS.
 - No Wi-Fi (dswifi). Add a `bevy_nds_wifi` crate alongside `bevy_nds_audio`
   (link `-ldswifi9`, embed the matching ARM7 core).
 - Keep entity counts modest; the DS has ~4 MB of RAM.
