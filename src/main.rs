@@ -66,7 +66,7 @@ impl Plugin for GamePlugin {
                 step_player,
                 spin_companion,
                 sync_map_to_world,
-                update_map_display,
+                sync_marker_glyph,
                 update_hud,
                 update_touch_hud,
                 update_pick_hud,
@@ -171,10 +171,11 @@ struct Player;
 #[derive(Component)]
 struct Companion;
 
-/// One row of the map display on the text console (`row` is the map-row index,
-/// not the tile-row). Recomposed in [`update_map_display`].
+/// Marker for the player's on-map `Glyph` overlay (the moving `@`). A separate
+/// entity so we can update just its `TilePos` when the player walks, without
+/// recomposing any text.
 #[derive(Component)]
-struct MapRow(u8);
+struct PlayerMarker;
 
 /// The live status line on the text console.
 #[derive(Component)]
@@ -258,16 +259,40 @@ fn setup(mut commands: Commands, nitrofs: Res<NitroFs>, mut music: ResMut<Music>
     };
     commands.spawn((DsScreen::Bottom, TilePos::new(2, 0), DsText::new(source)));
 
-    // One DsText per map row. `update_map_display` rewrites these in place each
-    // frame; the text renderer's grid diff turns that into a few changed cells.
+    // Static map rows: one `DsText` per row, written once. Composition cost
+    // disappears for unchanged frames; the text-renderer's per-cell diff only
+    // ever fires on the cells where the moving `@`/`O` glyphs overlap. The
+    // game crate runs at `opt-level = 0`, so recomposing 8 × 16 characters
+    // every frame here noticeably halved fps before this change.
+    let mut row_buf = alloc::string::String::with_capacity(MAP_W);
     for row in 0..MAP_H {
+        row_buf.clear();
+        for &byte in MAP_DATA[row].iter() {
+            row_buf.push(byte as char);
+        }
         commands.spawn((
             DsScreen::Bottom,
             TilePos::new(MAP_TILE_COL, MAP_TILE_ROW + row as i16),
-            MapRow(row as u8),
-            DsText::new(""),
+            DsText::new(row_buf.as_str()),
         ));
     }
+
+    // Player marker (`@`) — drawn on top of the underlying floor by the text
+    // renderer (texts compose first, glyphs overlay). `sync_marker_glyph`
+    // updates its `TilePos` from the player's `MapPos` each frame.
+    commands.spawn((
+        PlayerMarker,
+        DsScreen::Bottom,
+        cell_to_tile(player_start),
+        Glyph(b'@'),
+    ));
+
+    // Companion marker (`O`). It doesn't move, so its `TilePos` is static.
+    commands.spawn((
+        DsScreen::Bottom,
+        cell_to_tile(companion_pos),
+        Glyph(b'O'),
+    ));
 
     // HUD lines, below the map.
     commands.spawn((
@@ -391,37 +416,23 @@ fn sync_map_to_world(
 
 // --- Map display -------------------------------------------------------------
 
-/// Compose each map row from the static tile data, overlaying `@` for the
-/// player and `O` for the companion. The text renderer's per-cell diff turns
-/// "the player moved one cell" into two changed tiles (old cell back to `.`,
-/// new cell to `@`) rather than a full redraw.
-fn update_map_display(
-    map: Res<Map>,
-    player: Query<&MapPos, With<Player>>,
-    companion: Query<&MapPos, With<Companion>>,
-    mut rows: Query<(&MapRow, &mut DsText)>,
+/// Convert a map cell to the tile position of its glyph on the text console.
+fn cell_to_tile(pos: MapPos) -> TilePos {
+    TilePos::new(MAP_TILE_COL + pos.col, MAP_TILE_ROW + pos.row)
+}
+
+/// Keep the player's `@` glyph aligned with its current cell. Triggered by
+/// `Changed<MapPos>`, so it only does work on the frames the player actually
+/// walks — no per-frame map recomposition.
+fn sync_marker_glyph(
+    player: Query<&MapPos, (With<Player>, Changed<MapPos>)>,
+    mut marker: Query<&mut TilePos, With<PlayerMarker>>,
 ) {
-    let player = player.iter().next().copied();
-    let companion = companion.iter().next().copied();
-    for (MapRow(r), mut text) in &mut rows {
-        let row = *r as usize;
-        text.0.clear();
-        for col in 0..MAP_W {
-            let mut byte = map.tiles[row][col];
-            if let Some(p) = companion
-                && p.col as usize == col
-                && p.row as usize == row
-            {
-                byte = b'O';
-            }
-            if let Some(p) = player
-                && p.col as usize == col
-                && p.row as usize == row
-            {
-                byte = b'@';
-            }
-            text.0.push(byte as char);
-        }
+    let Some(pos) = player.iter().next() else {
+        return;
+    };
+    for mut tile in &mut marker {
+        *tile = cell_to_tile(*pos);
     }
 }
 

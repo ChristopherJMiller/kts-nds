@@ -7,8 +7,10 @@
 //!
 //! Drawables carry a [`TilePos`] (grid coordinate) and a [`DsScreen`], plus one
 //! of:
-//! - [`Glyph`] — a single character ("text sprite"), or
-//! - [`DsText`] — a run of text.
+//! - [`DsText`] — a run of text (rendered first), or
+//! - [`Glyph`] — a single character "sticker" rendered *on top of* any text in
+//!   the same cell. Use this to move a marker around without recomposing the
+//!   underlying text every frame (e.g. a player `@` over a static map row).
 //!
 //! ## Double-buffered, diffed output
 //!
@@ -210,13 +212,16 @@ fn render(
     buffers.top.clear_back();
     buffers.bottom.clear_back();
 
-    for (screen, pos, glyph) in &glyphs {
-        buffers.screen(*screen).put(pos.x, pos.y, glyph.0);
-    }
+    // Text first, glyphs on top: lets games park static `DsText` rows (a map,
+    // a HUD frame) and use cheap single-cell `Glyph` entities for the moving
+    // pieces, without recomposing the underlying text each frame.
     for (screen, pos, text) in &texts {
         buffers
             .screen(*screen)
             .put_str(pos.x, pos.y, text.0.as_bytes());
+    }
+    for (screen, pos, glyph) in &glyphs {
+        buffers.screen(*screen).put(pos.x, pos.y, glyph.0);
     }
 
     unsafe {
