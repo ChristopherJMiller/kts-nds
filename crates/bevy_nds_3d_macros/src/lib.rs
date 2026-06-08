@@ -251,10 +251,31 @@ fn normalize(v: [f32; 3]) -> [f32; 3] {
     }
 }
 
-/// Emit the `DsMesh` expression. A leading `include_bytes!` ties the build to the
-/// source file so edits to the model trigger a recompile (proc-macros don't track
-/// file reads on their own).
+/// Emit the `DsMesh` expression. The geometry is **pre-packed at build time**
+/// into the exact Geometry Engine command words the hardware consumes (three per
+/// vertex: normal, vertex16-xy, vertex16-z), so the DS runtime does no per-frame
+/// fixed-point or normal maths — it just streams these `u32`s to MMIO. A leading
+/// `include_bytes!` ties the build to the source file so edits to the model
+/// trigger a recompile (proc-macros don't track file reads on their own).
 fn emit(tris: &[Tri], full: &std::path::Path) -> String {
+    // Pack every vertex and accumulate the local-space bounding box.
+    let mut words: Vec<u32> = Vec::with_capacity(tris.len() * 9);
+    let mut min = [f32::INFINITY; 3];
+    let mut max = [f32::NEG_INFINITY; 3];
+    for tri in tris {
+        for (pos, nor) in &tri.verts {
+            for k in 0..3 {
+                min[k] = min[k].min(pos[k]);
+                max[k] = max[k].max(pos[k]);
+            }
+            let n = normalize(*nor);
+            words.push(normal_pack(n[0], n[1], n[2]));
+            let (xy, z) = vertex16(pos[0], pos[1], pos[2]);
+            words.push(xy);
+            words.push(z);
+        }
+    }
+
     let mut out = String::new();
     out.push_str("{\n");
     let _ = writeln!(
@@ -262,25 +283,50 @@ fn emit(tris: &[Tri], full: &std::path::Path) -> String {
         "    const _: &[u8] = include_bytes!({:?});",
         full.display().to_string()
     );
-    out.push_str("    const TRIS: &[[::bevy_nds_3d::Vertex; 3]] = &[\n");
-    for tri in tris {
-        out.push_str("        [");
-        for (pos, nor) in &tri.verts {
-            // Pre-normalise so the runtime never has to.
-            let n = normalize(*nor);
-            let _ = write!(
-                out,
-                "::bevy_nds_3d::Vertex::from_raw([{}f32,{}f32,{}f32],[{}f32,{}f32,{}f32],[200u8,200u8,210u8]),",
-                fl(pos[0]), fl(pos[1]), fl(pos[2]),
-                fl(n[0]), fl(n[1]), fl(n[2]),
-            );
+    out.push_str("    const WORDS: &[u32] = &[");
+    for (i, w) in words.iter().enumerate() {
+        if i % 12 == 0 {
+            out.push_str("\n        ");
         }
-        out.push_str("],\n");
+        let _ = write!(out, "0x{w:08X},");
     }
-    out.push_str("    ];\n");
-    out.push_str("    ::bevy_nds_3d::DsMesh::from_static(TRIS, true)\n");
+    out.push_str("\n    ];\n");
+    let _ = writeln!(
+        out,
+        "    ::bevy_nds_3d::DsMesh::from_baked(WORDS, [{}f32,{}f32,{}f32], [{}f32,{}f32,{}f32])",
+        fl(min[0]), fl(min[1]), fl(min[2]),
+        fl(max[0]), fl(max[1]), fl(max[2]),
+    );
     out.push_str("}\n");
     out
+}
+
+/// Pack a position into the DS `GFX_VERTEX16` command pair, matching
+/// `bevy_nds_3d::ffi::gl::vertex_v16`: each component is 4.12 fixed (`* 4096`),
+/// `(xy, z)` as two command words.
+fn vertex16(x: f32, y: f32, z: f32) -> (u32, u32) {
+    let xi = (x * 4096.0) as i16 as u16 as u32;
+    let yi = (y * 4096.0) as i16 as u16 as u32;
+    let zi = (z * 4096.0) as i16 as u16 as u32;
+    ((yi << 16) | xi, zi)
+}
+
+/// Pack a unit normal into the DS `GFX_NORMAL` command word, matching
+/// `bevy_nds_3d::ffi::normal_pack` (10-bit signed per component).
+fn normal_pack(x: f32, y: f32, z: f32) -> u32 {
+    float_to_v10(x) | (float_to_v10(y) << 10) | (float_to_v10(z) << 20)
+}
+
+/// Float → 10-bit signed `v10` (1.0 → 0x1FF), matching `ffi::float_to_v10`.
+fn float_to_v10(v: f32) -> u32 {
+    let x = if v >= 1.0 {
+        0x1FF
+    } else if v < -1.0 {
+        0x200
+    } else {
+        ((v * 512.0) as i32) & 0x3FF
+    };
+    x as u32
 }
 
 /// Format an `f32` so it always round-trips as a float literal (`0` -> `0.0`).

@@ -103,12 +103,28 @@ impl Vertex {
     }
 }
 
+/// Pre-packed Geometry Engine command words for a static lit mesh, computed at
+/// build time by `include_obj!`. The render loop streams these straight to the
+/// hardware with no per-frame float maths (see [`ffi::gl::stream_lit`]), which is
+/// what keeps a ~650-triangle model at frame rate on the 33 MHz ARM9.
+#[derive(Clone)]
+pub struct BakedMesh {
+    /// Flat command words, three per vertex: `[normal, vertex16-xy, vertex16-z]`.
+    pub words: Cow<'static, [u32]>,
+    /// Local-space axis-aligned bounds (`[min, max]`), for frustum culling.
+    pub aabb: [Vec3; 2],
+}
+
 /// A drawable mesh: a flat list of triangles. Small by design — the DS has a
 /// hard per-frame budget of a couple thousand polygons.
 ///
 /// `tris` is a [`Cow`] so a mesh can either own its triangles (e.g. [`DsMesh::cube`])
 /// or borrow `&'static` data baked into the ROM at compile time (e.g. the
 /// `include_obj!` macro), with no per-spawn heap copy in the latter case.
+///
+/// When `baked` is `Some`, it carries a pre-packed command stream used by the
+/// fast lit render path; `tris` is then left empty (the geometry lives in the
+/// baked words). This is what `include_obj!` emits.
 #[derive(Component, Clone, Default)]
 pub struct DsMesh {
     pub tris: Cow<'static, [[Vertex; 3]]>,
@@ -116,15 +132,38 @@ pub struct DsMesh {
     /// (per-vertex normals + the [`DsLights`] resource + a [`DsMaterial`]).
     /// When clear, vertices use their flat [`Vertex::color`] directly.
     pub lit: bool,
+    /// Pre-packed GE command words for the fast static-lit path (see [`BakedMesh`]).
+    pub baked: Option<BakedMesh>,
 }
 
 impl DsMesh {
     /// Build a mesh that borrows `&'static` triangle data (no allocation). This
-    /// is what the `include_obj!` macro emits for compile-time-embedded models.
+    /// is used for hand-authored static meshes; the lit path still packs each
+    /// vertex per frame, so prefer [`DsMesh::from_baked`] (what `include_obj!`
+    /// emits) for large lit models.
     pub const fn from_static(tris: &'static [[Vertex; 3]], lit: bool) -> Self {
         Self {
             tris: Cow::Borrowed(tris),
             lit,
+            baked: None,
+        }
+    }
+
+    /// Build a hardware-lit mesh from a pre-packed `&'static` command stream and
+    /// its local-space bounds. This is the form `include_obj!` emits: all the
+    /// fixed-point/normal packing happens at build time, so rendering is just
+    /// MMIO writes. `words` must be three per vertex (see [`BakedMesh`]).
+    pub const fn from_baked(words: &'static [u32], aabb_min: [f32; 3], aabb_max: [f32; 3]) -> Self {
+        Self {
+            tris: Cow::Borrowed(&[]),
+            lit: true,
+            baked: Some(BakedMesh {
+                words: Cow::Borrowed(words),
+                aabb: [
+                    Vec3::new(aabb_min[0], aabb_min[1], aabb_min[2]),
+                    Vec3::new(aabb_max[0], aabb_max[1], aabb_max[2]),
+                ],
+            }),
         }
     }
 
@@ -212,6 +251,7 @@ impl DsMesh {
         Self {
             tris: Cow::Owned(tris),
             lit: false,
+            baked: None,
         }
     }
 }
@@ -443,13 +483,18 @@ fn render_3d(
                 gl::poly_fmt(ffi::poly_alpha(31) | ffi::POLY_CULL_BACK | light_mask);
 
                 gl::begin(ffi::GL_TRIANGLES);
-                for tri in mesh.tris.iter() {
-                    for v in tri {
-                        // Normals are expected to be unit length (the include_obj!
-                        // macro normalises at build time), so no runtime sqrt here.
-                        let n = v.normal;
-                        gl::normal(ffi::normal_pack(n.x, n.y, n.z));
-                        gl::vertex_v16(to_v16(v.pos.x), to_v16(v.pos.y), to_v16(v.pos.z));
+                if let Some(baked) = &mesh.baked {
+                    // Fast path: stream pre-packed command words, no float maths.
+                    gl::stream_lit(&baked.words);
+                } else {
+                    for tri in mesh.tris.iter() {
+                        for v in tri {
+                            // Normals are expected unit length (baked meshes pack
+                            // them at build time), so no runtime sqrt here.
+                            let n = v.normal;
+                            gl::normal(ffi::normal_pack(n.x, n.y, n.z));
+                            gl::vertex_v16(to_v16(v.pos.x), to_v16(v.pos.y), to_v16(v.pos.z));
+                        }
                     }
                 }
                 gl::end();
@@ -492,7 +537,7 @@ impl Plugin for Ds3dPlugin {
 /// Common imports for games using the 3D backend.
 pub mod prelude {
     pub use crate::{
-        Camera3d, DirectionalLight, Display3d, Ds3dPlugin, DsLights, DsMaterial, DsMesh,
+        BakedMesh, Camera3d, DirectionalLight, Display3d, Ds3dPlugin, DsLights, DsMaterial, DsMesh,
         Transform3d, Vertex,
     };
     pub use bevy_math::Vec3;

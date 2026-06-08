@@ -95,9 +95,9 @@ pub const fn rgb15(r: u8, g: u8, b: u8) -> u32 {
 /// format (1.0 maps to `0x1FF`), as `floattov10` does in `<nds/arm9/videoGL.h>`.
 pub fn float_to_v10(v: f32) -> u32 {
     let x = if v >= 1.0 {
-        0x1FF
-    } else if v <= -1.0 {
-        0x3FF // -1.0 in 10-bit two's complement (0x400 - 1 region)
+        0x1FF // largest representable +ve (≈ +0.998); 0x200 would read as -1.0
+    } else if v < -1.0 {
+        0x200 // -1.0 in 10-bit two's complement
     } else {
         ((v * 512.0) as i32) & 0x3FF
     };
@@ -244,6 +244,26 @@ pub mod gl {
     /// [`normal_pack`] word.
     pub unsafe fn normal(packed: u32) {
         unsafe { write_volatile(GFX_NORMAL, packed) }
+    }
+
+    /// Stream a baked lit-vertex command run to the Geometry Engine. `words` is a
+    /// flat list of pre-packed command words, **three per vertex** in the fixed
+    /// order `[normal, vertex16-xy, vertex16-z]` (as produced by the `include_obj!`
+    /// macro at build time). This is the hot path for static lit meshes: it does
+    /// no float maths at all, just MMIO writes, which keeps large models at frame
+    /// rate on the 33 MHz ARM9.
+    ///
+    /// # Safety
+    /// Must be called between [`begin`]/[`end`], with lighting/material set up,
+    /// and `words.len()` a multiple of three.
+    pub unsafe fn stream_lit(words: &[u32]) {
+        for v in words.chunks_exact(3) {
+            unsafe {
+                write_volatile(GFX_NORMAL, v[0]);
+                write_volatile(GFX_VERTEX16, v[1]);
+                write_volatile(GFX_VERTEX16, v[2]);
+            }
+        }
     }
 
     /// Configure directional light `id` (0-3): its `color` (RGB15) and its
