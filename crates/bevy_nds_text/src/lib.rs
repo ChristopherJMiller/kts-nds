@@ -157,12 +157,16 @@ impl Grid {
             run[..bytes.len()].copy_from_slice(bytes);
             run[bytes.len()] = 0;
 
-            // ANSI cursor move to 1-based (row, col), then print the run.
+            // ANSI cursor move, then print the run. NB: libnds's ANSI parser
+            // treats the row/col params in `ESC[r;cH` as *zero-based*, not the
+            // standard 1-based that VT100/xterm use (see libnds console.c's
+            // case 'H' — it assigns `cursorY = params[0]` with no -1). Pass
+            // raw 0-based coords so the cursor lands where the diff intended.
             unsafe {
                 printf(
                     c"\x1b[%u;%uH%s".as_ptr(),
-                    (row + 1) as c_uint,
-                    (col + 1) as c_uint,
+                    row as c_uint,
+                    col as c_uint,
                     run.as_ptr() as *const c_char,
                 );
             }
