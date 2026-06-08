@@ -58,6 +58,13 @@ wav2bank = { path = "crates/wav2bank" }
 
 [profile.dev]
 panic = "abort"
+# Splitting `bevy_nds` into per-capability subcrates means the per-frame hot
+# path now crosses crate boundaries (text -> video, gesture -> input, etc.).
+# Without LTO those become real function calls instead of the inlined helpers
+# they were when everything lived in one crate, which costs noticeable fps on
+# the 33 MHz ARM9. Thin LTO restores most of the inlining at a modest compile-
+# time hit.
+lto = "thin"
 
 # Bevy's recommended dev setup: optimize all *dependencies* (notably bevy_ecs)
 # so the debug ROM still runs at a usable frame rate on the 33 MHz ARM9.
