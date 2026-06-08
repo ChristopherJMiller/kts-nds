@@ -6,12 +6,14 @@
 //! backend): this file contains no FFI, no allocator and no panic handler.
 //!
 //! A hardware-rendered, hardware-*lit* Utah teapot starts on the bottom screen.
-//! The model is loaded with [`include_obj!`], which parses the `.obj` on the host
-//! at build time and bakes a `&'static` mesh into the ROM — the DS has no
-//! filesystem to load assets from at runtime. The D-pad moves the teapot around,
-//! and when it runs off the top or bottom edge it *travels to the other screen*
-//! (a coupled LCD swap, since the DS 3D core is wired to the main engine). ABXY
-//! tumble it so you can watch the hardware lighting play across the surface.
+//! The model is loaded at runtime from the ROM filesystem (NitroFS): `build.rs`
+//! bakes `assets/teapot.obj` into `nitro:/teapot.dl` and [`DsMesh::load`] reads
+//! it on startup, falling back to a copy baked into the binary with
+//! [`include_obj!`] if the filesystem is unavailable. The D-pad moves the teapot
+//! around, and when it runs off the top or bottom edge it *travels to the other
+//! screen* (a coupled LCD swap, since the DS 3D core is wired to the main
+//! engine). ABXY tumble it so you can watch the hardware lighting play across
+//! the surface.
 
 #![no_std]
 #![no_main]
@@ -31,6 +33,7 @@ pub extern "C" fn main() -> core::ffi::c_int {
     let mut app = App::new();
     app.add_plugins(DsPlugins)
         .add_plugins(Ds3dPlugin)
+        .add_plugins(NitroFsPlugin)
         .add_plugins(GamePlugin);
     bevy_nds::run(app)
 }
@@ -61,14 +64,27 @@ struct Hud;
 /// other one. Sized to the camera frustum so the model is fully off-screen first.
 const EDGE: f32 = 1.6;
 
-fn setup(mut commands: Commands) {
-    // The Utah teapot, baked into the ROM at build time from `assets/teapot.obj`
-    // and drawn with the DS hardware lighting pipeline. The model is authored
-    // sitting on the XY plane (pivot at its base), so `center` recentres it at
-    // build time, making it rotate about its visual middle rather than tumbling.
+fn setup(mut commands: Commands, nitrofs: Res<NitroFs>) {
+    // The Utah teapot. We prefer to load it at runtime from the ROM filesystem
+    // (NitroFS) — `build.rs` bakes `assets/teapot.obj` into `nitro:/teapot.dl`,
+    // which `just rom` packs into the ROM. This keeps large models out of the
+    // ARM9 binary (precious main RAM) and lets us swap assets without relinking.
+    // If the filesystem isn't available (e.g. a loader that doesn't provide
+    // argv[0]), we fall back to the copy baked straight into the ROM by
+    // `include_obj!`. Either way the geometry is byte-identical (shared encoder).
+    //
+    // The model is authored sitting on the XY plane (pivot at its base), so both
+    // paths recentre it (`center`) so it rotates about its visual middle.
+    let loaded = nitrofs
+        .ready
+        .then(|| DsMesh::load(b"nitro:/teapot.dl\0"))
+        .flatten();
+    let from_nitrofs = loaded.is_some();
+    let teapot = loaded.unwrap_or_else(|| include_obj!("assets/teapot.obj", center));
+
     commands.spawn((
         Model,
-        include_obj!("assets/teapot.obj", center),
+        teapot,
         DsMaterial {
             diffuse: [120, 170, 215],
             ambient: [28, 36, 56],
@@ -81,11 +97,13 @@ fn setup(mut commands: Commands) {
     ));
 
     // Text console (sub engine): title, a per-frame HUD, and a control hint.
-    commands.spawn((
-        DsScreen::Bottom,
-        TilePos::new(4, 2),
-        DsText::new("Lit teapot on Nintendo DS"),
-    ));
+    // Title doubles as proof of where the model came from this boot.
+    let source = if from_nitrofs {
+        "teapot from nitro:/teapot.dl"
+    } else {
+        "teapot baked in (no NitroFS)"
+    };
+    commands.spawn((DsScreen::Bottom, TilePos::new(2, 2), DsText::new(source)));
     commands.spawn((DsScreen::Bottom, TilePos::new(5, 4), Hud, DsText::new("")));
     commands.spawn((
         DsScreen::Bottom,

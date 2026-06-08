@@ -171,6 +171,50 @@ impl DsMesh {
         }
     }
 
+    /// Build a hardware-lit mesh from an **owned** (heap) display list and its
+    /// local-space bounds. This is the runtime counterpart to [`from_baked`]:
+    /// the words come from a NitroFS asset loaded at runtime rather than baked
+    /// into the ROM, so the list is owned rather than `&'static`. The buffer is
+    /// already cache-flushed by [`load`](DsMesh::load) before reaching here.
+    ///
+    /// [`from_baked`]: DsMesh::from_baked
+    pub fn from_owned(words: Vec<u32>, aabb_min: [f32; 3], aabb_max: [f32; 3]) -> Self {
+        Self {
+            tris: Cow::Borrowed(&[]),
+            lit: true,
+            baked: Some(BakedMesh {
+                words: Cow::Owned(words),
+                aabb: [
+                    Vec3::new(aabb_min[0], aabb_min[1], aabb_min[2]),
+                    Vec3::new(aabb_max[0], aabb_max[1], aabb_max[2]),
+                ],
+            }),
+        }
+    }
+
+    /// Load a display-list model from the ROM filesystem (NitroFS) at runtime.
+    ///
+    /// `path` is a NUL-terminated `nitro:/` path (e.g. `b"nitro:/teapot.dl\0"`).
+    /// The file is the `.dl` format written by `obj2dl` / the `build.rs` asset
+    /// pipeline: a small header (magic + AABB + word count) followed by the
+    /// libnds display list. The bytes are flushed from the data cache so the
+    /// Geometry Engine's DMA (`glCallList`) reads them correctly.
+    ///
+    /// Returns `None` if the file is missing, truncated, or not a valid asset.
+    /// [`NitroFsPlugin`] (or [`ffi::nitrofs::init`]) must have mounted the
+    /// filesystem first.
+    pub fn load(path: &[u8]) -> Option<Self> {
+        let bytes = ffi::nitrofs::read_file(path)?;
+        let (words, aabb_min, aabb_max) = parse_dl_asset(&bytes)?;
+        // SAFETY: `words` is a contiguous `[u32]`; reinterpret as bytes purely to
+        // hand its address/length to the cache-flush. No aliasing writes occur.
+        let word_bytes = unsafe {
+            core::slice::from_raw_parts(words.as_ptr() as *const u8, words.len() * 4)
+        };
+        ffi::nitrofs::flush_dcache(word_bytes);
+        Some(Self::from_owned(words, aabb_min, aabb_max))
+    }
+
     /// An axis-aligned cube of side `2 * half`, with each face a distinct
     /// flat colour. Handy as a "hello, triangle" for the 3D pipeline.
     pub fn cube(half: f32) -> Self {
@@ -260,7 +304,52 @@ impl DsMesh {
     }
 }
 
-/// Position and orientation of a 3D entity. The DS-native analogue of Bevy's
+/// Parse the `.dl` runtime asset format written by `obj2dl` /
+/// `bevy_nds_3d_obj::model_to_le_bytes`: a little-endian header (magic `"BDL1"`,
+/// six `f32` AABB components, a `u32` word count) followed by the display list.
+/// Returns the owned word buffer and the bounds, or `None` if malformed.
+fn parse_dl_asset(bytes: &[u8]) -> Option<(Vec<u32>, [f32; 3], [f32; 3])> {
+    /// ASCII `"BDL1"`, matching `bevy_nds_3d_obj::ASSET_MAGIC`.
+    const MAGIC: u32 = u32::from_le_bytes(*b"BDL1");
+    const HEADER: usize = 32; // magic(4) + aabb(24) + count(4)
+
+    if bytes.len() < HEADER || read_u32(bytes, 0) != MAGIC {
+        return None;
+    }
+
+    let mut aabb = [0.0f32; 6];
+    for (i, slot) in aabb.iter_mut().enumerate() {
+        *slot = f32::from_bits(read_u32(bytes, 4 + i * 4));
+    }
+
+    let count = read_u32(bytes, 28) as usize;
+    if bytes.len() < HEADER + count * 4 {
+        return None;
+    }
+
+    let mut words = Vec::with_capacity(count);
+    for i in 0..count {
+        words.push(read_u32(bytes, HEADER + i * 4));
+    }
+
+    Some((
+        words,
+        [aabb[0], aabb[1], aabb[2]],
+        [aabb[3], aabb[4], aabb[5]],
+    ))
+}
+
+/// Read a little-endian `u32` at `offset` (caller guarantees the bytes exist).
+fn read_u32(bytes: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes([
+        bytes[offset],
+        bytes[offset + 1],
+        bytes[offset + 2],
+        bytes[offset + 3],
+    ])
+}
+
+
 /// `Transform`: rotation is Euler angles (radians), applied X then Y then Z, and
 /// `scale` is a per-axis multiplier (use [`Vec3::splat`] for uniform scale).
 #[derive(Component, Clone, Copy)]
@@ -539,11 +628,37 @@ impl Plugin for Ds3dPlugin {
     }
 }
 
+/// Records whether the ROM filesystem (NitroFS) mounted successfully. When
+/// `ready` is `false`, [`DsMesh::load`] calls will fail — the loader probably
+/// didn't supply `argv[0]`/DLDI (emulators always work). Inserted by
+/// [`NitroFsPlugin`].
+#[derive(Resource, Clone, Copy, Debug, Default)]
+pub struct NitroFs {
+    pub ready: bool,
+}
+
+/// Mounts the ROM filesystem (NitroFS) in [`PreStartup`] so models and other
+/// assets can be loaded at runtime with [`DsMesh::load`]. Add it before any
+/// [`Startup`] system that loads assets. The [`NitroFs`] resource records
+/// whether the mount succeeded.
+pub struct NitroFsPlugin;
+
+impl Plugin for NitroFsPlugin {
+    fn build(&self, app: &mut App) {
+        app.init_resource::<NitroFs>()
+            .add_systems(PreStartup, init_nitrofs);
+    }
+}
+
+fn init_nitrofs(mut nitrofs: ResMut<NitroFs>) {
+    nitrofs.ready = ffi::nitrofs::init();
+}
+
 /// Common imports for games using the 3D backend.
 pub mod prelude {
     pub use crate::{
         BakedMesh, Camera3d, DirectionalLight, Display3d, Ds3dPlugin, DsLights, DsMaterial, DsMesh,
-        Transform3d, Vertex,
+        NitroFs, NitroFsPlugin, Transform3d, Vertex,
     };
     pub use bevy_math::Vec3;
     pub use bevy_nds_3d_macros::include_obj;

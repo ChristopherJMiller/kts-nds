@@ -15,7 +15,7 @@
 
 #![allow(non_snake_case)]
 
-use core::ffi::c_int;
+use core::ffi::{c_int, c_long, c_void};
 use core::ptr::{read_volatile, write_volatile};
 
 // --- Display / power registers (see <nds/arm9/video.h>, <nds/system.h>) ------
@@ -125,7 +125,35 @@ unsafe extern "C" {
     /// The first word of `list` is the body length in `u32`s, followed by the
     /// packed command stream. See `<nds/arm9/videoGL.h>`.
     pub fn glCallList(list: *const u32);
+
+    /// Mount the ROM filesystem (NitroFS) so files can be read from `nitro:/`.
+    /// Pass null to use the current ROM. Returns non-zero on success. See
+    /// `<filesystem.h>`.
+    pub fn nitroFSInit(basepath: *const u8) -> bool;
+
+    /// Clean and flush a range of the ARM9 data cache to main memory, so a
+    /// subsequent DMA read (e.g. `glCallList`) sees the CPU's writes. This is
+    /// libnds' `DC_FlushRange` (a `static inline` wrapper, so we bind the
+    /// underlying symbol). See `<nds/arm9/cache.h>`.
+    pub fn CP15_CleanAndFlushDCacheRange(base: *const c_void, size: u32);
 }
+
+// Minimal newlib `stdio.h` surface for reading NitroFS files at runtime. The DS
+// has no asset server, so a runtime-loaded model is read with plain C file I/O
+// from the `nitro:/` drive (resolved by NitroFS). Declared here per the crate's
+// hand-written-FFI convention; resolved against `libc.a` at link. See
+// `<stdio.h>`.
+unsafe extern "C" {
+    pub fn fopen(path: *const u8, mode: *const u8) -> *mut c_void;
+    pub fn fclose(stream: *mut c_void) -> c_int;
+    pub fn fread(ptr: *mut c_void, size: usize, nmemb: usize, stream: *mut c_void) -> usize;
+    pub fn fseek(stream: *mut c_void, offset: c_long, whence: c_int) -> c_int;
+    pub fn ftell(stream: *mut c_void) -> c_long;
+    pub fn rewind(stream: *mut c_void);
+}
+
+/// `SEEK_END` from `<stdio.h>`.
+pub const SEEK_END: c_int = 2;
 
 /// Safe-to-call (still `unsafe`: they touch MMIO) reimplementations of the
 /// libnds inline `gl*` command-register writes.
@@ -291,5 +319,68 @@ pub mod gl {
     /// swaps buffers at the next vertical blank.
     pub unsafe fn flush() {
         unsafe { write_volatile(GFX_FLUSH, 0) }
+    }
+}
+
+/// Runtime asset loading from the ROM filesystem (NitroFS).
+///
+/// The DS has no asset server; at runtime a model is just *bytes at an address*,
+/// read from the read-only filesystem packed into the ROM (the `nitro:/` drive).
+/// This module wraps the libnds / newlib FFI needed to mount that filesystem and
+/// slurp a whole file into RAM.
+pub mod nitrofs {
+    use super::*;
+    use alloc::vec::Vec;
+
+    /// Mount the ROM filesystem. Must succeed before any `nitro:/` path can be
+    /// opened. Returns `true` on success (`false` typically means the loader
+    /// didn't provide `argv[0]`/DLDI — emulators always work).
+    pub fn init() -> bool {
+        unsafe { nitroFSInit(core::ptr::null()) }
+    }
+
+    /// Read an entire file from the filesystem into a byte buffer.
+    ///
+    /// `path` is a NUL-terminated C string (e.g. `b"nitro:/teapot.dl\0"`).
+    /// Returns `None` if the file can't be opened or read. Uses CPU copies
+    /// (`fread`), so no cache flush is needed for the returned `Vec` itself;
+    /// callers that hand the data to DMA must flush it first (see
+    /// [`flush_dcache`]).
+    pub fn read_file(path: &[u8]) -> Option<Vec<u8>> {
+        debug_assert!(path.last() == Some(&0), "path must be NUL-terminated");
+        unsafe {
+            let f = fopen(path.as_ptr(), b"rb\0".as_ptr());
+            if f.is_null() {
+                return None;
+            }
+            let ok = (|| {
+                if fseek(f, 0, SEEK_END) != 0 {
+                    return None;
+                }
+                let size = ftell(f);
+                if size <= 0 {
+                    return None;
+                }
+                rewind(f);
+                let size = size as usize;
+                let mut buf = Vec::<u8>::with_capacity(size);
+                let read = fread(buf.as_mut_ptr() as *mut c_void, 1, size, f);
+                if read != size {
+                    return None;
+                }
+                buf.set_len(size);
+                Some(buf)
+            })();
+            fclose(f);
+            ok
+        }
+    }
+
+    /// Clean+flush a buffer from the data cache to main RAM so a following DMA
+    /// read (e.g. `glCallList` on a heap display list) sees current contents.
+    pub fn flush_dcache(bytes: &[u8]) {
+        unsafe {
+            CP15_CleanAndFlushDCacheRange(bytes.as_ptr() as *const c_void, bytes.len() as u32);
+        }
     }
 }

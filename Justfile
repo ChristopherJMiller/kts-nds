@@ -53,6 +53,10 @@ fmt:
     cargo fmt
 
 # Package a compiled ELF into a bootable .nds ROM.
+#
+# `build/nitrofs/` (populated by build.rs from `assets/*.obj`) is packed into the
+# ROM filesystem with `-d`, so models load at runtime from `nitro:/`. The
+# directory is created on first build; tolerate it being empty.
 # Usage: `just rom` (debug) or `just rom release`.
 rom profile="debug": (_build profile)
     #!/usr/bin/env bash
@@ -62,7 +66,10 @@ rom profile="debug": (_build profile)
     ndstool="$BLOCKSDS/tools/ndstool/ndstool"
     arm7="$BLOCKSDS/sys/arm7/main_core/arm7_minimal.elf"
     [ -f "$arm7" ] || arm7="$BLOCKSDS/sys/arm7/main_core/arm7_maxmod.elf"
+    nitrofs_args=()
+    [ -d build/nitrofs ] && nitrofs_args=(-d build/nitrofs)
     "$ndstool" -c "{{rom}}" -7 "$arm7" -9 "$elf" \
+        "${nitrofs_args[@]}" \
         -h 0x200 -g BEVY ME "Bevy DS"
     echo "Wrote {{rom}} from $elf"
 
