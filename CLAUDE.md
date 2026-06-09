@@ -39,7 +39,7 @@ invocations split by dependency shape:
    `--target $host`.
 2. The platform subcrates (`bevy_nds_diagnostics`, `bevy_nds_time`,
    `bevy_nds_input`, `bevy_nds_gesture`, `bevy_nds_text`), `bevy_nds_3d_cull`,
-   `wav2bank`, `bevy_nds_audio` — pull in code compiled against `core`, so they
+   `bevy_nds_math`, `wav2bank`, `bevy_nds_audio` — pull in code compiled against `core`, so they
    need `std` from source (`unstable.build-std=["std","panic_unwind","proc_macro"]`)
    and `panic = "unwind"` to avoid a duplicate-`core` lang-item clash and match
    the test harness. The first run is slow (builds `std`); later runs are fast.
@@ -80,6 +80,11 @@ they don't need (e.g. drop `bevy_nds_text` for a sprite-only game).
   bake `assets/sprites/*.png` into `.sprite` NitroFS assets.
 - **`crates/bevy_nds_nitrofs`** — mounts the ROM filesystem and exposes
   `read_file` / `flush_dcache`. Shared by 3D, audio, and any future asset loader.
+- **`crates/bevy_nds_math`** — 20.12 fixed-point (`Fx32`, `FxVec2`, `FxVec3`)
+  and safe wrappers around the DS hardware divide/sqrt coprocessor
+  (`<nds/arm9/math.h>`, MMIO at `0x0400_0280` / `0x0400_02B0`), with software
+  fallbacks for host tests. The no-FPU analogue of `portable-atomic`'s no-CAS
+  story: used on per-frame math hot paths to avoid software-emulated `f32`.
 
 **Capability crates** (additive, depended on directly by games when used):
 
@@ -143,6 +148,7 @@ starting in its own crate.
 | 2D sprites (OAM)         | `Sprite` component (x, y in pixels)                     | `bevy_nds_sprite::SpritePlugin`                     |
 | 3D geometry engine       | `Transform3d` + `DsMesh` + `Camera3d` resource          | `bevy_nds_3d::Ds3dPlugin`                           |
 | ARM7 sound (maxmod)      | `Music` resource (looping) + `PlaySfx` events           | `bevy_nds_audio::AudioPlugin`                       |
+| Math coprocessor (div/sqrt) | `Fx32` + `FxVec2`/`FxVec3`; `hw::div_*` / `hw::sqrt_*` | `bevy_nds_math`                                  |
 
 `DsPlugins` (in `bevy_nds`) bundles the platform-layer plugins;
 `bevy_nds::run(app)` (re-export from `bevy_nds_runtime`) installs the runner

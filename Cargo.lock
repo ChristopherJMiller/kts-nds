@@ -176,6 +176,7 @@ dependencies = [
  "bevy_nds_diagnostics",
  "bevy_nds_gesture",
  "bevy_nds_input",
+ "bevy_nds_math",
  "bevy_nds_nitrofs",
  "bevy_nds_runtime",
  "bevy_nds_text",
@@ -194,6 +195,7 @@ dependencies = [
  "bevy_math",
  "bevy_nds_3d_cull",
  "bevy_nds_3d_macros",
+ "bevy_nds_math",
  "bevy_nds_nitrofs",
  "bevy_nds_video",
 ]
@@ -254,6 +256,10 @@ dependencies = [
  "bevy_input",
  "bevy_math",
 ]
+
+[[package]]
+name = "bevy_nds_math"
+version = "0.1.0"
 
 [[package]]
 name = "bevy_nds_nitrofs"

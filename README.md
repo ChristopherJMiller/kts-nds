@@ -47,6 +47,11 @@ drop `bevy_nds_text` for a sprite-only game).
 - **`bevy_nds_3d_cull`** (`crates/bevy_nds_3d_cull`) — pure, host-testable
   view-frustum culling math.
 - **`bevy_nds_audio`** (`crates/bevy_nds_audio`) — maxmod-backed music + SFX.
+- **`bevy_nds_math`** (`crates/bevy_nds_math`) — 20.12 fixed-point (`Fx32` /
+  `FxVec2` / `FxVec3`) and safe wrappers around the DS hardware divide/sqrt
+  coprocessor. Pure, host-testable; replaces software `f32` in the per-frame
+  math hot paths (the no-FPU ARM946E-S analogue of `portable-atomic`'s no-CAS
+  story).
 - **`obj2dl`** (`crates/obj2dl`) — host CLI/lib that bakes OBJ models into `.dl`
   NitroFS assets; used by the demo's `build.rs`.
 - **`wav2bank`** (`crates/wav2bank`) — host CLI/lib that wraps `mmutil` to bake
@@ -93,6 +98,7 @@ concepts so game code doesn't deal with it directly:
 | 2D hardware sprites (OAM) | `Sprite` component (x, y in pixels)                                  | `bevy_nds_sprite::SpritePlugin`                  |
 | 3D geometry engine       | `Transform3d` + `DsMesh` + a `Camera3d` resource                      | `bevy_nds_3d::Ds3dPlugin`                        |
 | ARM7 sound (maxmod)      | `Music` resource (looping) + `PlaySfx` events                         | `bevy_nds_audio::AudioPlugin`                    |
+| Math coprocessor (divide/sqrt) | `Fx32` + `FxVec2`/`FxVec3` (20.12 fixed-point), `hw::div_*`/`hw::sqrt_*` | `bevy_nds_math`                          |
 
 `DsPlugins` bundles all of it, and `bevy_nds::run(app)` installs the runner that
 owns the frame loop (`swiWaitForVBlank` → `app.update()`).
@@ -225,6 +231,7 @@ crates/bevy_nds_3d/             hardware 3D backend (Transform3d, DsMesh, Camera
 crates/bevy_nds_3d_obj/         host OBJ -> display-list encoder (shared packing math)
 crates/bevy_nds_3d_macros/      include_obj! proc-macro (bakes a model into the ROM)
 crates/bevy_nds_3d_cull/        pure, host-testable view-frustum culling math
+crates/bevy_nds_math/           20.12 fixed-point + hardware divide/sqrt wrappers (host-testable)
 crates/bevy_nds_audio/          maxmod audio backend (Music resource, PlaySfx events)
   src/lib.rs                      AudioPlugin, Music/PlaySfx API, soundbank loading
   src/ffi.rs                      FFI to the maxmod ARM9 API

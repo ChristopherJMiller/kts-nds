@@ -25,6 +25,7 @@ bevy_nds_time = { path = "../bevy_nds_time" }
 bevy_nds_diagnostics = { path = "../bevy_nds_diagnostics" }
 bevy_nds_text = { path = "../bevy_nds_text" }
 bevy_nds_nitrofs = { path = "../bevy_nds_nitrofs" }
+bevy_nds_math = { path = "../bevy_nds_math" }
 
 bevy_app = { version = "0.16", default-features = false, features = [
   "critical-section",

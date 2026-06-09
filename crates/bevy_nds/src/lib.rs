@@ -17,6 +17,7 @@
 //! | —                      | smoothed [`Fps`] resource                  | [`bevy_nds_diagnostics::DiagnosticsPlugin`]                        |
 //! | Tiled text background  | [`Glyph`] / [`DsText`] + [`TilePos`]       | [`bevy_nds_text::TextRenderPlugin`]                                |
 //! | ROM filesystem         | [`NitroFs`] resource + [`read_file`]       | [`bevy_nds_nitrofs::NitroFsPlugin`]                                |
+//! | Math coprocessor       | [`Fx32`] / [`FxVec3`] + [`bevy_nds_math::hw`] divide/sqrt | [`bevy_nds_math`]                            |
 //!
 //! Games depend on this crate, add [`DsPlugins`] to their `App`, and call
 //! [`run`] — they never touch FFI directly.
@@ -45,8 +46,11 @@ use bevy_app::{PluginGroup, PluginGroupBuilder};
 // Re-export the platform subcrates' public surface so games can import
 // everything from `bevy_nds::*` (or, preferably, `bevy_nds::prelude::*`).
 pub use bevy_nds_diagnostics::{DiagnosticsPlugin, Fps};
-pub use bevy_nds_gesture::{Gesture, GestureEvent, GesturePlugin, GestureRecognizer, Gestures, SwipeDir};
+pub use bevy_nds_gesture::{
+    Gesture, GestureEvent, GesturePlugin, GestureRecognizer, Gestures, SwipeDir,
+};
 pub use bevy_nds_input::{DsButton, InputPlugin};
+pub use bevy_nds_math::{Fx32, FxVec2, FxVec3};
 pub use bevy_nds_nitrofs::{NitroFs, NitroFsPlugin, flush_dcache, init_nitrofs, read_file};
 pub use bevy_nds_runtime::run;
 pub use bevy_nds_text::{DsText, Glyph, TextRenderPlugin, TilePos};
@@ -74,8 +78,8 @@ impl PluginGroup for DsPlugins {
 /// Common imports for games built on `bevy_nds`.
 pub mod prelude {
     pub use crate::{
-        DsButton, DsPlugins, DsScreen, DsText, Fps, Gesture, GestureEvent, Gestures, Glyph,
-        NitroFs, SwipeDir, TilePos, run,
+        DsButton, DsPlugins, DsScreen, DsText, Fps, Fx32, FxVec2, FxVec3, Gesture, GestureEvent,
+        Gestures, Glyph, NitroFs, SwipeDir, TilePos, run,
     };
     pub use bevy_input::ButtonInput;
     pub use bevy_input::touch::{TouchInput, TouchPhase, Touches};

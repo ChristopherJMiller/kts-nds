@@ -130,6 +130,31 @@ pub fn normal_pack(x: f32, y: f32, z: f32) -> u32 {
     float_to_v10(x) | (float_to_v10(y) << 10) | (float_to_v10(z) << 20)
 }
 
+/// Pack a 20.12 fixed-point normal/direction directly into the `NORMAL_PACK`
+/// word, skipping the f32 → v10 conversion. v10 has 9 fractional bits; 20.12
+/// has 12, so the conversion is `raw >> 3` (with saturation at `±1`). Used by
+/// the per-frame light-direction normalize, which already lives in fixed-point.
+pub fn normal_pack_fx(
+    x: bevy_nds_math::Fx32,
+    y: bevy_nds_math::Fx32,
+    z: bevy_nds_math::Fx32,
+) -> u32 {
+    fx32_to_v10(x) | (fx32_to_v10(y) << 10) | (fx32_to_v10(z) << 20)
+}
+
+fn fx32_to_v10(v: bevy_nds_math::Fx32) -> u32 {
+    // 20.12: 1.0 = 0x1000 (4096), so the v10 saturation point is at raw 4096.
+    let r = v.raw();
+    let clamped = if r >= 0x1000 {
+        0x1FF
+    } else if r <= -0x1000 {
+        0x200
+    } else {
+        (r >> 3) & 0x3FF
+    };
+    clamped as u32
+}
+
 unsafe extern "C" {
     /// Initialise the 3D engine: resets the matrix stacks and geometry state.
     pub fn glInit() -> c_int;
@@ -361,4 +386,3 @@ pub mod gl {
         unsafe { gluPickMatrix(x, y, width, height, viewport.as_ptr()) }
     }
 }
-

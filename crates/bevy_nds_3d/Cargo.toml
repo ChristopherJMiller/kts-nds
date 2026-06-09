@@ -17,6 +17,10 @@ bevy_nds_video = { path = "../bevy_nds_video" }
 bevy_nds_nitrofs = { path = "../bevy_nds_nitrofs" }
 bevy_nds_3d_macros = { path = "../bevy_nds_3d_macros" }
 bevy_nds_3d_cull = { path = "../bevy_nds_3d_cull" }
+# 20.12 fixed-point + hardware divide/sqrt for the per-frame normalize on
+# directional light directions (replaces a softfloat `f32::sqrt` + 3 `f32` divs
+# with one MMIO sqrt + 3 MMIO divides on the math coprocessor).
+bevy_nds_math = { path = "../bevy_nds_math" }
 
 bevy_app = { version = "0.16", default-features = false, features = [
   "critical-section",

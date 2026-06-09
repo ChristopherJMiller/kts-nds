@@ -590,11 +590,21 @@ fn render_3d(
         let mut light_mask = 0u32;
         for (id, light) in lights.lights.iter().enumerate() {
             if let Some(light) = light {
-                let d = light.direction.normalize_or_zero();
+                // Hot path: a softfloat `Vec3::normalize_or_zero()` costs an
+                // `f32::sqrt` plus three `f32` divs (hundreds of ARM9 cycles
+                // each). The fixed-point path goes through the DS math
+                // coprocessor for ~one sqrt + three divides at < 40 cycles
+                // apiece. Same result, much cheaper per frame per light.
+                let d = bevy_nds_math::FxVec3::from_f32(
+                    light.direction.x,
+                    light.direction.y,
+                    light.direction.z,
+                )
+                .normalize_or_zero();
                 gl::light(
                     id as u32,
                     ffi::rgb15(light.color[0], light.color[1], light.color[2]),
-                    ffi::normal_pack(d.x, d.y, d.z),
+                    ffi::normal_pack_fx(d.x, d.y, d.z),
                 );
                 light_mask |= ffi::poly_light(id as u32);
             }

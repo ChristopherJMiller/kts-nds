@@ -18,6 +18,7 @@ members = [
   "crates/wav2bank",
   "crates/bevy_nds_audio",
   "crates/png2sprite",
+  "crates/bevy_nds_math",
 ]
 resolver = "2"
 
@@ -122,6 +123,9 @@ opt-level = 3
 opt-level = 3
 
 [profile.dev.package.bevy_nds_3d_macros]
+opt-level = 3
+
+[profile.dev.package.bevy_nds_math]
 opt-level = 3
 
 [profile.release]

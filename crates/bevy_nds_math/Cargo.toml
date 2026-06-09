@@ -1,0 +1,21 @@
+[package]
+name = "bevy_nds_math"
+version = "0.1.0"
+edition = "2024"
+description = "Fixed-point math and hardware divide/sqrt helpers for bevy_nds (no_std, host-testable)."
+
+# The ARM946E-S in the Nintendo DS has no FPU, so every `f32` op the engine
+# touches is software-emulated at 33 MHz. The DS's native idiom is fixed-point
+# integer math, and it ships a hardware divide/sqrt coprocessor we should be
+# using on the hot paths. This crate provides:
+#
+# - `Fx32` (20.12 fixed-point) plus `FxVec2`/`FxVec3`, matching the format the
+#   3D Geometry Engine consumes natively.
+# - `hw::div_*` / `hw::sqrt_*` wrappers around the DS math coprocessor
+#   (`<nds/arm9/math.h>`) gated on `target_vendor = "nintendo"`, with bit-for-bit
+#   software fallbacks for host tests.
+#
+# Pure logic only — no FFI to libnds, no allocator, no panic handler — so it
+# compiles on the DS target and runs unchanged under the host test harness.
+
+[dependencies]
