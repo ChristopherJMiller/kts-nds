@@ -45,6 +45,16 @@
             extensions = [ "rust-src" "rustfmt" "clippy" ];
           }
         );
+
+        # Upstream nixpkgs builds desmume without `-Dgdb-stub=true`, which means
+        # the `--arm9gdb=PORT` / `--arm7gdb=PORT` flags are stripped out and the
+        # emulator has no way to expose ARM9 main RAM to a debugger. We want
+        # them for perf telemetry: the ROM writes a `PerfBlob` (frame-time ring)
+        # into main RAM, and a small host tool connects to the gdbstub during
+        # `just preview` to read it back. Override only the meson flags.
+        desmumeWithGdbStub = pkgs.desmume.overrideAttrs (old: {
+          mesonFlags = (old.mesonFlags or [ ]) ++ [ "-Dgdb-stub=true" ];
+        });
       in
       {
         devShells.default = pkgs.mkShell {
@@ -56,7 +66,9 @@
             pkgs.melonds
             # Headless preview: desmume (SDL frontend) + Xvfb + ImageMagick let
             # `just preview` boot the ROM and capture a screenshot with no GUI.
-            pkgs.desmume
+            # Built with `gdb-stub=true` so `--arm9gdb=PORT` is available — see
+            # `desmumeWithGdbStub` above.
+            desmumeWithGdbStub
             pkgs.xvfb
             pkgs.imagemagick
             # bindgen / general build helpers

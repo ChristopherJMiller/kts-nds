@@ -52,7 +52,7 @@ check:
 #   `std` from source fixes it).
 test *args:
     host="$(rustc -vV | sed -n 's/^host: //p')"; \
-    cargo test -p bevy_nds_3d_obj -p obj2dl -p bevy_nds_3d_macros -p png2sprite \
+    cargo test -p bevy_nds_3d_obj -p obj2dl -p bevy_nds_3d_macros -p png2sprite -p perfread \
         --target "$host" {{args}}
     cargo test \
         -p bevy_nds_diagnostics \
@@ -104,29 +104,71 @@ rom profile="debug": (_build profile)
 run profile="debug": (rom profile)
     melonDS "{{rom}}"
 
-# Headlessly boot the ROM in desmume and save a screenshot — handy for quickly
-# seeing what the ROM renders without a GUI (also usable in CI).
-# Usage: `just preview` or `just preview release`. Output: preview.png
-# Override with OUT=foo.png, WAIT=12 (seconds), DISP=:99.
-preview profile="debug": (rom profile)
+# Headlessly boot the ROM in desmume, save a screenshot, and (via the gdbstub)
+# pull frame-time stats out of `bevy_nds_diagnostics::PERF_BLOB` so the same
+# command tells you both what the demo looked like *and* how it performed.
+# Usage: `just preview` or `just preview release`. Output: preview.png + a
+# `samples=… min=… avg=… p95=… fps_avg=…` line printed to stdout.
+# Override with OUT=foo.png, WAIT=12 (seconds), DISP=:99, GDBPORT=9999.
+preview profile="debug": (rom profile) (_build_perfread)
     #!/usr/bin/env bash
     set -euo pipefail
     out="${OUT:-preview.png}"
     wait_s="${WAIT:-10}"
     disp="${DISP:-:99}"
-    echo "Booting {{rom}} in desmume (headless) on $disp …"
-    timeout $((wait_s + 20)) Xvfb "$disp" -screen 0 256x384x24 >/tmp/bevy-ds-xvfb.log 2>&1 &
+    port="${GDBPORT:-9999}"
+    elf="{{target_dir}}/{{profile}}/bevy-ds.elf"
+    host="$(rustc -vV | sed -n 's/^host: //p')"
+    perfread="target/$host/debug/perfread"
+    # Fish PERF_BLOB out of the ELF so perfread can read it directly instead
+    # of scanning 4 MB of main RAM (the slow fallback path).
+    perf_addr="$(nm "$elf" 2>/dev/null | awk '/PERF_BLOB$/ { print "0x" $1 }')"
+    # SIGTERM doesn't always stop desmume cleanly after a gdbstub BREAK; kill
+    # everything we spawned ourselves at the end (and on Ctrl-C) so the recipe
+    # never hangs in a final `wait`.
+    cleanup_pids=()
+    trap 'for p in "${cleanup_pids[@]}"; do kill -9 "$p" 2>/dev/null || true; done' EXIT INT TERM
+    echo "Booting {{rom}} in desmume (headless, gdbstub :$port) on $disp …"
+    Xvfb "$disp" -screen 0 256x384x24 >/tmp/bevy-ds-xvfb.log 2>&1 &
+    cleanup_pids+=("$!")
     sleep 2
     # `--disable-sound` keeps the preview silent: the preview is meant for
     # eyes-only (CI, quick screenshots), and an emulator that suddenly bursts
     # into music is startling when you forget you launched it. Also dodges any
     # SDL audio device the headless Xvfb session doesn't have.
+    #
+    # `--arm9gdb` launches desmume *paused* and only runs ARM9 code once the
+    # debugger sends `c`. perfread (below) drives that, so the emulator runs
+    # for exactly the same window we time the screenshot against.
     DISPLAY="$disp" SDL_VIDEODRIVER=x11 SDL_AUDIODRIVER=dummy \
-        timeout $((wait_s + 6)) desmume-cli --nojoy --disable-sound "{{rom}}" >/tmp/bevy-ds-emu.log 2>&1 &
-    sleep "$wait_s"
+        desmume-cli --nojoy --disable-sound --arm9gdb "$port" "{{rom}}" >/tmp/bevy-ds-emu.log 2>&1 &
+    cleanup_pids+=("$!")
+    # Give the gdbstub a moment to bind before perfread races to connect.
+    sleep 1
+    # perfread:
+    #   * connects to the paused emulator,
+    #   * sends `c` so the ROM actually runs,
+    #   * sleeps `wait_s` seconds (during which the demo fills the PerfBlob
+    #     ring and we grab the screenshot below),
+    #   * BREAKs, reads PerfBlob, prints the one-line summary.
+    "$perfread" --port "$port" --addr "$perf_addr" --run-ms $((wait_s * 1000)) >/tmp/bevy-ds-perf.log 2>&1 &
+    perfread_pid=$!
+    # Grab the screenshot just before perfread BREAKs — at 90 % of the run
+    # window the demo is in a steady-state frame, not still booting.
+    sleep "$(awk -v w="$wait_s" 'BEGIN { printf "%.2f", w * 0.9 }')"
     DISPLAY="$disp" import -window root "$out"
+    wait "$perfread_pid" || true
     echo "Saved $out (emulator log: /tmp/bevy-ds-emu.log)"
-    wait 2>/dev/null || true
+    if [ -s /tmp/bevy-ds-perf.log ]; then
+        echo "Perf:  $(cat /tmp/bevy-ds-perf.log)"
+    else
+        echo "Perf:  (no data — see /tmp/bevy-ds-perf.log)"
+    fi
+
+# Internal: build the host-side `perfread` tool used by `just preview`. Split
+# out so the cargo invocation lives next to the rest of the build recipes.
+_build_perfread:
+    cargo build -p perfread --target "$(rustc -vV | sed -n 's/^host: //p')" --quiet
 
 # Headlessly boot the ROM in desmume and grab the first stable frame — the
 # fast variant of `just preview`, tuned for README banner / changelog snaps

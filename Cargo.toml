@@ -20,6 +20,7 @@ members = [
   "crates/png2sprite",
   "crates/bevy_nds_math",
   "crates/bevy_nds_cothread",
+  "crates/perfread",
 ]
 resolver = "2"
 

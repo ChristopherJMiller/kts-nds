@@ -60,6 +60,11 @@ drop `bevy_nds_text` for a sprite-only game).
   NitroFS assets; used by the demo's `build.rs`.
 - **`wav2bank`** (`crates/wav2bank`) — host CLI/lib that wraps `mmutil` to bake
   WAVs into `soundbank.bin`.
+- **`perfread`** (`crates/perfread`) — host CLI that pulls
+  `bevy_nds_diagnostics::PERF_BLOB` (a frame-time ring in main RAM) out of a
+  running emulator over desmume's gdbstub and prints `min/avg/p50/p95` frame
+  time. `just preview` invokes it next to the screenshot so each preview run
+  reports both *what* the demo looked like and *how* it performed.
 - **`bevy-ds`** (the root crate) — the demo. Plain Bevy components and systems,
   with no FFI, allocator or panic handler.
 
@@ -177,7 +182,7 @@ For the smaller, faster build, append `release`, e.g. `just run release`.
 | `just build-release`     | Compile the ARM9 ELF (release).                            |
 | `just rom [profile]`     | Package an ELF into `bevy-ds.nds` (`ndstool`).             |
 | `just run [profile]`     | Build, package, and run in **melonDS** (interactive).      |
-| `just preview [profile]` | Build, package, boot in **desmume** headlessly and save `preview.png`. Override with `OUT=`, `WAIT=`, `DISP=`. |
+| `just preview [profile]` | Build, package, boot in **desmume** headlessly, save `preview.png` and print frame-time stats (`samples=… min=… avg=… p95=… fps_avg=…`) read from the ROM's `PERF_BLOB` via the gdbstub. Override with `OUT=`, `WAIT=`, `DISP=`, `GDBPORT=`. |
 | `just snap [profile]`    | Like `preview`, but with a short default `WAIT` for grabbing the first stable frame (README banners, changelog snaps). Accepts fractional seconds. |
 | `just check`             | `cargo check`.                                             |
 | `just test [filter]`     | Run the `bevy_nds` host-side unit tests (builds for the host triple). |

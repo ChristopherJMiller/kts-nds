@@ -1,0 +1,15 @@
+[package]
+name = "perfread"
+version = "0.1.0"
+edition = "2024"
+description = "Read the `PerfBlob` frame-time ring out of a running DS ROM via an emulator's gdbstub. Used by `just preview`."
+
+# Host-side tool. Connects to desmume's `--arm9gdb=PORT` listener, scans ARM9
+# main RAM for the `b"BVDS"` magic written by bevy_nds_diagnostics, reads the
+# frame-time ring, and prints min/avg/p50/p95 frame time (and the equivalent
+# FPS) so `just preview` can include a one-line perf summary next to the
+# screenshot. Pure stdlib — no extra deps so it compiles instantly.
+
+[[bin]]
+name = "perfread"
+path = "src/main.rs"
