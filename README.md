@@ -64,7 +64,7 @@ drop `bevy_nds_text` for a sprite-only game).
   with no FFI, allocator or panic handler.
 
 <p align="center">
-  <img src="docs/cube-demo.png" alt="The hardware-rendered 3D cube on the top screen with the live HUD below" width="320">
+  <img src="docs/demo.png" alt="The map + HUD on the top screen with the hardware-lit teapots on the bottom" width="320">
 </p>
 
 The demo renders a hardware-lit Utah teapot on one screen and a text HUD on the
@@ -178,6 +178,7 @@ For the smaller, faster build, append `release`, e.g. `just run release`.
 | `just rom [profile]`     | Package an ELF into `bevy-ds.nds` (`ndstool`).             |
 | `just run [profile]`     | Build, package, and run in **melonDS** (interactive).      |
 | `just preview [profile]` | Build, package, boot in **desmume** headlessly and save `preview.png`. Override with `OUT=`, `WAIT=`, `DISP=`. |
+| `just snap [profile]`    | Like `preview`, but with a short default `WAIT` for grabbing the first stable frame (README banners, changelog snaps). Accepts fractional seconds. |
 | `just check`             | `cargo check`.                                             |
 | `just test [filter]`     | Run the `bevy_nds` host-side unit tests (builds for the host triple). |
 | `just fmt`               | `cargo fmt`.                                               |

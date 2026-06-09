@@ -128,6 +128,30 @@ preview profile="debug": (rom profile)
     echo "Saved $out (emulator log: /tmp/bevy-ds-emu.log)"
     wait 2>/dev/null || true
 
+# Headlessly boot the ROM in desmume and grab the first stable frame — the
+# fast variant of `just preview`, tuned for README banner / changelog snaps
+# rather than "let the demo run for a while". Default WAIT is short (~2s,
+# enough for desmume to bring up the X window and for the ROM to draw a
+# couple of frames). Like `preview`, override with OUT=, WAIT=, DISP=.
+# WAIT accepts fractional seconds (e.g. WAIT=1.5).
+snap profile="debug": (rom profile)
+    #!/usr/bin/env bash
+    set -euo pipefail
+    out="${OUT:-preview.png}"
+    wait_s="${WAIT:-2}"
+    disp="${DISP:-:99}"
+    # bash arithmetic is integer-only; round wait_s up for the timeout budgets.
+    wait_int=$(awk -v w="$wait_s" 'BEGIN { printf "%d", (w == int(w) ? w : int(w) + 1) }')
+    echo "Booting {{rom}} in desmume (headless) on $disp, sleeping ${wait_s}s …"
+    timeout $((wait_int + 20)) Xvfb "$disp" -screen 0 256x384x24 >/tmp/bevy-ds-xvfb.log 2>&1 &
+    sleep 2
+    DISPLAY="$disp" SDL_VIDEODRIVER=x11 SDL_AUDIODRIVER=dummy \
+        timeout $((wait_int + 6)) desmume-cli --nojoy --disable-sound "{{rom}}" >/tmp/bevy-ds-emu.log 2>&1 &
+    sleep "$wait_s"
+    DISPLAY="$disp" import -window root "$out"
+    echo "Saved $out (emulator log: /tmp/bevy-ds-emu.log)"
+    wait 2>/dev/null || true
+
 # Remove build artifacts and the generated ROM.
 clean:
     cargo clean
