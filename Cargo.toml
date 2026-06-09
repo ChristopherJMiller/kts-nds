@@ -22,6 +22,7 @@ members = [
   "crates/bevy_nds_cothread",
   "crates/perfread",
   "crates/bevy_nds_rtc",
+  "crates/bevy_nds_save",
 ]
 resolver = "2"
 
@@ -135,6 +136,9 @@ opt-level = 3
 opt-level = 3
 
 [profile.dev.package.bevy_nds_rtc]
+opt-level = 3
+
+[profile.dev.package.bevy_nds_save]
 opt-level = 3
 
 [profile.release]

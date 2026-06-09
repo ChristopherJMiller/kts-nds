@@ -20,6 +20,7 @@
 //! | Math coprocessor       | [`Fx32`] / [`FxVec3`] + [`bevy_nds_math::hw`] divide/sqrt | [`bevy_nds_math`]                            |
 //! | Cooperative threads    | [`Tasks`] resource + [`Task`] handle (spawn / poll) | [`bevy_nds_cothread::CothreadPlugin`]                 |
 //! | Real-time clock        | [`WallClock`] resource (year/month/day + h/m/s) | [`bevy_nds_rtc::RtcPlugin`]                              |
+//! | Writable FAT/SD storage | [`SaveStorage`] resource (blocking + async slot I/O) | [`bevy_nds_save::SavePlugin`]                            |
 //!
 //! Games depend on this crate, add [`DsPlugins`] to their `App`, and call
 //! [`run`] — they never touch FFI directly.
@@ -57,6 +58,7 @@ pub use bevy_nds_math::{Fx32, FxVec2, FxVec3};
 pub use bevy_nds_nitrofs::{NitroFs, NitroFsPlugin, flush_dcache, init_nitrofs, read_file};
 pub use bevy_nds_rtc::{RtcPlugin, WallClock};
 pub use bevy_nds_runtime::run;
+pub use bevy_nds_save::{SavePlugin, SaveStorage, StorageStatus};
 pub use bevy_nds_text::{DsText, Glyph, TextRenderPlugin, TilePos};
 pub use bevy_nds_time::TimePlugin;
 pub use bevy_nds_video::{ConsoleHandle, Consoles, DsScreen, PrintConsole, VideoPlugin};
@@ -74,6 +76,7 @@ impl PluginGroup for DsPlugins {
             .add(CothreadPlugin)
             .add(TimePlugin)
             .add(RtcPlugin)
+            .add(SavePlugin::default())
             .add(DiagnosticsPlugin)
             .add(InputPlugin)
             .add(GesturePlugin)
@@ -85,7 +88,8 @@ impl PluginGroup for DsPlugins {
 pub mod prelude {
     pub use crate::{
         DsButton, DsPlugins, DsScreen, DsText, Fps, Fx32, FxVec2, FxVec3, Gesture, GestureEvent,
-        Gestures, Glyph, NitroFs, SwipeDir, Task, Tasks, TilePos, WallClock, run,
+        Gestures, Glyph, NitroFs, SaveStorage, StorageStatus, SwipeDir, Task, Tasks, TilePos,
+        WallClock, run,
     };
     pub use bevy_input::ButtonInput;
     pub use bevy_input::touch::{TouchInput, TouchPhase, Touches};

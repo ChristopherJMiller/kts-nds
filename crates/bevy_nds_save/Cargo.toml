@@ -1,0 +1,29 @@
+[package]
+name = "bevy_nds_save"
+version = "0.1.0"
+edition = "2024"
+description = "Save data on writable FAT/SD storage for the Nintendo DS (no_std). Blocking + cothread-async slot I/O over libfat."
+
+# Mounts the writable filesystem (DLDI flashcart, DSi SD) once via
+# `fatInitDefault()` and exposes a small slot-keyed `SaveStorage` resource
+# for reading/writing game saves. Writes go through standard newlib stdio
+# (`fopen`/`fwrite`/`fclose`), so file paths are ordinary `fat:/...` strings.
+#
+# Both blocking and non-blocking flavours are exposed: the blocking calls are
+# fine for tiny saves (settings, a counter) or startup loads, while the
+# `*_async` variants spawn a `bevy_nds_cothread` task so a large save can
+# happen off the per-frame critical path without dropping below 60 fps.
+
+[lib]
+
+[dependencies]
+bevy_app = { version = "0.16", default-features = false, features = [
+  "critical-section",
+] }
+bevy_ecs = { version = "0.16", default-features = false, features = [
+  "critical-section",
+] }
+# Async slot I/O wraps `bevy_nds_cothread` so save/load can run off the
+# per-frame critical path. The cothread plugin must be in the App for the
+# returned `Task<T>`s to actually progress.
+bevy_nds_cothread = { path = "../bevy_nds_cothread" }

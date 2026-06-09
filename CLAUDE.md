@@ -104,6 +104,14 @@ they don't need (e.g. drop `bevy_nds_text` for a sprite-only game).
   hardware timer; this is the orthogonal wall-clock axis for save timestamps,
   day/night, RNG seeding. Civil decomposition (Howard Hinnant's algorithm) is
   pure Rust and host-tested.
+- **`crates/bevy_nds_save`** — writable-filesystem persistence. Mounts FAT
+  (DLDI flashcart, DSi SD) once via `fatInitDefault()` and exposes a
+  slot-keyed `SaveStorage` resource. Both blocking (`read`/`write`) and
+  cothread-async (`read_async`/`write_async` → `Task<T>`) flavours over the
+  same newlib stdio backend (`fopen`/`fread`/`fwrite`). `StorageStatus`
+  reports availability (FAT can fail to mount on unsupported flashcarts);
+  callers degrade gracefully. Pure slot-path joining + name validation
+  (rejects `..`, `/`, NUL) is host-tested.
 
 **Capability crates** (additive, depended on directly by games when used):
 
@@ -170,6 +178,7 @@ starting in its own crate.
 | Math coprocessor (div/sqrt) | `Fx32` + `FxVec2`/`FxVec3`; `hw::div_*` / `hw::sqrt_*` | `bevy_nds_math`                                  |
 | Cooperative threads (`cothread`) | `Tasks` resource + `Task<T>` handle (`spawn` / `poll`) | `bevy_nds_cothread::CothreadPlugin`           |
 | Real-time clock          | `WallClock` resource (year/month/day + h/m/s + unix_secs) | `bevy_nds_rtc::RtcPlugin`                     |
+| Writable FAT/SD storage  | `SaveStorage` resource (blocking + async slot I/O) + `StorageStatus` | `bevy_nds_save::SavePlugin`              |
 
 `DsPlugins` (in `bevy_nds`) bundles the platform-layer plugins;
 `bevy_nds::run(app)` (re-export from `bevy_nds_runtime`) installs the runner

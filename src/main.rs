@@ -70,7 +70,9 @@ impl Plugin for GamePlugin {
             screen: DsScreen::Bottom,
         })
         .insert_resource(Map::new())
-        .add_systems(Startup, setup)
+        .init_resource::<FrameCounter>()
+        .init_resource::<PendingSave>()
+        .add_systems(Startup, (setup, load_counter))
         .add_systems(
             Update,
             (
@@ -88,6 +90,8 @@ impl Plugin for GamePlugin {
                 update_audio_hud,
                 bg_task_demo,
                 update_clock_hud,
+                tick_and_autosave,
+                update_save_hud,
             ),
         );
     }
@@ -221,6 +225,28 @@ struct BgTaskHud;
 /// A status line showing wall-clock time (YYYY-MM-DD HH:MM:SS) from the DS RTC.
 #[derive(Component)]
 struct ClockHud;
+
+/// A status line for the save-storage demo: shows the live frame counter
+/// plus the last value committed to `fat:/bevy-ds/counter.sav`. The counter
+/// resumes across reboots, proving the SD-card write/read round-trip.
+#[derive(Component)]
+struct SaveHud;
+
+/// Counts frames since the last load; the resource itself is the canonical
+/// state we round-trip through `SaveStorage`. `last_saved` is shown on the
+/// HUD so you can see autosaves fire (the live counter overtakes it, then it
+/// catches up).
+#[derive(Resource, Default)]
+struct FrameCounter {
+    frames: u32,
+    last_saved: u32,
+}
+
+/// The currently-in-flight async save, if any. We only kick off a new
+/// `write_async` when the previous one has finished — dropping an unfinished
+/// `Task` would block the frame loop.
+#[derive(Resource, Default)]
+struct PendingSave(Option<Task<bool>>);
 
 // --- Setup -------------------------------------------------------------------
 
@@ -361,6 +387,12 @@ fn setup(mut commands: Commands, nitrofs: Res<NitroFs>, mut music: ResMut<Music>
         TilePos::new(2, MAP_TILE_ROW + MAP_H as i16 + 7),
         ClockHud,
         DsText::new("clock: --"),
+    ));
+    commands.spawn((
+        DsScreen::Bottom,
+        TilePos::new(2, MAP_TILE_ROW + MAP_H as i16 + 8),
+        SaveHud,
+        DsText::new("save: --"),
     ));
     commands.spawn((
         DsScreen::Bottom,
@@ -565,6 +597,65 @@ fn toggle_music(input: Res<ButtonInput<DsButton>>, mut music: ResMut<Music>) {
             music.stop();
         } else {
             music.play(SoundId(sounds::SFX_PIANO_LOOP));
+        }
+    }
+}
+
+/// On boot, pull the persisted frame count off the SD card (if any) so the
+/// counter resumes where it left off. Synchronous read — fine for startup
+/// since we're not yet inside the per-frame loop.
+fn load_counter(save: Res<SaveStorage>, mut counter: ResMut<FrameCounter>) {
+    if let Some(bytes) = save.read("counter")
+        && let Ok(arr) = <[u8; 4]>::try_from(bytes.as_slice())
+    {
+        counter.frames = u32::from_le_bytes(arr);
+        counter.last_saved = counter.frames;
+    }
+}
+
+/// Per-frame: bump the counter, and every ~5 s (300 vblanks) kick off an
+/// async save via cothread so the write doesn't stall vblank. We hold the
+/// in-flight `Task` in `PendingSave` and poll it each frame; we only start a
+/// new save once the previous one has joined (dropping an unfinished `Task`
+/// would block).
+fn tick_and_autosave(
+    mut counter: ResMut<FrameCounter>,
+    mut pending: ResMut<PendingSave>,
+    save: Res<SaveStorage>,
+) {
+    counter.frames = counter.frames.wrapping_add(1);
+
+    // Reap a completed save first.
+    if let Some(task) = &mut pending.0
+        && task.poll().is_some()
+    {
+        counter.last_saved = counter.frames;
+        pending.0 = None;
+    }
+
+    // Kick off a new autosave every 5 s, unless one is still running.
+    if pending.0.is_none() && counter.frames.is_multiple_of(300) {
+        let bytes = counter.frames.to_le_bytes().to_vec();
+        pending.0 = Some(save.write_async("counter", bytes));
+    }
+}
+
+/// Reflect the live counter and the last persisted value on the HUD.
+fn update_save_hud(
+    counter: Res<FrameCounter>,
+    save: Res<SaveStorage>,
+    mut query: Query<&mut DsText, With<SaveHud>>,
+) {
+    for mut text in &mut query {
+        text.0.clear();
+        if save.status().is_ready() {
+            let _ = write!(
+                text.0,
+                "save: live={} disk={}",
+                counter.frames, counter.last_saved,
+            );
+        } else {
+            let _ = write!(text.0, "save: unavailable");
         }
     }
 }

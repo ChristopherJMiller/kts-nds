@@ -181,6 +181,7 @@ dependencies = [
  "bevy_nds_nitrofs",
  "bevy_nds_rtc",
  "bevy_nds_runtime",
+ "bevy_nds_save",
  "bevy_nds_text",
  "bevy_nds_time",
  "bevy_nds_video",
@@ -294,6 +295,15 @@ version = "0.1.0"
 dependencies = [
  "bevy_app",
  "critical-section",
+]
+
+[[package]]
+name = "bevy_nds_save"
+version = "0.1.0"
+dependencies = [
+ "bevy_app",
+ "bevy_ecs",
+ "bevy_nds_cothread",
 ]
 
 [[package]]
