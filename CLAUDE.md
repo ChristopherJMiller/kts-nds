@@ -74,10 +74,14 @@ they don't need (e.g. drop `bevy_nds_text` for a sprite-only game).
 - **`crates/bevy_nds_diagnostics`** — smoothed `Fps` resource.
 - **`crates/bevy_nds_text`** — tile-console text renderer (`Glyph`/`DsText`/`TilePos`).
 - **`crates/bevy_nds_sprite`** — 2D hardware sprites (OAM) on the sub engine.
-  Loads a `.sprite` asset from NitroFS at startup (or falls back to an
-  embedded 16x16 cursor). Pure parser host-tested.
-- **`crates/png2sprite`** — host CLI/library that wraps BlocksDS's `grit` to
-  bake `assets/sprites/*.png` into `.sprite` NitroFS assets.
+  Lazy-loads `.sprite` assets from NitroFS on first sight of a `Sprite`
+  carrying their path, up to 16 distinct images (one per 4bpp palette
+  bank). Pure parser + size-code logic host-tested.
+- **`crates/png2sprite`** — host CLI/library that wraps BlocksDS's `grit`
+  to bake `assets/sprites/**/*.png` (recursive) into `.sprite` NitroFS
+  assets under `nitro:/sprites/`. Also emits `OUT_DIR/sprites.rs` — a
+  Rust constants module of paths the game `include!`s (mirrors
+  `wav2bank`'s `sounds.rs`).
 - **`crates/bevy_nds_nitrofs`** — mounts the ROM filesystem and exposes
   `read_file` / `flush_dcache`. Shared by 3D, audio, and any future asset loader.
 - **`crates/bevy_nds_math`** — 20.12 fixed-point (`Fx32`, `FxVec2`, `FxVec3`)
@@ -181,13 +185,20 @@ Meshes carry a local AABB used by `bevy_nds_3d_cull` for view-frustum culling.
 ### Sprite pipeline
 
 `bevy_nds_sprite` drives the sub engine's OAM. Sprite tile data + a 16-entry
-palette live in a baked `.sprite` blob: `build.rs` calls `png2sprite` (wraps
-BlocksDS's `grit`) over `assets/sprites/*.png` into `build/nitrofs/*.sprite`,
-which `just rom` packs into the ROM. The plugin loads `nitro:/sprite.sprite`
-at startup, falls back to a tiny embedded cursor if the file is missing or
-NitroFS isn't mounted. The on-disk format (magic `"BSP1"` + sizes + palette
-+ gfx) is defined once in `png2sprite::encode` and parsed by
-`bevy_nds_sprite::asset::parse` — keep the two in sync.
+palette live in a baked `.sprite` blob: `build.rs` walks
+`assets/sprites/**/*.png` (recursive), calls `png2sprite` (wraps BlocksDS's
+`grit`) and writes `build/nitrofs/sprites/<rel>.sprite`, which `just rom`
+packs into the ROM. It also emits `$OUT_DIR/sprites.rs` — a Rust constants
+module of NitroFS paths, with subdirectories rendered as nested modules
+(e.g. `sprites::CURSOR`, `sprites::ui::CURSOR`) — that the game `include!`s.
+
+Sprites are referenced by passing a constant to `Sprite { image, x, y }`.
+The plugin's `SpriteAssets` resource lazy-loads each distinct `image` path
+the first time it is observed, claiming the next free 4bpp palette bank
+(cap = 16). Failed loads silently leave the sprite hidden. Supported square
+sizes only: 8×8, 16×16, 32×32, 64×64. The on-disk format (magic `"BSP1"` +
+sizes + palette + gfx) is defined once in `png2sprite::encode` and parsed
+by `bevy_nds_sprite::asset::parse` — keep the two in sync.
 
 ### Audio pipeline
 

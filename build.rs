@@ -116,41 +116,62 @@ fn write_predicted_ids(src: &std::path::Path, out_ids: &std::path::Path) {
     }
 }
 
-/// Bake every `assets/sprites/*.png` into `build/nitrofs/*.sprite` via
-/// BlocksDS's `grit` (wrapped by the `png2sprite` library). `bevy_nds_sprite`
-/// reads them at runtime; without them, the plugin falls back to the embedded
-/// sprite baked into the crate. `grit` only exists inside `nix develop`, so a
-/// plain `cargo check` outside the shell silently skips this step.
+/// Bake every `assets/sprites/**/*.png` into `build/nitrofs/sprites/*.sprite`
+/// via BlocksDS's `grit` (wrapped by the `png2sprite` library). Always emits
+/// `$OUT_DIR/sprites.rs` — a Rust constants module of NitroFS paths the game
+/// `include!`s — even when `grit` is missing, so `cargo check` outside `nix
+/// develop` still compiles (only the binary assets are skipped, so loads
+/// silently fail at runtime).
 fn compile_sprites() {
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let src = manifest.join(SPRITE_DIR);
-    let dst = manifest.join(NITROFS_DIR);
+    let dst = manifest.join(NITROFS_DIR).join(png2sprite::NITROFS_SUBDIR);
     let work = PathBuf::from(env::var("OUT_DIR").unwrap()).join("png2sprite-work");
+    let out_rs = PathBuf::from(env::var("OUT_DIR").unwrap()).join("sprites.rs");
 
     println!("cargo:rerun-if-changed={}", src.display());
     println!("cargo:rerun-if-env-changed=BLOCKSDS");
     println!("cargo:rerun-if-env-changed=GRIT");
 
+    // Even if the source tree is empty, write a stub so `include!` works.
     if !src.is_dir() {
+        write_sprite_consts(&out_rs, &[]);
         return;
     }
 
-    let Some(grit) = png2sprite::find_grit() else {
-        println!(
-            "cargo:warning=grit not found (run inside `nix develop`); \
-             sprite PNGs not baked — bevy_nds_sprite will use the embedded fallback"
-        );
-        return;
-    };
-
-    let opts = png2sprite::Options::default();
-    match png2sprite::build_dir(&src, &dst, &grit, &work, &opts) {
-        Ok(built) => {
-            for input in &built.inputs {
-                println!("cargo:rerun-if-changed={}", input.display());
+    let grit = png2sprite::find_grit();
+    let items = match &grit {
+        Some(grit) => {
+            match png2sprite::build_dir(&src, &dst, grit, &work, &png2sprite::Options::default()) {
+                Ok(built) => {
+                    for input in built.inputs() {
+                        println!("cargo:rerun-if-changed={}", input.display());
+                    }
+                    built.items
+                }
+                Err(e) => {
+                    println!("cargo:warning=sprite baking failed: {e}");
+                    png2sprite::predict_dir(&src).unwrap_or_default()
+                }
             }
         }
-        Err(e) => println!("cargo:warning=sprite baking failed: {e}"),
+        None => {
+            println!(
+                "cargo:warning=grit not found (run inside `nix develop`); \
+                 sprite PNGs not baked — sprites will silently fail to load at runtime"
+            );
+            png2sprite::predict_dir(&src).unwrap_or_default()
+        }
+    };
+    write_sprite_consts(&out_rs, &items);
+}
+
+/// Emit the generated `sprites.rs` constants module, mirroring how
+/// `compile_audio` writes `sounds.rs`.
+fn write_sprite_consts(out_rs: &std::path::Path, items: &[png2sprite::Baked]) {
+    let rust = png2sprite::emit_rust_consts(items);
+    if let Err(e) = std::fs::write(out_rs, rust) {
+        println!("cargo:warning=could not write {}: {e}", out_rs.display());
     }
 }
 

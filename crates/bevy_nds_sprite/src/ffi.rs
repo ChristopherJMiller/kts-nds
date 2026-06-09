@@ -41,6 +41,8 @@ pub mod sprite_size {
     pub const _16X16: c_int = (1 << 14) | (0 << 12) | ((16 * 16) >> 5);
     /// 32x32 sprite (16 tiles).
     pub const _32X32: c_int = (2 << 14) | (0 << 12) | ((32 * 32) >> 5);
+    /// 64x64 sprite (64 tiles).
+    pub const _64X64: c_int = (3 << 14) | (0 << 12) | ((64 * 64) >> 5);
 }
 
 /// `SpriteColorFormat` discriminants.

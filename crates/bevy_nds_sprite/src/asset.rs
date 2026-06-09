@@ -22,9 +22,11 @@ use alloc::vec::Vec;
 const MAGIC: u32 = u32::from_le_bytes(*b"BSP1");
 const HEADER_LEN: usize = 16;
 
-/// A baked sprite read from NitroFS: palette + tile gfx, both owned so the
-/// underlying file buffer can be dropped.
+/// A baked sprite read from NitroFS: dimensions + palette + tile gfx, all
+/// owned so the underlying file buffer can be dropped.
 pub struct LoadedSprite {
+    pub width: u16,
+    pub height: u16,
     pub palette: Vec<u16>,
     pub gfx: Vec<u8>,
 }
@@ -47,10 +49,8 @@ pub fn parse(bytes: &[u8]) -> Option<LoadedSprite> {
     if magic != MAGIC {
         return None;
     }
-    // We don't currently use width/height — the plugin still hard-codes the
-    // OAM size to 16x16 — but read them so the parser fails fast on bad data.
-    let _width = read_u16(bytes, 4);
-    let _height = read_u16(bytes, 6);
+    let width = read_u16(bytes, 4);
+    let height = read_u16(bytes, 6);
     let pal_count = read_u32(bytes, 8) as usize;
     let gfx_count = read_u32(bytes, 12) as usize;
 
@@ -67,7 +67,12 @@ pub fn parse(bytes: &[u8]) -> Option<LoadedSprite> {
         palette.push(read_u16(bytes, pal_off + i * 2));
     }
     let gfx = bytes[gfx_off..gfx_end].to_vec();
-    Some(LoadedSprite { palette, gfx })
+    Some(LoadedSprite {
+        width,
+        height,
+        palette,
+        gfx,
+    })
 }
 
 fn read_u16(bytes: &[u8], off: usize) -> u16 {
@@ -102,6 +107,8 @@ mod tests {
         let gfx = [0xAAu8, 0xBB, 0xCC, 0xDD];
         let blob = build_blob(&pal, &gfx);
         let parsed = parse(&blob).unwrap();
+        assert_eq!(parsed.width, 16);
+        assert_eq!(parsed.height, 16);
         assert_eq!(parsed.palette, pal);
         assert_eq!(parsed.gfx, gfx);
     }

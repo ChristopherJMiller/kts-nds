@@ -5,22 +5,26 @@
 //! tile-map). This crate wraps the libnds OAM API as ordinary Bevy components
 //! and a [`SpritePlugin`].
 //!
-//! ## Scope (MVP)
+//! ## Asset model
 //!
-//! - One pre-loaded 16x16 4bpp sprite image and a 16-colour palette, both
-//!   embedded in this crate as bytes. Replace with a `grit`-baked asset once
-//!   the `png2sprite` host crate lands.
-//! - Up to 128 [`Sprite`] entities on the **sub engine** (typically the screen
-//!   that *isn't* showing the 3D output, i.e. the top LCD when `Display3d` is
-//!   `Bottom`).
-//! - Each frame, the live [`Sprite`] entities are flushed into OAM slots
-//!   0..n; a small high-water watermark tells the plugin which trailing slots
-//!   to hide when sprite count drops.
+//! Sprites are baked from `assets/sprites/**/*.png` into `.sprite` blobs under
+//! `nitro:/sprites/` by the host-side `png2sprite` crate. `build.rs` also
+//! generates a Rust constants module (`sprites::*`) of NitroFS paths the game
+//! `include!`s, so spawning a sprite looks like:
 //!
 //! ```ignore
-//! app.add_plugins(SpritePlugin);
-//! commands.spawn(Sprite::at(120, 90));
+//! commands.spawn(Sprite { image: sprites::CURSOR, x: 16, y: 8 });
 //! ```
+//!
+//! At runtime the plugin maintains a [`SpriteAssets`] registry, capped at 16
+//! distinct images (one per sub-engine sprite palette bank). The first time
+//! any [`Sprite`] is seen carrying a given `image` path, the plugin reads the
+//! `.sprite` file from NitroFS, claims a palette bank, allocates the matching
+//! gfx VRAM, and caches the result. Subsequent sprites that reuse the same
+//! `image` share the cached entry — at no extra VRAM cost.
+//!
+//! Supported sizes are the square OAM sizes: **8×8, 16×16, 32×32, 64×64**.
+//! Rectangular sizes (8×16, 16×8, …) are rejected at load time.
 //!
 //! ## Engine ownership
 //!
@@ -34,7 +38,8 @@
 
 extern crate alloc;
 
-use core::ffi::c_void;
+use alloc::vec::Vec;
+use core::ffi::{c_int, c_void};
 
 use bevy_app::prelude::*;
 use bevy_ecs::prelude::*;
@@ -45,32 +50,86 @@ mod slots;
 
 pub use slots::{MAX_SPRITES, SpriteSlots};
 
+/// Maximum number of distinct sprite images loaded simultaneously. Bounded by
+/// the 16 4bpp palette banks on the sub-engine sprite palette — each loaded
+/// image claims its own bank.
+pub const MAX_SPRITE_IMAGES: usize = 16;
+
 /// One on-screen hardware sprite. Position is in pixels (top-left corner;
 /// 0..=255 horizontally, 0..=191 vertically — values outside this range are
-/// clipped by the hardware). All other OAM attributes are fixed at the MVP
-/// defaults (size 16x16, 4bpp 16-colour, palette 0, priority 0, no flip /
-/// affine / mosaic).
+/// clipped by the hardware). `image` is a NUL-terminated NitroFS path —
+/// typically one of the `sprites::*` constants generated from
+/// `assets/sprites/**/*.png` at build time.
 #[derive(Component, Clone, Copy, Debug)]
 pub struct Sprite {
     pub x: i16,
     pub y: i16,
+    /// NUL-terminated NitroFS path to the baked `.sprite` asset. Use the
+    /// constants in the game's generated `sprites` module.
+    pub image: &'static [u8],
 }
 
 impl Sprite {
-    pub const fn at(x: i16, y: i16) -> Self {
-        Self { x, y }
+    /// Convenience constructor — `Sprite::new(sprites::CURSOR).at(16, 8)`.
+    pub const fn new(image: &'static [u8]) -> Self {
+        Self { x: 0, y: 0, image }
+    }
+
+    /// Builder-style: set the screen position in pixels.
+    pub const fn at(mut self, x: i16, y: i16) -> Self {
+        self.x = x;
+        self.y = y;
+        self
     }
 }
 
-/// Internal: the embedded sprite gfx, allocated once in [`init_sprite_engine`].
-#[derive(Resource, Clone, Copy)]
-struct SpriteGfx {
-    gfx_ptr: *mut u16,
+/// Registry of sprite images that have been loaded into hardware VRAM and
+/// palette banks. Populated lazily as new [`Sprite`] entities are seen.
+///
+/// The registry is keyed on the **pointer identity** of `Sprite.image`: two
+/// sprites referencing the same `&'static [u8]` constant share an entry, but
+/// two constants with the same bytes do not. This works because the build
+/// pipeline emits one `&'static [u8]` per asset.
+#[derive(Resource, Default)]
+pub struct SpriteAssets {
+    entries: Vec<SpriteEntry>,
 }
 
-// SAFETY: the DS is single-core; we only touch the pointer from systems.
-unsafe impl Send for SpriteGfx {}
-unsafe impl Sync for SpriteGfx {}
+impl SpriteAssets {
+    /// Look up an already-loaded entry by image path.
+    fn find(&self, image: &[u8]) -> Option<&SpriteEntry> {
+        let key_ptr = image.as_ptr();
+        let key_len = image.len();
+        self.entries
+            .iter()
+            .find(|e| e.path_ptr == key_ptr && e.path_len == key_len)
+    }
+
+    /// How many distinct images are currently loaded.
+    pub fn loaded_count(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+/// One slot in [`SpriteAssets`]: the hardware resources backing a single
+/// loaded sprite image.
+struct SpriteEntry {
+    /// Identity of the source path (matched by pointer + length).
+    path_ptr: *const u8,
+    path_len: usize,
+    /// VRAM offset returned by `oamAllocateGfx`.
+    gfx_ptr: *mut u16,
+    /// Palette bank (0..15) this image's 16-colour palette lives in.
+    palette_bank: u8,
+    /// OAM size code (`ffi::sprite_size::_*`).
+    size_code: c_int,
+}
+
+// SAFETY: the DS is single-core; the raw pointers in SpriteEntry only ever
+// point into MMIO/VRAM, never into user-managed memory, and we only touch
+// them from systems running on the ARM9.
+unsafe impl Send for SpriteEntry {}
+unsafe impl Sync for SpriteEntry {}
 
 /// Internal: the highest OAM slot id we wrote to last frame, so the next
 /// frame can hide any trailing slots that no longer have a live sprite.
@@ -84,81 +143,113 @@ pub struct SpritePlugin;
 impl Plugin for SpritePlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<OamHighWater>()
+            .init_resource::<SpriteAssets>()
             .add_systems(Startup, init_sprite_engine)
+            .add_systems(PreUpdate, ensure_sprites_loaded)
             .add_systems(Last, (submit_sprites, finalize_oam).chain());
     }
 }
 
-/// Path the plugin tries to load a `.sprite` asset from. If NitroFS isn't
-/// mounted or the file is missing/invalid, the plugin falls back to the
-/// crate's embedded cursor.
-const ASSET_PATH: &[u8] = b"nitro:/sprite.sprite\0";
-
-/// One-time sub-engine OAM bring-up: map VRAM_I to sub sprite memory, load
-/// the palette + gfx (either from `nitro:/sprite.sprite` if available, or the
-/// embedded fallback), allocate gfx VRAM, and DMA the bytes into it. Runs in
-/// [`Startup`], after `bevy_nds`'s `PreStartup` mounts NitroFS.
-fn init_sprite_engine(mut commands: Commands) {
-    // Owned slices so the embedded path and the NitroFS-loaded path share
-    // one downstream code path.
-    let (gfx_bytes, palette): (alloc::borrow::Cow<[u8]>, alloc::borrow::Cow<[u16]>) =
-        match asset::load(ASSET_PATH) {
-            Some(s) => (
-                alloc::borrow::Cow::Owned(s.gfx),
-                alloc::borrow::Cow::Owned(s.palette),
-            ),
-            None => {
-                let (g, p) = embedded::cursor();
-                (
-                    alloc::borrow::Cow::Borrowed(g),
-                    alloc::borrow::Cow::Borrowed(p),
-                )
-            }
-        };
-    let gfx_bytes: &[u8] = &gfx_bytes;
-    let palette: &[u16] = &palette;
-
-    let gfx_ptr = unsafe {
+/// One-time sub-engine OAM bring-up: map VRAM_I to sub sprite memory and
+/// initialise the OAM shadow buffer. No asset loading — that is lazy and
+/// keyed off each [`Sprite`]'s `image` path.
+fn init_sprite_engine() {
+    unsafe {
         ffi::map_vram_i_to_sub_sprite();
         ffi::oamInit(
             &raw mut ffi::oamSub,
             ffi::SPRITE_MAPPING_1D_32,
             false, // extPalette
         );
+    }
+}
 
-        // Load the 16-colour palette into sub-engine sprite palette bank 0.
-        let pal = ffi::SPRITE_PALETTE_SUB;
-        for (i, &entry) in palette.iter().enumerate() {
-            core::ptr::write_volatile(pal.add(i), entry);
+/// PreUpdate: load any sprite image we haven't seen yet. Linear scan over all
+/// live [`Sprite`] entities; with up to 128 sprites and ≤16 cached entries,
+/// each frame this is a few thousand pointer comparisons (cheap on the ARM9
+/// even without the cache).
+fn ensure_sprites_loaded(mut assets: ResMut<SpriteAssets>, sprites: Query<&Sprite>) {
+    for sprite in &sprites {
+        if assets.find(sprite.image).is_some() {
+            continue;
         }
+        if assets.entries.len() >= MAX_SPRITE_IMAGES {
+            // No palette banks left — skip silently. The sprite will simply
+            // not render until another image is dropped (not yet supported).
+            continue;
+        }
+        let Some(entry) = load_into_hardware(sprite.image, assets.entries.len() as u8) else {
+            // Asset missing/invalid/unsupported size. The sprite using it
+            // will be hidden; retrying every frame keeps the cost trivial.
+            continue;
+        };
+        assets.entries.push(entry);
+    }
+}
 
-        // Allocate VRAM for one 16x16 4bpp sprite (4 tiles × 32 bytes = 128 B).
+/// Read a `.sprite` blob from NitroFS, allocate gfx VRAM, copy the palette
+/// into the assigned bank, and copy the tile bytes into VRAM. Returns the
+/// completed [`SpriteEntry`], or `None` if anything went wrong.
+fn load_into_hardware(image: &'static [u8], palette_bank: u8) -> Option<SpriteEntry> {
+    let loaded = asset::load(image)?;
+    let size_code = size_code_for(loaded.width, loaded.height)?;
+
+    let gfx_ptr = unsafe {
         let gfx = ffi::oamAllocateGfx(
             &raw mut ffi::oamSub,
-            ffi::sprite_size::_16X16,
+            size_code,
             ffi::sprite_color_format::_16COLOR,
         );
-
-        // Copy tile bytes into the allocated VRAM. `gfx` is `u16*` (VRAM is
-        // 16-bit-aligned), so pair adjacent bytes into one halfword write.
-        let dst = gfx;
-        let halfwords = gfx_bytes.len() / 2;
+        if gfx.is_null() {
+            return None;
+        }
+        // Tile bytes are paired into 16-bit writes (VRAM is halfword-aligned).
+        let halfwords = loaded.gfx.len() / 2;
         for i in 0..halfwords {
-            let lo = gfx_bytes[i * 2] as u16;
-            let hi = gfx_bytes[i * 2 + 1] as u16;
-            core::ptr::write_volatile(dst.add(i), lo | (hi << 8));
+            let lo = loaded.gfx[i * 2] as u16;
+            let hi = loaded.gfx[i * 2 + 1] as u16;
+            core::ptr::write_volatile(gfx.add(i), lo | (hi << 8));
         }
         gfx
     };
 
-    commands.insert_resource(SpriteGfx { gfx_ptr });
+    // Each loaded image owns one 16-entry palette bank on the sub engine.
+    // Write up to 16 entries; ignore anything grit emitted past that (it
+    // shouldn't, for 4bpp, but we don't want to spill into adjacent banks).
+    unsafe {
+        let base = ffi::SPRITE_PALETTE_SUB.add(palette_bank as usize * 16);
+        let n = loaded.palette.len().min(16);
+        for i in 0..n {
+            core::ptr::write_volatile(base.add(i), loaded.palette[i]);
+        }
+    }
+
+    Some(SpriteEntry {
+        path_ptr: image.as_ptr(),
+        path_len: image.len(),
+        gfx_ptr,
+        palette_bank,
+        size_code,
+    })
+}
+
+/// Map (width, height) → OAM size code. Only the square sizes are supported
+/// for now; everything else returns `None` and the sprite is hidden.
+fn size_code_for(width: u16, height: u16) -> Option<c_int> {
+    match (width, height) {
+        (8, 8) => Some(ffi::sprite_size::_8X8),
+        (16, 16) => Some(ffi::sprite_size::_16X16),
+        (32, 32) => Some(ffi::sprite_size::_32X32),
+        (64, 64) => Some(ffi::sprite_size::_64X64),
+        _ => None,
+    }
 }
 
 /// Push every live [`Sprite`] into the next OAM slot. After all sprites are
 /// written, hide any slots up to last frame's high-water mark. Cheap on the
-/// 33 MHz ARM9: position + gfx pointer per sprite, no per-frame allocation.
+/// 33 MHz ARM9: position + entry lookup per sprite, no per-frame allocation.
 fn submit_sprites(
-    gfx: Res<SpriteGfx>,
+    assets: Res<SpriteAssets>,
     sprites: Query<&Sprite>,
     mut high_water: ResMut<OamHighWater>,
 ) {
@@ -167,6 +258,10 @@ fn submit_sprites(
         if (next as usize) >= MAX_SPRITES {
             break;
         }
+        // Sprites whose image hasn't loaded (yet) are silently skipped.
+        let Some(entry) = assets.find(sprite.image) else {
+            continue;
+        };
         unsafe {
             ffi::oamSet(
                 &raw mut ffi::oamSub,
@@ -174,10 +269,10 @@ fn submit_sprites(
                 sprite.x as i32,
                 sprite.y as i32,
                 0, // priority (0 = top)
-                0, // palette index
-                ffi::sprite_size::_16X16,
+                entry.palette_bank as i32,
+                entry.size_code,
                 ffi::sprite_color_format::_16COLOR,
-                gfx.gfx_ptr as *const c_void,
+                entry.gfx_ptr as *const c_void,
                 -1,    // affine_index (none)
                 false, // size_double
                 false, // hide
@@ -188,7 +283,8 @@ fn submit_sprites(
         }
         next += 1;
     }
-    // Hide slots that were live last frame but are vacant this frame.
+    // Hide slots that were live last frame but are vacant this frame. We pick
+    // an arbitrary size — the entry is hidden, so the parameters don't render.
     let mut hide = next;
     while hide < high_water.0 {
         unsafe {
@@ -222,76 +318,25 @@ fn finalize_oam() {
 
 /// Common imports for games using the sprite backend.
 pub mod prelude {
-    pub use crate::{Sprite, SpritePlugin};
+    pub use crate::{Sprite, SpriteAssets, SpritePlugin};
 }
 
-/// Embedded MVP sprite asset: a 16x16 square with a red border on yellow
-/// fill, 4bpp + 16-colour palette. Replace with a `grit`-baked NitroFS asset
-/// once `png2sprite` lands.
-mod embedded {
-    /// Palette: 16 RGB15 entries (libnds `RGB15(r, g, b)` layout). Colour 0
-    /// is transparent (the sprite engine treats palette index 0 as
-    /// see-through). Colour 1 is bright yellow, colour 2 is red.
-    const PALETTE: [u16; 16] = [
-        0,      // 0: transparent
-        0x03FF, // 1: yellow (R=31, G=31, B=0)
-        0x001F, // 2: red    (R=31, G=0,  B=0)
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    ];
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    /// 16x16 sprite encoded as 4 tiles (top-left, top-right, bottom-left,
-    /// bottom-right) in 1D-32 tile order, each tile being 8x8 px at 4bpp
-    /// (= 32 bytes). Each *byte* holds two 4-bit pixels, low nibble = left.
-    ///
-    /// Yellow fill (palette 1) bordered by red (palette 2) — visible against
-    /// the dark blue 3D background.
-    pub fn cursor() -> (&'static [u8], &'static [u16; 16]) {
-        // For a row of 8 pixels at 4bpp, the byte order is:
-        //   byte 0 = pixel 1 (high nibble) | pixel 0 (low nibble)
-        //   byte 1 = pixel 3 | pixel 2
-        //   byte 2 = pixel 5 | pixel 4
-        //   byte 3 = pixel 7 | pixel 6
-        const TILE_TL: [u8; 32] = [
-            // row 0 (top sprite edge): all border (2,2,2,2,2,2,2,2)
-            0x22, 0x22, 0x22, 0x22,
-            // rows 1..7: left col is border, rest fill (2,1,1,1,1,1,1,1)
-            0x12, 0x11, 0x11, 0x11, 0x12, 0x11, 0x11, 0x11, 0x12, 0x11, 0x11, 0x11, 0x12, 0x11,
-            0x11, 0x11, 0x12, 0x11, 0x11, 0x11, 0x12, 0x11, 0x11, 0x11, 0x12, 0x11, 0x11, 0x11,
-        ];
-        const TILE_TR: [u8; 32] = [
-            // row 0: all border
-            0x22, 0x22, 0x22, 0x22,
-            // rows 1..7: fill with right col border (1,1,1,1,1,1,1,2)
-            0x11, 0x11, 0x11, 0x21, 0x11, 0x11, 0x11, 0x21, 0x11, 0x11, 0x11, 0x21, 0x11, 0x11,
-            0x11, 0x21, 0x11, 0x11, 0x11, 0x21, 0x11, 0x11, 0x11, 0x21, 0x11, 0x11, 0x11, 0x21,
-        ];
-        const TILE_BL: [u8; 32] = [
-            // rows 0..6: left col border, rest fill
-            0x12, 0x11, 0x11, 0x11, 0x12, 0x11, 0x11, 0x11, 0x12, 0x11, 0x11, 0x11, 0x12, 0x11,
-            0x11, 0x11, 0x12, 0x11, 0x11, 0x11, 0x12, 0x11, 0x11, 0x11, 0x12, 0x11, 0x11, 0x11,
-            // row 7 (bottom sprite edge): all border
-            0x22, 0x22, 0x22, 0x22,
-        ];
-        const TILE_BR: [u8; 32] = [
-            // rows 0..6: fill with right col border
-            0x11, 0x11, 0x11, 0x21, 0x11, 0x11, 0x11, 0x21, 0x11, 0x11, 0x11, 0x21, 0x11, 0x11,
-            0x11, 0x21, 0x11, 0x11, 0x11, 0x21, 0x11, 0x11, 0x11, 0x21, 0x11, 0x11, 0x11, 0x21,
-            // row 7: all border
-            0x22, 0x22, 0x22, 0x22,
-        ];
-        // Concatenate the 4 tiles into the 1D-32 byte order libnds expects.
-        static GFX: [u8; 128] = {
-            let mut out = [0u8; 128];
-            let mut i = 0;
-            while i < 32 {
-                out[i] = TILE_TL[i];
-                out[32 + i] = TILE_TR[i];
-                out[64 + i] = TILE_BL[i];
-                out[96 + i] = TILE_BR[i];
-                i += 1;
-            }
-            out
-        };
-        (&GFX, &PALETTE)
+    #[test]
+    fn size_code_for_recognises_square_sizes() {
+        assert!(size_code_for(8, 8).is_some());
+        assert!(size_code_for(16, 16).is_some());
+        assert!(size_code_for(32, 32).is_some());
+        assert!(size_code_for(64, 64).is_some());
+    }
+
+    #[test]
+    fn size_code_for_rejects_rectangles_and_unknowns() {
+        assert!(size_code_for(16, 8).is_none());
+        assert!(size_code_for(24, 24).is_none());
+        assert!(size_code_for(0, 0).is_none());
     }
 }

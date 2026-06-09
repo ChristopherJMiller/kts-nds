@@ -38,6 +38,15 @@ mod sounds {
     include!(concat!(env!("OUT_DIR"), "/sounds.rs"));
 }
 
+/// NitroFS paths for every baked sprite under `assets/sprites/**/*.png`,
+/// generated at build time by `png2sprite` (e.g. `sprites::SPRITE`,
+/// `sprites::ui::CURSOR`). Pass one to `Sprite::image` instead of hard-coding
+/// the `nitro:/...` path. Written to `$OUT_DIR/sprites.rs` by `build.rs`.
+mod sprites {
+    #![allow(dead_code)]
+    include!(concat!(env!("OUT_DIR"), "/sprites.rs"));
+}
+
 /// Program entry point, called by the BlocksDS crt0.
 #[unsafe(no_mangle)]
 pub extern "C" fn main() -> core::ffi::c_int {
@@ -291,7 +300,7 @@ fn setup(mut commands: Commands, nitrofs: Res<NitroFs>, mut music: ResMut<Music>
         DsScreen::Bottom,
         start_tile,
         Glyph(b'@'),
-        Sprite::at(start_tile.x * 8, start_tile.y * 8),
+        Sprite::new(sprites::SPRITE).at(start_tile.x * 8, start_tile.y * 8),
     ));
 
     // Companion marker (`O`). It doesn't move, so its `TilePos` is static.

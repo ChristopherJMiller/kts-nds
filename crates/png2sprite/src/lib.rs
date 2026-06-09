@@ -1,9 +1,10 @@
 //! Host-side PNG → `.sprite` baker, wrapping BlocksDS's `grit`.
 //!
 //! Mirrors the `obj2dl` / `wav2bank` shape: a `build.rs` calls [`build_dir`]
-//! over `assets/sprites/*.png` and the results land under `build/nitrofs/` so
-//! `just rom` can pack them into the ROM filesystem. `bevy_nds_sprite` reads
-//! the resulting `.sprite` blob at runtime.
+//! over `assets/sprites/**/*.png` (recursive) and the results land under
+//! `build/nitrofs/sprites/` so `just rom` can pack them into the ROM
+//! filesystem. `bevy_nds_sprite` reads the resulting `.sprite` blobs at runtime
+//! via the `SpriteAssets` registry.
 //!
 //! Each PNG is fed through `grit` with these flags (see grit's `--help`):
 //!
@@ -17,6 +18,11 @@
 //! grit produces `<name>.img.bin` (gfx) and `<name>.pal.bin` (palette). We
 //! repack them with a small header into a single `<name>.sprite` file so the
 //! runtime only has one path to load.
+//!
+//! Alongside the binaries, the host crate emits a Rust module of NitroFS
+//! paths (via [`emit_rust_consts`]) that the game `include!`s — analogous to
+//! the `sounds.rs` `wav2bank` emits — so game code refers to sprites by
+//! name (`sprites::CURSOR`) instead of stringly-typed paths.
 
 use std::env;
 use std::ffi::OsStr;
@@ -26,6 +32,12 @@ use std::process::Command;
 
 /// ASCII `"BSP1"` — magic prefix of a baked `.sprite` file.
 pub const ASSET_MAGIC: u32 = u32::from_le_bytes(*b"BSP1");
+
+/// Subdirectory under the NitroFS root that holds baked sprites. Both the
+/// on-disk layout (`build/nitrofs/sprites/...`) and the generated constants
+/// (`nitro:/sprites/...`) live here, so they cannot collide with `teapot.dl`,
+/// `soundbank.bin`, etc.
+pub const NITROFS_SUBDIR: &str = "sprites";
 
 /// Bake options for a single PNG.
 #[derive(Clone, Copy, Debug)]
@@ -54,6 +66,35 @@ pub struct Sprite {
     pub palette: Vec<u16>,
     /// 4bpp tile gfx in 1D-32 tile order, as grit emits it.
     pub gfx: Vec<u8>,
+}
+
+/// One PNG's bake metadata, returned by [`build_dir`] / [`predict_dir`] so
+/// the build script can both register `cargo:rerun-if-changed` deps and feed
+/// the constants emitter.
+#[derive(Clone, Debug)]
+pub struct Baked {
+    /// Absolute source path (the input PNG).
+    pub input: PathBuf,
+    /// Output `.sprite` path components below `dst`, e.g. `["ui", "cursor.sprite"]`.
+    pub rel: PathBuf,
+    /// Constants-module path, e.g. `["ui", "CURSOR"]`. The last element is the
+    /// upper-cased asset name; everything before names a nested module.
+    pub const_path: Vec<String>,
+    /// NitroFS path the constant resolves to, e.g. `"nitro:/sprites/ui/cursor.sprite"`.
+    pub nitrofs_path: String,
+}
+
+/// What [`build_dir`] returns: the set of baked sprites, for both
+/// cargo rerun tracking and constants emission.
+#[derive(Default, Debug)]
+pub struct Built {
+    pub items: Vec<Baked>,
+}
+
+impl Built {
+    pub fn inputs(&self) -> impl Iterator<Item = &Path> {
+        self.items.iter().map(|b| b.input.as_path())
+    }
 }
 
 /// Locate the `grit` binary that ships with BlocksDS. Honours `$GRIT` first,
@@ -179,14 +220,117 @@ pub fn encode(sprite: &Sprite) -> Vec<u8> {
     out
 }
 
-/// What [`build_dir`] returns: the inputs it touched, for cargo rerun tracking.
-#[derive(Default, Debug)]
-pub struct Built {
-    pub inputs: Vec<PathBuf>,
+/// Convert a PNG file stem to the constant name `wav2bank::sample_const_name`
+/// would yield: upper-cased, non-alphanumerics turned to `_`. No prefix —
+/// the enclosing module already says these are sprites.
+pub fn const_name(stem: &str) -> String {
+    let mut s = String::new();
+    for c in stem.chars() {
+        if c.is_ascii_alphanumeric() {
+            s.push(c.to_ascii_uppercase());
+        } else {
+            s.push('_');
+        }
+    }
+    s
 }
 
-/// Bake every `*.png` directly under `src` into `dst/*.sprite`. Returns the
-/// list of inputs so callers can emit `cargo:rerun-if-changed` for each.
+/// Lower-case + non-alphanumeric → `_`, used for the nested module names that
+/// mirror subdirectories under `assets/sprites/`. Rust identifiers must start
+/// with a letter; we prepend `_` if the first character is a digit.
+fn module_name(component: &str) -> String {
+    let mut s = String::new();
+    for c in component.chars() {
+        if c.is_ascii_alphanumeric() {
+            s.push(c.to_ascii_lowercase());
+        } else {
+            s.push('_');
+        }
+    }
+    if s.starts_with(|c: char| c.is_ascii_digit()) {
+        s.insert(0, '_');
+    }
+    s
+}
+
+/// Walk `src` recursively, returning a [`Baked`] descriptor for every PNG
+/// found. Does **not** invoke `grit` — used both by [`build_dir`] (to drive
+/// the bake loop) and by [`predict_dir`] (to emit the constants module when
+/// grit isn't available).
+pub fn discover(src: &Path) -> Result<Vec<Baked>, String> {
+    let mut out = Vec::new();
+    if !src.is_dir() {
+        return Ok(out);
+    }
+    discover_into(src, &mut Vec::new(), &mut out)?;
+    // Stable order so generated constants don't churn between builds.
+    out.sort_by(|a, b| a.rel.cmp(&b.rel));
+    Ok(out)
+}
+
+fn discover_into(
+    dir: &Path,
+    rel_components: &mut Vec<String>,
+    out: &mut Vec<Baked>,
+) -> Result<(), String> {
+    let entries = fs::read_dir(dir).map_err(|e| format!("read_dir {}: {e}", dir.display()))?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let ty = entry
+            .file_type()
+            .map_err(|e| format!("file_type {}: {e}", path.display()))?;
+        if ty.is_dir() {
+            let name = path
+                .file_name()
+                .and_then(OsStr::to_str)
+                .ok_or_else(|| format!("bad dir name {}", path.display()))?
+                .to_string();
+            rel_components.push(name);
+            discover_into(&path, rel_components, out)?;
+            rel_components.pop();
+            continue;
+        }
+        if path.extension().and_then(OsStr::to_str) != Some("png") {
+            continue;
+        }
+        let stem = path
+            .file_stem()
+            .and_then(OsStr::to_str)
+            .ok_or_else(|| format!("bad PNG name {}", path.display()))?
+            .to_string();
+
+        // On-disk relative output (`build/nitrofs/sprites/<rel>.sprite`).
+        let mut rel: PathBuf = rel_components.iter().collect();
+        rel.push(format!("{stem}.sprite"));
+
+        // NitroFS path the runtime opens. Always uses `/` separators.
+        let mut nitrofs = String::from("nitro:/");
+        nitrofs.push_str(NITROFS_SUBDIR);
+        nitrofs.push('/');
+        for comp in rel_components.iter() {
+            nitrofs.push_str(comp);
+            nitrofs.push('/');
+        }
+        nitrofs.push_str(&stem);
+        nitrofs.push_str(".sprite");
+
+        // Constants-module path: nested modules per subdirectory, leaf is
+        // the upper-cased stem.
+        let mut const_path: Vec<String> = rel_components.iter().map(|c| module_name(c)).collect();
+        const_path.push(const_name(&stem));
+
+        out.push(Baked {
+            input: path,
+            rel,
+            const_path,
+            nitrofs_path: nitrofs,
+        });
+    }
+    Ok(())
+}
+
+/// Bake every `*.png` under `src` (recursive) into `dst/<rel>.sprite`. Returns
+/// the [`Built`] descriptor for cargo rerun tracking and constants emission.
 pub fn build_dir(
     src: &Path,
     dst: &Path,
@@ -195,25 +339,95 @@ pub fn build_dir(
     opts: &Options,
 ) -> Result<Built, String> {
     fs::create_dir_all(dst).map_err(|e| format!("mkdir {}: {e}", dst.display()))?;
-    let mut built = Built::default();
+    let items = discover(src)?;
 
-    let entries = fs::read_dir(src).map_err(|e| format!("read_dir {}: {e}", src.display()))?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(OsStr::to_str) != Some("png") {
-            continue;
+    for baked in &items {
+        let out_path = dst.join(&baked.rel);
+        if let Some(parent) = out_path.parent() {
+            fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
         }
-        let stem = path
-            .file_stem()
-            .and_then(OsStr::to_str)
-            .ok_or_else(|| format!("bad PNG name {}", path.display()))?;
-        let sprite = bake(grit, &path, work, opts)?;
+        // Each PNG gets its own scratch subdir so grit's `<stem>.img.bin` /
+        // `<stem>.pal.bin` outputs don't collide across nested folders that
+        // happen to use the same stem (e.g. `ui/cursor.png` and `cursor.png`).
+        let mut work_sub = work.to_path_buf();
+        for comp in baked.rel.parent().into_iter().flatten() {
+            work_sub.push(comp);
+        }
+        let sprite = bake(grit, &baked.input, &work_sub, opts)?;
         let bytes = encode(&sprite);
-        let out = dst.join(format!("{stem}.sprite"));
-        fs::write(&out, &bytes).map_err(|e| format!("write {}: {e}", out.display()))?;
-        built.inputs.push(path);
+        fs::write(&out_path, &bytes).map_err(|e| format!("write {}: {e}", out_path.display()))?;
     }
-    Ok(built)
+
+    Ok(Built { items })
+}
+
+/// Like [`discover`], but exposed for the build.rs "grit missing" path so the
+/// game can still compile — `bevy_nds_sprite` will simply fail to load any
+/// sprite at runtime.
+pub fn predict_dir(src: &Path) -> Result<Vec<Baked>, String> {
+    discover(src)
+}
+
+/// Emit a Rust source string that declares one `pub const NAME: &[u8]` per
+/// baked sprite, with subdirectories rendered as nested `pub mod` blocks.
+/// Each constant is a NUL-terminated byte literal suitable for handing to
+/// `bevy_nds_nitrofs::read_file`.
+pub fn emit_rust_consts(items: &[Baked]) -> String {
+    let mut root = Node::default();
+    for item in items {
+        root.insert(&item.const_path, &item.nitrofs_path);
+    }
+    let mut s = String::new();
+    s.push_str("// @generated by png2sprite from assets/sprites/**/*.png.\n");
+    s.push_str("// Each constant is a NUL-terminated NitroFS path you can pass\n");
+    s.push_str("// to `bevy_nds_nitrofs::read_file` or stash in a `Sprite.image`.\n");
+    root.render(&mut s, 0);
+    s
+}
+
+/// In-memory tree used by [`emit_rust_consts`] to group leaf constants by
+/// their parent module path.
+#[derive(Default)]
+struct Node {
+    /// Direct leaf constants at this module (NAME → nitrofs path).
+    leaves: Vec<(String, String)>,
+    /// Nested children, keyed by module name.
+    children: std::collections::BTreeMap<String, Node>,
+}
+
+impl Node {
+    fn insert(&mut self, path: &[String], nitrofs_path: &str) {
+        match path {
+            [] => unreachable!("const_path is always non-empty"),
+            [leaf] => self.leaves.push((leaf.clone(), nitrofs_path.to_string())),
+            [head, rest @ ..] => self
+                .children
+                .entry(head.clone())
+                .or_default()
+                .insert(rest, nitrofs_path),
+        }
+    }
+
+    fn render(&self, out: &mut String, depth: usize) {
+        let pad = "    ".repeat(depth);
+        for (name, path) in &self.leaves {
+            out.push_str(&pad);
+            out.push_str("pub const ");
+            out.push_str(name);
+            out.push_str(": &[u8] = b\"");
+            out.push_str(path);
+            out.push_str("\\0\";\n");
+        }
+        for (mod_name, child) in &self.children {
+            out.push_str(&pad);
+            out.push_str("pub mod ");
+            out.push_str(mod_name);
+            out.push_str(" {\n");
+            child.render(out, depth + 1);
+            out.push_str(&pad);
+            out.push_str("}\n");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -253,5 +467,88 @@ mod tests {
         assert_eq!(&bytes[22..26], &[0xAA, 0xBB, 0xCC, 0xDD]);
         // total length
         assert_eq!(bytes.len(), 16 + 6 + 4);
+    }
+
+    #[test]
+    fn const_name_upper_cases_and_sanitises() {
+        assert_eq!(const_name("cursor"), "CURSOR");
+        assert_eq!(const_name("hit-01"), "HIT_01");
+        assert_eq!(const_name("player.run"), "PLAYER_RUN");
+    }
+
+    #[test]
+    fn module_name_is_lower_snake_safe_for_identifiers() {
+        assert_eq!(module_name("ui"), "ui");
+        assert_eq!(module_name("Ui-Bits"), "ui_bits");
+        assert_eq!(module_name("2d"), "_2d");
+    }
+
+    #[test]
+    fn emit_rust_consts_groups_by_module() {
+        let items = vec![
+            Baked {
+                input: PathBuf::from("/dev/null"),
+                rel: PathBuf::from("cursor.sprite"),
+                const_path: vec!["CURSOR".into()],
+                nitrofs_path: "nitro:/sprites/cursor.sprite".into(),
+            },
+            Baked {
+                input: PathBuf::from("/dev/null"),
+                rel: PathBuf::from("ui/cursor.sprite"),
+                const_path: vec!["ui".into(), "CURSOR".into()],
+                nitrofs_path: "nitro:/sprites/ui/cursor.sprite".into(),
+            },
+            Baked {
+                input: PathBuf::from("/dev/null"),
+                rel: PathBuf::from("ui/select.sprite"),
+                const_path: vec!["ui".into(), "SELECT".into()],
+                nitrofs_path: "nitro:/sprites/ui/select.sprite".into(),
+            },
+        ];
+        let src = emit_rust_consts(&items);
+        // Root-level constant.
+        assert!(src.contains("pub const CURSOR: &[u8] = b\"nitro:/sprites/cursor.sprite\\0\";"));
+        // Nested module with two constants.
+        assert!(src.contains("pub mod ui {"));
+        assert!(src.contains("pub const CURSOR: &[u8] = b\"nitro:/sprites/ui/cursor.sprite\\0\";"));
+        assert!(src.contains("pub const SELECT: &[u8] = b\"nitro:/sprites/ui/select.sprite\\0\";"));
+    }
+
+    #[test]
+    fn discover_walks_subdirs_in_sorted_order() {
+        let tmp = tempdir();
+        std::fs::create_dir_all(tmp.join("ui")).unwrap();
+        // 1x1 PNG bytes wouldn't be valid, but discover() doesn't read them.
+        std::fs::write(tmp.join("cursor.png"), b"").unwrap();
+        std::fs::write(tmp.join("ui/select.png"), b"").unwrap();
+        std::fs::write(tmp.join("ui/cursor.png"), b"").unwrap();
+
+        let items = discover(&tmp).unwrap();
+        let paths: Vec<_> = items.iter().map(|b| b.nitrofs_path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec![
+                "nitro:/sprites/cursor.sprite",
+                "nitro:/sprites/ui/cursor.sprite",
+                "nitro:/sprites/ui/select.sprite",
+            ]
+        );
+        assert_eq!(items[0].const_path, vec!["CURSOR".to_string()]);
+        assert_eq!(
+            items[1].const_path,
+            vec!["ui".to_string(), "CURSOR".to_string()]
+        );
+    }
+
+    /// Tiny tempdir helper so the test doesn't need an external dep.
+    fn tempdir() -> PathBuf {
+        let mut p = std::env::temp_dir();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        p.push(format!("png2sprite-test-{nonce}"));
+        std::fs::create_dir_all(&p).unwrap();
+        p
     }
 }

@@ -11,11 +11,11 @@ landing under `build/nitrofs/`, which `just rom` packs into the ROM with
 host-side libraries + CLIs — the `lib` is what `build.rs` uses; the `bin`
 is for manual one-off bakes.
 
-| Asset    | Source                  | Baker         | Output (`build/nitrofs/`) | Loaded by                   |
-| -------- | ----------------------- | ------------- | ------------------------- | --------------------------- |
-| 3D model | `assets/*.obj`          | `obj2dl`      | `<name>.dl`               | `DsMesh::load("nitro:/<name>.dl")` |
-| Sprite   | `assets/sprites/*.png`  | `png2sprite`  | `<name>.sprite`           | `bevy_nds_sprite` at startup       |
-| Audio    | `audio/{music,sfx}/*.wav` | `wav2bank` | `soundbank.bin` + `OUT_DIR/sounds.rs` | maxmod via `Music`/`PlaySfx` |
+| Asset    | Source                   | Baker         | Output (`build/nitrofs/`)                         | Loaded by                                       |
+| -------- | ------------------------ | ------------- | ------------------------------------------------- | ----------------------------------------------- |
+| 3D model | `assets/*.obj`           | `obj2dl`      | `<name>.dl`                                       | `DsMesh::load("nitro:/<name>.dl")`              |
+| Sprite   | `assets/sprites/**/*.png`| `png2sprite`  | `sprites/<rel>.sprite` + `OUT_DIR/sprites.rs`     | `bevy_nds_sprite` lazily on first `Sprite` spawn |
+| Audio    | `audio/{music,sfx}/*.wav`| `wav2bank`    | `soundbank.bin` + `OUT_DIR/sounds.rs`             | maxmod via `Music`/`PlaySfx`                    |
 
 All bakers require the BlocksDS toolchain (`grit`, `mmutil`), which is on
 `$PATH` **only inside `nix develop`**. Outside the shell, bakers print a
@@ -42,19 +42,32 @@ To bake manually (debug an `.obj` outside cargo):
 
 ### Sprite (`.png`)
 
-1. Drop the file into `assets/sprites/<name>.png`. **16-color
+1. Drop the file into `assets/sprites/<name>.png` (subdirectories are
+   allowed — `assets/sprites/ui/cursor.png` is fine). **16-color
    indexed-palette PNG** is what `grit` wants; otherwise the bake fails or
-   colors map oddly.
-2. `nix develop --command just build` — `build.rs` runs `png2sprite::build_dir`
-   and writes `build/nitrofs/<name>.sprite` (magic `BSP1` + sizes +
-   palette + gfx).
-3. Sprite is loaded at startup by `bevy_nds_sprite`. If multiple
-   `.sprite` files are present today the plugin loads `nitro:/sprite.sprite`
-   specifically — to use a different name, edit
-   `crates/bevy_nds_sprite/src/lib.rs`.
+   colors map oddly. Square sizes only: **8×8, 16×16, 32×32, 64×64** — any
+   other dimensions are silently dropped at runtime by `bevy_nds_sprite`.
+2. `nix develop --command just build` — `build.rs` walks the source tree
+   recursively, runs `png2sprite::build_dir`, and writes
+   `build/nitrofs/sprites/<rel>.sprite` (magic `BSP1` + sizes + palette +
+   gfx). It also emits `$OUT_DIR/sprites.rs`, a Rust constants module of
+   NitroFS paths the game `include!`s.
+3. Reference the constant in game code, mirroring `sounds`:
 
-Missing `grit` warning means you're not in the Nix shell. Falls back to
-the embedded magenta cursor.
+   ```rust
+   mod sprites { include!(concat!(env!("OUT_DIR"), "/sprites.rs")); }
+   commands.spawn(Sprite::new(sprites::CURSOR).at(16, 8));
+   // subdir → nested module: sprites::ui::CURSOR
+   ```
+
+   `bevy_nds_sprite` lazy-loads each distinct `image` path the first time
+   it sees a `Sprite` carrying it, claiming the next free 4bpp palette
+   bank. Cap is 16 distinct images.
+
+Missing `grit` warning means you're not in the Nix shell. `build.rs` still
+writes a predicted `sprites.rs` from the PNG filenames so the game
+compiles, but the binaries aren't in the ROM and `Sprite` entities simply
+don't render.
 
 ### Audio (`.wav`)
 
