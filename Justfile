@@ -52,7 +52,7 @@ check:
 #   `std` from source fixes it).
 test *args:
     host="$(rustc -vV | sed -n 's/^host: //p')"; \
-    cargo test -p bevy_nds_3d_obj -p obj2dl -p bevy_nds_3d_macros -p png2sprite -p perfread \
+    cargo test -p bevy_nds_3d_obj -p obj2dl -p bevy_nds_3d_macros -p png2sprite -p png2bg -p perfread \
         --target "$host" {{args}}
     cargo test \
         -p bevy_nds_diagnostics \
@@ -61,6 +61,7 @@ test *args:
         -p bevy_nds_gesture \
         -p bevy_nds_text \
         -p bevy_nds_sprite \
+        -p bevy_nds_bg \
         -p bevy_nds_3d_cull \
         -p wav2bank \
         -p bevy_nds_audio \

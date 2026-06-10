@@ -47,9 +47,11 @@ dependencies = [
  "bevy_nds",
  "bevy_nds_3d",
  "bevy_nds_audio",
+ "bevy_nds_bg",
  "bevy_nds_sprite",
  "bevy_time",
  "obj2dl",
+ "png2bg",
  "png2sprite",
  "wav2bank",
 ]
@@ -173,6 +175,7 @@ version = "0.1.0"
 dependencies = [
  "bevy_app",
  "bevy_input",
+ "bevy_nds_bg",
  "bevy_nds_cothread",
  "bevy_nds_diagnostics",
  "bevy_nds_gesture",
@@ -228,6 +231,16 @@ dependencies = [
  "bevy_app",
  "bevy_ecs",
  "bevy_nds_nitrofs",
+]
+
+[[package]]
+name = "bevy_nds_bg"
+version = "0.1.0"
+dependencies = [
+ "bevy_app",
+ "bevy_ecs",
+ "bevy_nds_nitrofs",
+ "bevy_nds_video",
 ]
 
 [[package]]
@@ -803,6 +816,10 @@ name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
+
+[[package]]
+name = "png2bg"
+version = "0.1.0"
 
 [[package]]
 name = "png2sprite"

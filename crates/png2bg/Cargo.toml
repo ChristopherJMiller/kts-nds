@@ -1,0 +1,18 @@
+[package]
+name = "png2bg"
+version = "0.1.0"
+edition = "2024"
+description = "Bake PNGs into bevy_nds_bg .bg/.bbg background assets via BlocksDS's grit (host CLI + library)."
+
+# Host-side tool. `build.rs` calls into the library to bake every PNG under
+# `assets/backgrounds/tiled/**/*.png` into a 4bpp tile background blob (`.bg`)
+# and every PNG under `assets/backgrounds/bitmap/**/*.png` into a 16bpp
+# direct-color bitmap blob (`.bbg`), under `build/nitrofs/backgrounds/`. The
+# wrapped `grit` binary ships inside BlocksDS, so this must run inside
+# `nix develop`.
+
+[lib]
+
+[[bin]]
+name = "png2bg"
+path = "src/main.rs"

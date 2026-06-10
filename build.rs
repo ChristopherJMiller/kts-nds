@@ -21,6 +21,8 @@ const ASSET_DIR: &str = "assets";
 const AUDIO_DIR: &str = "audio";
 /// Source directory of uncompiled sprite PNGs.
 const SPRITE_DIR: &str = "assets/sprites";
+/// Source directory of uncompiled background PNGs (`tiled/` and `bitmap/`).
+const BG_DIR: &str = "assets/backgrounds";
 /// Output directory for compiled NitroFS assets (gitignored; packed by `just rom`).
 const NITROFS_DIR: &str = "build/nitrofs";
 
@@ -28,6 +30,7 @@ fn main() {
     compile_assets();
     compile_audio();
     compile_sprites();
+    compile_backgrounds();
     emit_link_args();
 }
 
@@ -170,6 +173,61 @@ fn compile_sprites() {
 /// `compile_audio` writes `sounds.rs`.
 fn write_sprite_consts(out_rs: &std::path::Path, items: &[png2sprite::Baked]) {
     let rust = png2sprite::emit_rust_consts(items);
+    if let Err(e) = std::fs::write(out_rs, rust) {
+        println!("cargo:warning=could not write {}: {e}", out_rs.display());
+    }
+}
+
+/// Bake every PNG under `assets/backgrounds/{tiled,bitmap}/**/*.png` into the
+/// matching `.bg` / `.bbg` blob under `build/nitrofs/backgrounds/`. Always
+/// emits `$OUT_DIR/backgrounds.rs` (the constants module the game
+/// `include!`s) even when `grit` is missing — only the binaries are skipped
+/// so `cargo check` outside `nix develop` still compiles, with the
+/// `Backgrounds` setters silently failing to load at runtime.
+fn compile_backgrounds() {
+    let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let src = manifest.join(BG_DIR);
+    let dst = manifest.join(NITROFS_DIR).join(png2bg::NITROFS_SUBDIR);
+    let work = PathBuf::from(env::var("OUT_DIR").unwrap()).join("png2bg-work");
+    let out_rs = PathBuf::from(env::var("OUT_DIR").unwrap()).join("backgrounds.rs");
+
+    println!("cargo:rerun-if-changed={}", src.display());
+    println!("cargo:rerun-if-env-changed=BLOCKSDS");
+    println!("cargo:rerun-if-env-changed=GRIT");
+
+    if !src.is_dir() {
+        write_background_consts(&out_rs, &[]);
+        return;
+    }
+
+    let grit = png2bg::find_grit();
+    let items = match &grit {
+        Some(grit) => match png2bg::build_dir(&src, &dst, grit, &work) {
+            Ok(built) => {
+                for input in built.inputs() {
+                    println!("cargo:rerun-if-changed={}", input.display());
+                }
+                built.items
+            }
+            Err(e) => {
+                println!("cargo:warning=background baking failed: {e}");
+                png2bg::predict_dir(&src).unwrap_or_default()
+            }
+        },
+        None => {
+            println!(
+                "cargo:warning=grit not found (run inside `nix develop`); \
+                 background PNGs not baked — backgrounds will silently fail to load at runtime"
+            );
+            png2bg::predict_dir(&src).unwrap_or_default()
+        }
+    };
+    write_background_consts(&out_rs, &items);
+}
+
+/// Emit the generated `backgrounds.rs` constants module.
+fn write_background_consts(out_rs: &std::path::Path, items: &[png2bg::Baked]) {
+    let rust = png2bg::emit_rust_consts(items);
     if let Err(e) = std::fs::write(out_rs, rust) {
         println!("cargo:warning=could not write {}: {e}", out_rs.display());
     }

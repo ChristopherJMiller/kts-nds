@@ -1,0 +1,26 @@
+[package]
+name = "bevy_nds_bg"
+version = "0.1.0"
+edition = "2024"
+description = "2D background layers (tile + bitmap) for bevy_nds (no_std)."
+
+# Drives the DS 2D engine's BG layers (the layer category text consoles and
+# `bevy_nds_text` already share). BG0 stays the property of `bevy_nds_video`
+# (the text console); this crate owns BG1 for 4bpp tile backgrounds and BG3
+# for 16bpp extended-mode bitmap backgrounds, on either engine. Switches the
+# main engine's video mode to MODE_5 so the extended BG3 is available, and
+# maps VRAM_B into main BG memory at 0x06020000 so the bitmap has somewhere
+# to live without colliding with the text console (in VRAM_A).
+
+[lib]
+
+[dependencies]
+bevy_nds_video = { path = "../bevy_nds_video" }
+bevy_nds_nitrofs = { path = "../bevy_nds_nitrofs" }
+
+bevy_app = { version = "0.16", default-features = false, features = [
+  "critical-section",
+] }
+bevy_ecs = { version = "0.16", default-features = false, features = [
+  "critical-section",
+] }

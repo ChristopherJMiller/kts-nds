@@ -38,7 +38,7 @@ invocations split by dependency shape:
 1. `bevy_nds_3d_obj`, `obj2dl`, `bevy_nds_3d_macros` — pure host crates, plain
    `--target $host`.
 2. The platform subcrates (`bevy_nds_diagnostics`, `bevy_nds_time`,
-   `bevy_nds_input`, `bevy_nds_gesture`, `bevy_nds_text`), `bevy_nds_3d_cull`,
+   `bevy_nds_input`, `bevy_nds_gesture`, `bevy_nds_text`, `bevy_nds_bg`), `bevy_nds_3d_cull`,
    `bevy_nds_math`, `bevy_nds_cothread`, `wav2bank`, `bevy_nds_audio` — pull in code compiled against `core`, so they
    need `std` from source (`unstable.build-std=["std","panic_unwind","proc_macro"]`)
    and `panic = "unwind"` to avoid a duplicate-`core` lang-item clash and match
@@ -130,6 +130,21 @@ they don't need (e.g. drop `bevy_nds_text` for a sprite-only game).
   `audio/{music,sfx}/*.wav` into `soundbank.bin` plus a Rust module of
   `SFX_*` IDs the game `include!`s. Also injects a forward-loop `smpl` chunk
   into music WAVs so maxmod loops them.
+- **`crates/bevy_nds_bg`** — 2D background layers (BG). Exposes a
+  `Backgrounds` resource with `set_tile` / `set_bitmap` / `set_tile_scroll`
+  setters keyed on `(DsScreen, BgKind)`. Tile BGs land on layer BG1 (4bpp,
+  32×32 tiles = one screen-fill), bitmap BGs on extended layer BG3 (16bpp,
+  256×256 direct-color). Lazy-loads `.bg` / `.bbg` blobs from NitroFS. Tile
+  palette goes in bank 1 so the text console's bank-0 font keeps rendering.
+  **Bitmap requires video mode 5**: it only works on the engine that
+  *isn't* hosting 3D (the 3D plugin's Startup write to `REG_DISPCNT` forces
+  mode 0 on the main engine, breaking bitmap there). Pure asset parser
+  host-tested.
+- **`crates/png2bg`** — host CLI/library wrapping BlocksDS's `grit` to bake
+  `assets/backgrounds/tiled/**/*.png` into `.bg` and
+  `assets/backgrounds/bitmap/**/*.png` into `.bbg`. Emits
+  `$OUT_DIR/backgrounds.rs` (constants module of NitroFS paths,
+  `backgrounds::tiled::*` / `backgrounds::bitmap::*`).
 - **`bevy-ds`** (root, `src/main.rs`) — the game. A *pure-Bevy consumer*: only
   components and systems, **no FFI / allocator / panic handler**.
 
@@ -179,6 +194,7 @@ starting in its own crate.
 | Cooperative threads (`cothread`) | `Tasks` resource + `Task<T>` handle (`spawn` / `poll`) | `bevy_nds_cothread::CothreadPlugin`           |
 | Real-time clock          | `WallClock` resource (year/month/day + h/m/s + unix_secs) | `bevy_nds_rtc::RtcPlugin`                     |
 | Writable FAT/SD storage  | `SaveStorage` resource (blocking + async slot I/O) + `StorageStatus` | `bevy_nds_save::SavePlugin`              |
+| 2D background layers (BG) | `Backgrounds` resource (`set_tile` / `set_bitmap` / `set_tile_scroll`) | `bevy_nds_bg::BackgroundPlugin` |
 
 `DsPlugins` (in `bevy_nds`) bundles the platform-layer plugins;
 `bevy_nds::run(app)` (re-export from `bevy_nds_runtime`) installs the runner
@@ -274,6 +290,9 @@ game `include!`s, so no hard-coded indices). maxmod loads the bank from
 - **Profiles.** Both profiles use `panic = "abort"`. Dev optimises *all
   dependencies* (`[profile.dev.package."*"] opt-level = 3`) and each of our
   engine subcrates explicitly (the `bevy_nds*` family) so the debug ROM still
-  hits 60 fps on the 33 MHz ARM9; only the *game* crate is left at
-  `opt-level = 0` for fast iteration. When adding a new subcrate, append it to
-  the per-package list in the root `Cargo.toml`.
+  hits 60 fps on the 33 MHz ARM9. The *game* crate (`bevy-ds`) is at
+  `opt-level = 1` — every additional capability plugin (sprite, audio, bg, …)
+  adds another batch of monomorphized Bevy ECS code, and at `opt-level = 0`
+  the debug binary grew past the 3.5 MiB EWRAM ceiling. opt-level=1 brings it
+  back under without noticeably slowing rebuilds. When adding a new subcrate,
+  append it to the per-package list in the root `Cargo.toml`.

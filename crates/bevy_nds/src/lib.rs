@@ -48,6 +48,7 @@ use bevy_app::{PluginGroup, PluginGroupBuilder};
 
 // Re-export the platform subcrates' public surface so games can import
 // everything from `bevy_nds::*` (or, preferably, `bevy_nds::prelude::*`).
+pub use bevy_nds_bg::{BackgroundPlugin, Backgrounds};
 pub use bevy_nds_cothread::{CothreadPlugin, Task, Tasks, yield_now, yield_until_vblank};
 pub use bevy_nds_diagnostics::{DiagnosticsPlugin, Fps};
 pub use bevy_nds_gesture::{
@@ -87,9 +88,9 @@ impl PluginGroup for DsPlugins {
 /// Common imports for games built on `bevy_nds`.
 pub mod prelude {
     pub use crate::{
-        DsButton, DsPlugins, DsScreen, DsText, Fps, Fx32, FxVec2, FxVec3, Gesture, GestureEvent,
-        Gestures, Glyph, NitroFs, SaveStorage, StorageStatus, SwipeDir, Task, Tasks, TilePos,
-        WallClock, run,
+        Backgrounds, DsButton, DsPlugins, DsScreen, DsText, Fps, Fx32, FxVec2, FxVec3, Gesture,
+        GestureEvent, Gestures, Glyph, NitroFs, SaveStorage, StorageStatus, SwipeDir, Task, Tasks,
+        TilePos, WallClock, run,
     };
     pub use bevy_input::ButtonInput;
     pub use bevy_input::touch::{TouchInput, TouchPhase, Touches};

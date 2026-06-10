@@ -56,6 +56,15 @@ drop `bevy_nds_text` for a sprite-only game).
   threads as a Bevy-friendly `Tasks` resource + `Task<T>` handle. The runtime's
   vblank wait yields to spawned tasks, so blocking work (NitroFS reads, saves,
   WiFi) can run off the per-frame critical path without dropping below 60 fps.
+- **`bevy_nds_bg`** (`crates/bevy_nds_bg`) — 2D background layers (BG). A
+  `Backgrounds` resource places a 4bpp tile background on layer BG1 (one
+  screen-fill, hardware-scrollable) or a 16bpp direct-color bitmap on
+  extended BG3 (256×256). Lazy-loads `.bg` / `.bbg` blobs from NitroFS, baked
+  from PNG by `png2bg`.
+- **`png2bg`** (`crates/png2bg`) — host CLI/lib that wraps BlocksDS's
+  `grit` to bake `assets/backgrounds/tiled/**/*.png` into `.bg` (tile) and
+  `assets/backgrounds/bitmap/**/*.png` into `.bbg` (bitmap) NitroFS assets.
+  Emits `backgrounds::{tiled,bitmap}::*` constants the game `include!`s.
 - **`obj2dl`** (`crates/obj2dl`) — host CLI/lib that bakes OBJ models into `.dl`
   NitroFS assets; used by the demo's `build.rs`.
 - **`wav2bank`** (`crates/wav2bank`) — host CLI/lib that wraps `mmutil` to bake
@@ -109,6 +118,7 @@ concepts so game code doesn't deal with it directly:
 | ARM7 sound (maxmod)      | `Music` resource (looping) + `PlaySfx` events                         | `bevy_nds_audio::AudioPlugin`                    |
 | Math coprocessor (divide/sqrt) | `Fx32` + `FxVec2`/`FxVec3` (20.12 fixed-point), `hw::div_*`/`hw::sqrt_*` | `bevy_nds_math`                          |
 | Cooperative threads (`cothread`) | `Tasks` resource + `Task<T>` handle (`spawn` / `poll`)              | `bevy_nds_cothread::CothreadPlugin`              |
+| 2D background layers (BG)        | `Backgrounds` resource (`set_tile` / `set_bitmap` / `set_tile_scroll`) | `bevy_nds_bg::BackgroundPlugin`              |
 
 `DsPlugins` bundles all of it, and `bevy_nds::run(app)` installs the runner that
 owns the frame loop (`cothread_yield_irq(IRQ_VBLANK)` → `app.update()`; with no
@@ -197,8 +207,9 @@ render diffing (`bevy_nds_text`), the timer-tick→nanoseconds conversion
 mapping and touch-state diff (`bevy_nds_input`), the gesture state machine
 (`bevy_nds_gesture`), the OBJ→display-list packing (`bevy_nds_3d_obj`), the
 view-frustum culling math (`bevy_nds_3d_cull`), the WAV loop-injection and
-soundbank-ID parsing (`wav2bank`), and the audio volume/panning quantisation
-(`bevy_nds_audio`). They run on the host, not the DS:
+soundbank-ID parsing (`wav2bank`), the audio volume/panning quantisation
+(`bevy_nds_audio`), and the background-asset parser + slot state machine
+(`bevy_nds_bg`). They run on the host, not the DS:
 
 ```sh
 just test          # run all host unit tests
@@ -251,6 +262,8 @@ crates/bevy_nds_audio/          maxmod audio backend (Music resource, PlaySfx ev
   src/sfx.rs                      pure, host-testable volume/panning + load bookkeeping
 crates/wav2bank/                host CLI/lib: WAV -> soundbank.bin via mmutil (used by build.rs)
 crates/obj2dl/                  host CLI/lib: OBJ -> .dl NitroFS asset (used by build.rs)
+crates/bevy_nds_bg/             tile + bitmap BG layers (BackgroundPlugin + Backgrounds resource)
+crates/png2bg/                  host CLI/lib: PNG -> .bg/.bbg NitroFS asset via grit (used by build.rs)
 assets/                         uncompiled source models (e.g. teapot.obj)
 audio/                          uncompiled source sounds (music/*.wav, sfx/*.wav)
 build/nitrofs/                  compiled .dl + soundbank.bin, packed into the ROM (gitignored)
@@ -345,9 +358,12 @@ maxmod music with a click SFX on teapot selection (`AudioPlugin`), and the HUD.
 
 ## Limitations / next steps
 
-- The `bevy_nds_sprite` MVP exposes a single hard-coded 16x16 sprite shared
-  by all spawned `Sprite` entities. A handle-based `SpriteSheet` API (and
-  multi-sheet asset baking) is a natural follow-up.
+- `bevy_nds_sprite` lazy-loads PNG-baked sprites from NitroFS but caps at 16
+  distinct images (one per 4bpp palette bank). Frame-based animation +
+  tile-VRAM sharing would lift the cap and enable spritesheets.
+- `bevy_nds_bg` covers tile (BG1) and bitmap (BG3) backgrounds on either
+  engine for tiles, main only for bitmap. Bitmap also can't coexist with 3D
+  on the same engine (the 3D plugin forces video mode 0; bitmap needs mode 5).
 - No Wi-Fi (dswifi). Add a `bevy_nds_wifi` crate alongside `bevy_nds_audio`
   (link `-ldswifi9`, embed the matching ARM7 core).
 - Keep entity counts modest; the DS has ~4 MB of RAM.

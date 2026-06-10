@@ -28,6 +28,7 @@ use bevy_ecs::prelude::*;
 use bevy_nds::prelude::*;
 use bevy_nds_3d::prelude::*;
 use bevy_nds_audio::prelude::*;
+use bevy_nds_bg::prelude::*;
 use bevy_nds_sprite::prelude::*;
 
 /// Numeric sound IDs generated at build time by `wav2bank` from the soundbank
@@ -47,6 +48,15 @@ mod sprites {
     include!(concat!(env!("OUT_DIR"), "/sprites.rs"));
 }
 
+/// NitroFS paths for baked backgrounds under `assets/backgrounds/`. The
+/// `tiled::*` constants are passed to `Backgrounds::set_tile`; the
+/// `bitmap::*` constants to `Backgrounds::set_bitmap`. Written to
+/// `$OUT_DIR/backgrounds.rs` by `build.rs`.
+mod backgrounds {
+    #![allow(dead_code)]
+    include!(concat!(env!("OUT_DIR"), "/backgrounds.rs"));
+}
+
 /// Program entry point, called by the BlocksDS crt0.
 #[unsafe(no_mangle)]
 pub extern "C" fn main() -> core::ffi::c_int {
@@ -55,6 +65,7 @@ pub extern "C" fn main() -> core::ffi::c_int {
         .add_plugins(Ds3dPlugin)
         .add_plugins(AudioPlugin)
         .add_plugins(SpritePlugin)
+        .add_plugins(BackgroundPlugin)
         .add_plugins(GamePlugin);
     bevy_nds::run(app)
 }
@@ -250,7 +261,17 @@ struct PendingSave(Option<Task<bool>>);
 
 // --- Setup -------------------------------------------------------------------
 
-fn setup(mut commands: Commands, nitrofs: Res<NitroFs>, mut music: ResMut<Music>) {
+fn setup(
+    mut commands: Commands,
+    nitrofs: Res<NitroFs>,
+    mut music: ResMut<Music>,
+    mut bgs: ResMut<Backgrounds>,
+) {
+    // Paint a subtle blue grid behind the text console on the bottom screen
+    // (map + HUD layer). Uses palette bank 1 so the console's bank-0 font
+    // keeps rendering on top. The grid only shows through the transparent
+    // tile-console cells where there is no text.
+    bgs.set_tile(DsScreen::Bottom, backgrounds::tiled::GRID);
     // Load the teapot model: prefer NitroFS (so large models stay out of main
     // RAM and can be swapped without relinking), fall back to the copy baked
     // into the binary by `include_obj!`. Both paths produce byte-identical

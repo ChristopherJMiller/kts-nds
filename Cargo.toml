@@ -23,6 +23,8 @@ members = [
   "crates/perfread",
   "crates/bevy_nds_rtc",
   "crates/bevy_nds_save",
+  "crates/bevy_nds_bg",
+  "crates/png2bg",
 ]
 resolver = "2"
 
@@ -40,6 +42,7 @@ bevy_nds = { path = "crates/bevy_nds" }
 bevy_nds_3d = { path = "crates/bevy_nds_3d" }
 bevy_nds_audio = { path = "crates/bevy_nds_audio" }
 bevy_nds_sprite = { path = "crates/bevy_nds_sprite" }
+bevy_nds_bg = { path = "crates/bevy_nds_bg" }
 
 bevy_app = { version = "0.16", default-features = false, features = [
   "critical-section",
@@ -66,6 +69,10 @@ wav2bank = { path = "crates/wav2bank" }
 # Bakes `assets/sprites/*.png` into `build/nitrofs/*.sprite` (via BlocksDS grit)
 # so `bevy_nds_sprite` can load them at runtime from NitroFS.
 png2sprite = { path = "crates/png2sprite" }
+# Bakes `assets/backgrounds/{tiled,bitmap}/**/*.png` into
+# `build/nitrofs/backgrounds/*.{bg,bbg}` (via BlocksDS grit) so `bevy_nds_bg`
+# can load them at runtime from NitroFS.
+png2bg = { path = "crates/png2bg" }
 
 [profile.dev]
 panic = "abort"
@@ -82,11 +89,19 @@ lto = "thin"
 [profile.dev.package."*"]
 opt-level = 3
 
+# The game crate (`bevy-ds`, the root) ships with the demo's `setup` /
+# update systems. We used to leave it at opt-level = 0 for fast iteration, but
+# every additional capability plugin (sprite, audio, bg, …) adds another batch
+# of monomorphized Bevy ECS code to it, and at opt-level = 0 those grew past
+# the ARM9's 3.5 MiB EWRAM ceiling. opt-level = 1 brings the binary back under
+# without noticeably slowing rebuilds. Engine subcrates below stay at 3
+# because they sit on the per-frame hot path.
+[profile.dev.package.bevy-ds]
+opt-level = 1
+
 # Our engine subcrates are on the per-frame hot path (FFI packing, the 3D render
 # loop), so optimize them too — the 33 MHz ARM9 can't afford an unoptimized
-# render path. The game crate (`bevy-ds`, the root package) is intentionally
-# left at the default opt-level 0 so iterating on game logic stays fast to
-# compile; it holds only lightweight per-frame ECS systems.
+# render path.
 [profile.dev.package.bevy_nds]
 opt-level = 3
 
@@ -139,6 +154,9 @@ opt-level = 3
 opt-level = 3
 
 [profile.dev.package.bevy_nds_save]
+opt-level = 3
+
+[profile.dev.package.bevy_nds_bg]
 opt-level = 3
 
 [profile.release]

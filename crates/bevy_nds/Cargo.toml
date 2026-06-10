@@ -29,6 +29,7 @@ bevy_nds_math = { path = "../bevy_nds_math" }
 bevy_nds_cothread = { path = "../bevy_nds_cothread" }
 bevy_nds_rtc = { path = "../bevy_nds_rtc" }
 bevy_nds_save = { path = "../bevy_nds_save" }
+bevy_nds_bg = { path = "../bevy_nds_bg" }
 
 bevy_app = { version = "0.16", default-features = false, features = [
   "critical-section",
