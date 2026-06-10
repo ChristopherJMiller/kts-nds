@@ -68,6 +68,9 @@ something must stand alone, that's a flag worth defending out loud.
   Get the feel-critical logic under unit tests before ROM work.
 - **Playtest with fresh eyes.** The reaction of someone who wasn't in the daily
   build matters more than our intention.
+- **Every feel-spike ends in a verdict — PROCEED / PIVOT / KILL** — naming which
+  open question it resolved and the next action. "Felt okay" is not a verdict.
+  Capture it with `playtest-log` and record the consequence with `design-sync`.
 
 ## The issues are the design record
 

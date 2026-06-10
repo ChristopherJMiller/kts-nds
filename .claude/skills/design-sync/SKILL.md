@@ -49,6 +49,24 @@ each pointing at its home issue) and the milestone/epic **tracking index**.
 5. **Report** the findings first; apply fixes with `gh issue edit` only after the
    user confirms.
 
+## Mode C — `--propagate <issue#>` (holistic consistency)
+
+When a `## Locked` decision in an issue *changes* (not just gets added),
+downstream work built against the old assumption may be stale. Find and flag it.
+
+1. `gh issue view <n>` and read the changed Locked decision; if useful, diff
+   against the prior version of any committed doc that mirrors it.
+2. Find dependents: scan all issues for `Depends on #<n>`, `Ref … #<n>`, and any
+   `OQ-n` in #17 whose home or text references the changed decision. (`gh issue
+   list` + `gh issue view`, or `gh search`.)
+3. For each dependent, judge whether the change invalidates an assumption it
+   made. Produce a **change-impact report**: dependent issue → what it assumed →
+   whether it's now stale → suggested action.
+4. **Report first.** Apply edits (move items back to Open, add a "revisit"
+   note) only after the user confirms. Don't silently rewrite dependents.
+
+This is the holistic guard: a small mechanic rarely changes alone.
+
 ## Notes
 
 - Prefer `--body-file <tmp>` for body rewrites (avoids shell-escaping markdown).
