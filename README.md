@@ -1,9 +1,7 @@
 # Kill the Serpent
 
-A 3D cyber-dystopian capture game for the **Nintendo DS** — a reimagining of
-Pokémon Ranger's loop-draw capture, a mechanic that originated on this hardware.
-You play a rebel hacking the agents of a runaway AI superintelligence (the
-*Serpent*) back from its control, one node at a time.
+A 3D capture game for the **Nintendo DS** — a reimagining of
+Pokémon Ranger's loop-draw capture.
 
 The game (`kts`, the root crate) is built on **`bevy_nds`**, a companion library
 — developed in this same repo — that runs [Bevy](https://bevyengine.org/)'s
