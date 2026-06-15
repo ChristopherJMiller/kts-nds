@@ -63,6 +63,7 @@ test *args:
         -p bevy_nds_sprite \
         -p bevy_nds_bg \
         -p bevy_nds_3d_cull \
+        -p bevy_nds_loop \
         -p wav2bank \
         -p bevy_nds_audio \
         -p bevy_nds_math \

@@ -1,30 +1,23 @@
-//! **Spike A — stylus virtual-analog locomotion** (Milestone 1, issue #18).
+//! **Spike B — loop-draw capture + enclosure detection** (Milestone 1, issue #19).
 //!
-//! A throwaway feel-spike, not production code. It exists to answer the single
-//! highest-risk unknown in the design (OQ-1): *does a relative stylus
-//! virtual-stick feel like an analog stick, not mud* — in both open and tight
-//! spaces? Everything else in the control model is built on the assumption that
-//! it does, so we prove it before any systems work.
+//! A throwaway feel-spike, not production code. It proves the core capture verb
+//! in isolation (no 3D, no dodging): **does loop-drawing read clearly and feel
+//! satisfying** at 60 Hz touch sampling? You drag the stylus into a loop around
+//! the enemy "blips" on the bottom screen; whatever the loop encloses takes a
+//! capture hit, and two hits captures it.
 //!
-//! Layout (locked in #17): the **top** LCD shows the 3D world (a flat arena with
-//! a hero teapot threading a grid of low-poly pillars), the **bottom** LCD is
-//! the touch surface — a *relative* virtual stick: pen-down sets an origin, the
-//! drag offset becomes a continuous heading + magnitude. Because the avatar and
-//! the touch panel live on different screens there is no shared coordinate
-//! space, so the stick must be relative (no absolute point-to-move).
+//! The feel-critical geometry — path smoothing, self-intersection loop closure,
+//! point-in-polygon enclosure — is the pure, host-tested [`bevy_nds_loop`] crate
+//! (the keeper that grows into epic #22). This file is the ROM-side harness: it
+//! captures the touch path, feeds the crate, and visualizes the stroke (a trail
+//! of dot sprites) and the blips (sprites that change as they're captured).
 //!
-//! The feel-critical conditioning (radial deadzone, magnitude ramp, low-pass
-//! smoothing) is the pure, host-tested [`bevy_nds_math::stick`] module; this
-//! file is the ROM-side arena that wires it to hardware and exposes every knob
-//! to live tuning so the feel pass can dial it in. The camera is a position-only
-//! soft-follow (the DS 3D view matrix is translation-only — it can pan but not
-//! rotate), matching the "authored camera, no player camera control" decision.
+//! Layout: the bottom LCD is the touch/draw surface — sprites (blips + the
+//! drawn trail) on the sub engine, over a black canvas. The top LCD is a text
+//! HUD. No 3D core this time, so there's no engine-swap dance.
 //!
-//! Controls (right-handed defaults; handedness mirroring is a later epic):
-//! - **Pen on bottom screen** — move (drag from the touch-down origin).
-//! - **L / R** — deadzone − / +      **Left / Right** — max-radius − / +
-//! - **Up / Down** — max-speed + / −  **Y / B** — smoothing + / −
-//! - **X** — recentre the hero        **Start** — reset all tunables
+//! Controls: **drag** on the bottom screen to draw a loop. **START** resets the
+//! blips for another pass.
 
 #![no_std]
 #![no_main]
@@ -37,432 +30,317 @@ use core::fmt::Write;
 use bevy_app::prelude::*;
 use bevy_ecs::prelude::*;
 use bevy_nds::prelude::*;
-use bevy_nds_3d::prelude::*;
-use bevy_nds_math::stick::{StickConfig, smooth, stick_vector};
+use bevy_nds_loop::{densify, enclosed, find_closed_loop_within, smooth};
 use bevy_nds_math::{Fx32, FxVec2};
+use bevy_nds_sprite::prelude::*;
 
-// --- Tunable feel constants (starting points for the feel pass) --------------
+/// NitroFS paths for baked sprites (`sprites::BLIP`, `sprites::BLIP_HIT`,
+/// `sprites::DOT`), generated at build time by `png2sprite`.
+mod sprites {
+    #![allow(dead_code)]
+    include!(concat!(env!("OUT_DIR"), "/sprites.rs"));
+}
 
-/// Half-extent of the square play-field, in world units. The hero is clamped
-/// here; the pillar grid sits inside it, leaving an open margin ring outside.
-const ARENA_HALF: f32 = 2.0;
+// --- Tunables ----------------------------------------------------------------
 
-/// Landmark/obstacle pillars, in world XY. Kept deliberately few: each drawn
-/// mesh costs ~2 ms of per-frame CPU matrix compose on the 33 MHz ARM9
-/// (see #34), so the scene is object-count-bound, not polygon-bound, at 60 fps.
-/// The top pair forms a narrow **gate** to thread (the "tight space" feel test);
-/// the lower pair are spread landmarks giving motion parallax across the **open**
-/// field. The hero starts at the origin and can roam the open margin to
-/// ±`ARENA_HALF`.
-const PILLAR_CELLS: [(f32, f32); 4] = [
-    (-0.25, 0.7),
-    (0.25, 0.7),
-    (-1.2, -0.85),
-    (1.2, -0.95),
+/// Minimum stylus travel (px) between captured path points — resamples the raw
+/// ~60 Hz stream down to an even, jitter-tolerant polyline. Kept below the 8 px
+/// dot size so the trail reads as a continuous line, not a dotted one.
+const MIN_SPACING: f32 = 4.0;
+/// Max control points retained in the live stroke (oldest dropped). Bounds the
+/// per-frame closure scan; a 4 px-spaced stroke of this many covers ~400 px.
+const MAX_POINTS: usize = 100;
+/// Sprites in the trail pool (≤ 128 OAM minus the blips). The trail is
+/// `densify`-resampled to this many points, so it reads as a continuous line.
+const DOT_POOL: usize = 110;
+/// Spacing (px) between rendered trail dots after densify (≤ 8 px dot size so
+/// they overlap into a line).
+const TRAIL_STEP: f32 = 4.0;
+/// Default loop-closure proximity tolerance (px). 0 = exact self-crossing only;
+/// higher = laxer (the stroke closes when it returns *near* its trail). Live-
+/// tunable with L/R. Feel pass (2026-06-14) landed on 2: exact crossing plus a
+/// small near-miss grace.
+const DEFAULT_CLOSE_TOL: f32 = 2.0;
+/// Enclosures needed to fully capture a blip (so progress visibly accrues).
+const CAPTURE_HITS: u8 = 2;
+
+/// Enemy blip centres on the bottom screen (256×192 px). Clustered so several
+/// can be caught in one loop, plus loners for single captures.
+const BLIPS: [(i16, i16); 6] = [
+    (104, 64),
+    (128, 56),
+    (118, 86),
+    (196, 120),
+    (60, 132),
+    (200, 58),
 ];
 
-/// Camera height above the z=0 play-plane (it looks straight down −Z).
-const CAM_Z: f32 = 3.6;
-/// Per-frame camera follow lerp (0 = locked, 1 = instant snap).
-const CAM_FOLLOW: f32 = 0.15;
+// --- Resources / components --------------------------------------------------
 
-/// Hero collision radius (world units).
-const PLAYER_RADIUS: f32 = 0.12;
-/// Pillar collision radius (world units).
-const PILLAR_RADIUS: f32 = 0.13;
-
-/// How far ahead of the hero the heading-nose marker sits.
-const NOSE_DIST: f32 = 0.26;
-/// Below this smoothed speed the hero is "stopped" and the nose hides.
-const MOVING_EPS: f32 = 0.03;
-
-/// Common forward tilt applied to every object so the straight-down camera
-/// reads as an angled 3/4 view (the view matrix can't tilt, so the meshes do).
-const TILT_X: f32 = -1.0;
-const PLAYER_SCALE: f32 = 0.11;
-const PILLAR_SCALE: f32 = 0.18;
-const NOSE_SCALE: f32 = 0.06;
-
-// --- Resources ----------------------------------------------------------------
-
-/// Live feel knobs, all adjustable on-device so the feel pass can tune without
-/// a rebuild. `deadzone` / `max_radius` are in touch pixels; `max_speed` is in
-/// world units/second; `smoothing` is the low-pass factor in `[0, 1)`.
-#[derive(Resource, Clone, Copy)]
-struct StickTuning {
-    deadzone: Fx32,
-    max_radius: Fx32,
-    max_speed: Fx32,
-    smoothing: Fx32,
-}
-
-impl Default for StickTuning {
-    fn default() -> Self {
-        // Values from the Spike A feel pass (2026-06-14): a slightly raised
-        // deadzone, generous max-radius and moderate smoothing read as a
-        // responsive analog stick (OQ-1).
-        Self {
-            deadzone: Fx32::from_f32(8.0),
-            max_radius: Fx32::from_f32(70.0),
-            max_speed: Fx32::from_f32(1.6),
-            smoothing: Fx32::from_f32(0.5),
-        }
-    }
-}
-
-impl StickTuning {
-    fn config(&self) -> StickConfig {
-        StickConfig {
-            deadzone: self.deadzone,
-            max_radius: self.max_radius,
-            smoothing: self.smoothing,
-        }
-    }
-}
-
-/// Mutable per-frame stick state: where the current drag started, the smoothed
-/// movement vector (unit direction × magnitude in `[0, 1]`), and whether the
-/// pen is currently down (so a fresh touch re-seats the origin).
+/// The in-progress stroke: resampled touch points (pixels) + whether the pen is
+/// currently down (so pen-up can finalize/clear it).
 #[derive(Resource, Default)]
-struct StickState {
-    origin: FxVec2,
-    vel: FxVec2,
+struct Stroke {
+    points: Vec<FxVec2>,
     active: bool,
 }
 
-/// Static pillar centres (world XY), built once at setup and read by the
-/// collision pass.
+/// Tally + last-loop feedback for the HUD.
 #[derive(Resource, Default)]
-struct Pillars(Vec<FxVec2>);
+struct Score {
+    captured: u32,
+    last_enclosed: usize,
+}
 
-// --- Components ---------------------------------------------------------------
+/// Live loop-closure proximity tolerance (px), tuned with L/R during the feel
+/// pass. See [`DEFAULT_CLOSE_TOL`].
+#[derive(Resource)]
+struct CloseTol(Fx32);
 
-/// The pen-driven hero.
-#[derive(Component)]
-struct Player;
+impl Default for CloseTol {
+    fn default() -> Self {
+        Self(Fx32::from_f32(DEFAULT_CLOSE_TOL))
+    }
+}
 
-/// A small marker that floats ahead of the hero in its heading direction —
-/// visual proof that the stick yields a *continuous* heading, not 8-way snaps.
+/// An enemy blip and its capture progress.
 #[derive(Component)]
-struct Nose;
+struct Blip {
+    hits: u8,
+    captured: bool,
+}
 
-/// The hero's authoritative world position, in fixed-point. Movement and
-/// collision run here (hardware sqrt/divide on the hot path); `sync_player`
-/// copies it into the float [`Transform3d`] the renderer wants.
-#[derive(Component, Clone, Copy)]
-struct WorldPos(FxVec2);
+/// A blip's centre in screen pixels (fixed-point, for the enclosure test).
+#[derive(Component)]
+struct BlipPos(FxVec2);
 
-/// HUD line: live stick readout (heading magnitude + components).
+/// One sprite in the path-trail pool.
 #[derive(Component)]
-struct StickHud;
-/// HUD line: the current tunable values.
+struct PathDot;
+
+/// The top-screen HUD line.
 #[derive(Component)]
-struct TuneHud;
-/// HUD line: fps + hero position.
-#[derive(Component)]
-struct StatHud;
+struct InfoHud;
 
 /// Program entry point, called by the BlocksDS crt0.
 #[unsafe(no_mangle)]
 pub extern "C" fn main() -> core::ffi::c_int {
     let mut app = App::new();
     app.add_plugins(DsPlugins)
-        .add_plugins(Ds3dPlugin)
+        .add_plugins(SpritePlugin)
         .add_plugins(SpikePlugin);
     bevy_nds::run(app)
 }
 
-/// The whole spike, as one Bevy plugin.
 struct SpikePlugin;
 
 impl Plugin for SpikePlugin {
     fn build(&self, app: &mut App) {
-        // 3D on the top LCD; the sub-engine text console + touch land on the
-        // bottom LCD (the two engines swap together — see bevy_nds_3d::Display3d).
-        app.insert_resource(Display3d {
-            screen: DsScreen::Top,
-        })
-        .init_resource::<StickTuning>()
-        .init_resource::<StickState>()
-        .init_resource::<Pillars>()
-        .add_systems(Startup, setup)
-        .add_systems(
-            Update,
-            // Chained so the camera + transforms read the freshly-moved hero,
-            // and the HUD reflects this frame's state. The DS is single-core, so
-            // sequential ordering costs nothing here.
-            (
-                adjust_tuning,
-                drive_player,
-                sync_player,
-                sync_nose,
-                follow_camera,
-                update_hud,
-            )
-                .chain(),
-        );
+        app.init_resource::<Stroke>()
+            .init_resource::<Score>()
+            .init_resource::<CloseTol>()
+            .add_systems(Startup, setup)
+            .add_systems(
+                Update,
+                (
+                    reset_blips,
+                    adjust_closure,
+                    capture_input,
+                    update_dots,
+                    update_blip_sprites,
+                    update_hud,
+                )
+                    .chain(),
+            );
     }
 }
 
 // --- Setup -------------------------------------------------------------------
 
-fn setup(mut commands: Commands, mut camera: ResMut<Camera3d>, mut pillars: ResMut<Pillars>) {
-    // Low-poly cube (12 tris) for the pillars — cheap enough to instance a whole
-    // grid under the DS ~2048-poly/frame budget, unlike the 552-face teapot.
-    let cube = include_obj!("assets/cube.obj", center);
-    // The hero is the teapot, so it reads as a distinct "character".
-    let teapot = include_obj!("assets/teapot.obj", center);
-
-    // Hero — starts at the open centre cell.
-    commands.spawn((
-        Player,
-        WorldPos(FxVec2::ZERO),
-        teapot,
-        DsMaterial {
-            diffuse: [110, 180, 235],
-            ambient: [26, 40, 58],
-        },
-        Transform3d {
-            translation: Vec3::ZERO,
-            rotation: Vec3::new(-1.3, 0.5, 0.0),
-            scale: Vec3::splat(PLAYER_SCALE),
-        },
-    ));
-
-    // Heading nose — bright, hidden (scale 0) until the hero moves.
-    commands.spawn((
-        Nose,
-        cube.clone(),
-        DsMaterial {
-            diffuse: [245, 220, 70],
-            ambient: [60, 52, 16],
-        },
-        Transform3d {
-            translation: Vec3::ZERO,
-            rotation: Vec3::new(TILT_X, 0.0, 0.0),
-            scale: Vec3::ZERO,
-        },
-    ));
-
-    // Pillars: a few hand-placed landmarks/obstacles (see PILLAR_CELLS).
-    let mut centres = Vec::new();
-    for (i, &(x, y)) in PILLAR_CELLS.iter().enumerate() {
-        centres.push(FxVec2::from_f32(x, y));
+fn setup(mut commands: Commands) {
+    // Enemy blips (sub-engine sprites, centred on their BLIPS coordinate).
+    for &(cx, cy) in &BLIPS {
         commands.spawn((
-            cube.clone(),
-            DsMaterial {
-                diffuse: [120, 120, 138],
-                ambient: [34, 34, 44],
+            Blip {
+                hits: 0,
+                captured: false,
             },
-            Transform3d {
-                translation: Vec3::new(x, y, 0.0),
-                // A little yaw variety so the boxes don't look stamped.
-                rotation: Vec3::new(TILT_X, 0.4 * i as f32, 0.0),
-                scale: Vec3::splat(PILLAR_SCALE),
-            },
+            BlipPos(FxVec2::from_f32(cx as f32, cy as f32)),
+            Sprite::new(sprites::BLIP).at(cx - 8, cy - 8),
         ));
     }
-    pillars.0 = centres;
 
-    // Camera starts centred over the hero.
-    camera.position = Vec3::new(0.0, 0.0, CAM_Z);
+    // Path-trail pool — parked off-screen until the stroke uses them.
+    for _ in 0..DOT_POOL {
+        commands.spawn((PathDot, Sprite::new(sprites::DOT).at(0, 200)));
+    }
 
-    // Bottom-screen text HUD (sub engine). Top is the 3D view.
-    let s = DsScreen::Bottom;
-    commands.spawn((s, TilePos::new(1, 0), DsText::new("Spike A: stylus virtual-stick")));
-    commands.spawn((s, TilePos::new(1, 1), DsText::new("drag below to move the hero")));
-    commands.spawn((s, TilePos::new(1, 3), StickHud, DsText::new("")));
-    commands.spawn((s, TilePos::new(1, 4), TuneHud, DsText::new("")));
-    commands.spawn((s, TilePos::new(1, 5), StatHud, DsText::new("")));
-    commands.spawn((s, TilePos::new(1, 18), DsText::new("L/R deadzone  <>/ max radius")));
-    commands.spawn((s, TilePos::new(1, 19), DsText::new("Up/Dn speed   Y/B smoothing")));
-    commands.spawn((s, TilePos::new(1, 20), DsText::new("X recentre    START reset knobs")));
+    // Top-screen HUD.
+    let t = DsScreen::Top;
+    commands.spawn((t, TilePos::new(2, 1), DsText::new("Spike B: loop-draw capture")));
+    commands.spawn((t, TilePos::new(2, 3), DsText::new("Draw a loop around the red")));
+    commands.spawn((t, TilePos::new(2, 4), DsText::new("nodes on the bottom screen.")));
+    commands.spawn((t, TilePos::new(2, 5), DsText::new("2 loops captures a node.")));
+    commands.spawn((t, TilePos::new(2, 8), InfoHud, DsText::new("")));
+    commands.spawn((t, TilePos::new(2, 21), DsText::new("L/R: closure laxness")));
+    commands.spawn((t, TilePos::new(2, 22), DsText::new("START: reset nodes")));
 }
 
-// --- Movement ----------------------------------------------------------------
+// --- Capture loop ------------------------------------------------------------
 
-/// Read the relative virtual stick, smooth it, and integrate the hero's
-/// fixed-point world position with arena-bound clamping and circular pillar
-/// push-out. This is the heart of the spike.
-fn drive_player(
-    time: Res<Time>,
+/// Capture the stylus path, close the loop (self-crossing or a lax near-miss),
+/// test which blips it encloses, and accrue capture hits. The heart of the spike.
+fn capture_input(
     touches: Res<Touches>,
-    tuning: Res<StickTuning>,
-    pillars: Res<Pillars>,
-    mut state: ResMut<StickState>,
-    mut query: Query<&mut WorldPos, With<Player>>,
+    tol: Res<CloseTol>,
+    mut stroke: ResMut<Stroke>,
+    mut score: ResMut<Score>,
+    mut blips: Query<(&BlipPos, &mut Blip)>,
 ) {
-    let cfg = tuning.config();
+    let min_spacing = Fx32::from_f32(MIN_SPACING);
 
-    // Target movement vector from the pen, in world axes (screen-y points down,
-    // world-y points up, so flip y). Releasing the pen targets zero, and the
-    // low-pass below makes the hero glide to a stop rather than snap.
-    let target = if let Some(touch) = touches.iter().next() {
-        let p = touch.position();
-        let cur = FxVec2::from_f32(p.x, p.y);
-        if !state.active {
-            state.origin = cur;
-            state.active = true;
-        }
-        let raw = cur - state.origin;
-        let offset = FxVec2::new(raw.x, -raw.y);
-        stick_vector(offset, &cfg)
-    } else {
-        state.active = false;
-        FxVec2::ZERO
-    };
-
-    state.vel = smooth(state.vel, target, cfg.smoothing);
-
-    // Integrate: delta = dir·magnitude × speed × dt.
-    let dt = Fx32::from_f32(time.delta_secs());
-    let delta = state.vel * (tuning.max_speed * dt);
-
-    let bound = Fx32::from_f32(ARENA_HALF);
-    let min_dist = Fx32::from_f32(PLAYER_RADIUS + PILLAR_RADIUS);
-    for mut pos in &mut query {
-        let mut np = pos.0 + delta;
-        np.x = np.x.clamp(-bound, bound);
-        np.y = np.y.clamp(-bound, bound);
-
-        // Push out of any pillar we've entered (sequential resolution is fine
-        // for this sparse, non-overlapping grid).
-        for &c in &pillars.0 {
-            let sep = np - c;
-            let d = sep.length();
-            if d > Fx32::ZERO && d < min_dist {
-                np = c + sep.normalize_or_zero() * min_dist;
-            }
-        }
-        pos.0 = np;
-    }
-}
-
-/// Copy the hero's fixed-point world position into its float transform.
-fn sync_player(mut query: Query<(&WorldPos, &mut Transform3d), With<Player>>) {
-    for (pos, mut transform) in &mut query {
-        transform.translation.x = pos.0.x.to_f32();
-        transform.translation.y = pos.0.y.to_f32();
-    }
-}
-
-/// Float the heading nose ahead of the hero in its travel direction, or hide it
-/// (scale 0) when stopped.
-fn sync_nose(
-    state: Res<StickState>,
-    player: Query<&WorldPos, With<Player>>,
-    mut nose: Query<&mut Transform3d, With<Nose>>,
-) {
-    let Some(pos) = player.iter().next() else {
+    let Some(touch) = touches.iter().next() else {
+        // Pen up: drop the stroke.
+        stroke.active = false;
+        stroke.points.clear();
         return;
     };
-    let speed = state.vel.length();
-    let moving = speed > Fx32::from_f32(MOVING_EPS);
-    let dir = state.vel.normalize_or_zero();
-    let nose_dist = Fx32::from_f32(NOSE_DIST);
-    for mut transform in &mut nose {
-        if moving {
-            let p = pos.0 + dir * nose_dist;
-            transform.translation = Vec3::new(p.x.to_f32(), p.y.to_f32(), 0.0);
-            transform.scale = Vec3::splat(NOSE_SCALE);
-        } else {
-            transform.scale = Vec3::ZERO;
+
+    let p = touch.position();
+    let cur = FxVec2::from_f32(p.x, p.y);
+    stroke.active = true;
+
+    // Resample: only keep a point once the pen has moved far enough.
+    let push = stroke
+        .points
+        .last()
+        .is_none_or(|&last| (cur - last).length() >= min_spacing);
+    if push {
+        stroke.points.push(cur);
+        if stroke.points.len() > MAX_POINTS {
+            stroke.points.remove(0);
         }
     }
-}
 
-/// Position-only soft follow: the camera pans toward the hero but never rotates
-/// (the DS view matrix is translation-only).
-fn follow_camera(mut camera: ResMut<Camera3d>, player: Query<&WorldPos, With<Player>>) {
-    let Some(pos) = player.iter().next() else {
+    if stroke.points.len() < 4 {
+        return;
+    }
+
+    // Smooth, then look for a closure (exact self-crossing, or a near-miss
+    // within the live tolerance).
+    let path = smooth(&stroke.points);
+    let Some(poly) = find_closed_loop_within(&path, tol.0) else {
         return;
     };
-    let tx = pos.0.x.to_f32();
-    let ty = pos.0.y.to_f32();
-    camera.position.x += (tx - camera.position.x) * CAM_FOLLOW;
-    camera.position.y += (ty - camera.position.y) * CAM_FOLLOW;
-    camera.position.z = CAM_Z;
+
+    // Which un-captured blips are inside? Accrue a hit on each.
+    let mut live: Vec<(FxVec2, Mut<Blip>)> = blips
+        .iter_mut()
+        .filter(|(_, b)| !b.captured)
+        .map(|(pos, b)| (pos.0, b))
+        .collect();
+    let centres: Vec<FxVec2> = live.iter().map(|(c, _)| *c).collect();
+    let inside = enclosed(&poly, &centres);
+
+    score.last_enclosed = inside.len();
+    for i in inside {
+        let blip = &mut live[i].1;
+        blip.hits += 1;
+        if blip.hits >= CAPTURE_HITS {
+            blip.captured = true;
+            score.captured += 1;
+        }
+    }
+
+    // Consume the loop so the next one starts fresh.
+    stroke.points.clear();
 }
 
-// --- Tuning ------------------------------------------------------------------
+/// START re-arms every blip for another pass.
+fn reset_blips(
+    input: Res<ButtonInput<DsButton>>,
+    mut score: ResMut<Score>,
+    mut blips: Query<&mut Blip>,
+) {
+    if !input.just_pressed(DsButton::Start) {
+        return;
+    }
+    for mut blip in &mut blips {
+        blip.hits = 0;
+        blip.captured = false;
+    }
+    *score = Score::default();
+}
 
-/// Adjust the feel knobs live from the button cluster, so the feel pass can dial
-/// the stick in on real hardware without a rebuild.
-fn adjust_tuning(input: Res<ButtonInput<DsButton>>, mut tuning: ResMut<StickTuning>) {
-    let px = Fx32::from_int(1);
-    let two_px = Fx32::from_int(2);
-    let small = Fx32::from_f32(0.1);
-    let fine = Fx32::from_f32(0.05);
-
+/// Live-tune the loop-closure laxness with L/R (0 = exact self-crossing only).
+fn adjust_closure(input: Res<ButtonInput<DsButton>>, mut tol: ResMut<CloseTol>) {
+    let step = Fx32::from_int(2);
     if input.just_pressed(DsButton::L) {
-        tuning.deadzone = (tuning.deadzone - px).max(Fx32::ZERO);
+        tol.0 = (tol.0 - step).max(Fx32::ZERO);
     }
     if input.just_pressed(DsButton::R) {
-        tuning.deadzone = (tuning.deadzone + px).min(Fx32::from_int(30));
-    }
-    if input.just_pressed(DsButton::Left) {
-        let floor = tuning.deadzone + px;
-        tuning.max_radius = (tuning.max_radius - two_px).max(floor);
-    }
-    if input.just_pressed(DsButton::Right) {
-        tuning.max_radius = (tuning.max_radius + two_px).min(Fx32::from_int(100));
-    }
-    if input.just_pressed(DsButton::Up) {
-        tuning.max_speed = (tuning.max_speed + small).min(Fx32::from_f32(5.0));
-    }
-    if input.just_pressed(DsButton::Down) {
-        tuning.max_speed = (tuning.max_speed - small).max(Fx32::from_f32(0.2));
-    }
-    if input.just_pressed(DsButton::Y) {
-        tuning.smoothing = (tuning.smoothing + fine).min(Fx32::from_f32(0.95));
-    }
-    if input.just_pressed(DsButton::B) {
-        tuning.smoothing = (tuning.smoothing - fine).max(Fx32::ZERO);
-    }
-    if input.just_pressed(DsButton::Start) {
-        *tuning = StickTuning::default();
+        tol.0 = (tol.0 + step).min(Fx32::from_int(32));
     }
 }
 
-// --- HUD ---------------------------------------------------------------------
+// --- Rendering ---------------------------------------------------------------
+
+/// Render the stroke as a continuous line: smooth it, then `densify` to evenly
+/// spaced points (filling fast-drag gaps) and lay the pooled dot sprites along
+/// them; park the rest off-screen. The dots are identical, so iteration order
+/// doesn't matter — only the set of positions does.
+fn update_dots(stroke: Res<Stroke>, mut dots: Query<&mut Sprite, With<PathDot>>) {
+    let line = densify(
+        &smooth(&stroke.points),
+        Fx32::from_f32(TRAIL_STEP),
+        DOT_POOL,
+    );
+    for (i, mut sprite) in dots.iter_mut().enumerate() {
+        if let Some(p) = line.get(i) {
+            sprite.x = p.x.to_f32() as i16 - 4; // 8×8 dot, centre on the point
+            sprite.y = p.y.to_f32() as i16 - 4;
+        } else {
+            sprite.x = 0;
+            sprite.y = 200; // off the 192-px screen
+        }
+    }
+}
+
+/// Reflect each blip's capture state in its sprite: red → yellow at one hit,
+/// parked off-screen once captured.
+fn update_blip_sprites(mut blips: Query<(&Blip, &BlipPos, &mut Sprite), Without<PathDot>>) {
+    for (blip, pos, mut sprite) in &mut blips {
+        if blip.captured {
+            sprite.x = 248;
+            sprite.y = 200;
+            continue;
+        }
+        sprite.image = if blip.hits >= 1 {
+            sprites::BLIP_HIT
+        } else {
+            sprites::BLIP
+        };
+        sprite.x = pos.0.x.to_f32() as i16 - 8; // 16×16 blip
+        sprite.y = pos.0.y.to_f32() as i16 - 8;
+    }
+}
 
 fn update_hud(
-    fps: Res<Fps>,
-    state: Res<StickState>,
-    tuning: Res<StickTuning>,
-    player: Query<&WorldPos, With<Player>>,
-    mut stick_hud: Query<&mut DsText, (With<StickHud>, Without<TuneHud>, Without<StatHud>)>,
-    mut tune_hud: Query<&mut DsText, (With<TuneHud>, Without<StatHud>)>,
-    mut stat_hud: Query<&mut DsText, With<StatHud>>,
+    stroke: Res<Stroke>,
+    score: Res<Score>,
+    tol: Res<CloseTol>,
+    mut hud: Query<&mut DsText, With<InfoHud>>,
 ) {
-    let mag = state.vel.length().to_f32();
-    for mut text in &mut stick_hud {
+    for mut text in &mut hud {
         text.0.clear();
         let _ = write!(
             text.0,
-            "mag={:.2} dir {:+.2},{:+.2}",
-            mag,
-            state.vel.x.to_f32(),
-            state.vel.y.to_f32(),
+            "cap {}/{} loop:{} pts:{} lax:{:.0}",
+            score.captured,
+            BLIPS.len(),
+            score.last_enclosed,
+            stroke.points.len(),
+            tol.0.to_f32(),
         );
-    }
-    for mut text in &mut tune_hud {
-        text.0.clear();
-        let _ = write!(
-            text.0,
-            "dz{:.0} mR{:.0} spd{:.1} sm{:.2}",
-            tuning.deadzone.to_f32(),
-            tuning.max_radius.to_f32(),
-            tuning.max_speed.to_f32(),
-            tuning.smoothing.to_f32(),
-        );
-    }
-    let (px, py) = match player.iter().next() {
-        Some(p) => (p.0.x.to_f32(), p.0.y.to_f32()),
-        None => (0.0, 0.0),
-    };
-    for mut text in &mut stat_hud {
-        text.0.clear();
-        let _ = write!(text.0, "fps={:>2.0} pos {:+.2},{:+.2}", fps.0, px, py);
     }
 }
