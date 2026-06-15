@@ -16,9 +16,10 @@ use core::ptr::write_volatile;
 pub const VRAM_I_CR: *mut u8 = 0x0400_0249 as *mut u8;
 /// `VRAM_ENABLE = BIT(7)`.
 pub const VRAM_ENABLE: u8 = 1 << 7;
-/// Map VRAM bank I (16 KiB) to the sub engine's sprite VRAM
-/// (`VRAM_I_SUB_SPRITE = 3`). See the libnds `VRAM_I_CR_*` constants.
-pub const VRAM_I_SUB_SPRITE: u8 = 3;
+/// Map VRAM bank I (16 KiB) to the sub engine's sprite VRAM (sub OBJ gfx at
+/// `0x0660_0000`). libnds `VRAM_I_SUB_SPRITE = 2` (MST=2); value 3 is the
+/// *extended-palette* slot, not gfx — see <nds/arm9/video.h>.
+pub const VRAM_I_SUB_SPRITE: u8 = 2;
 
 /// Sub-engine sprite palette (256 × u16, fixed VRAM address). See libnds
 /// `SPRITE_PALETTE_SUB`.
@@ -48,15 +49,19 @@ pub mod sprite_size {
 /// `SpriteColorFormat` discriminants.
 pub mod sprite_color_format {
     use core::ffi::c_int;
-    /// 16 colours per palette, 4bpp tiles.
-    pub const _16COLOR: c_int = 2;
-    /// 256 colours, 8bpp tiles.
+    // Values are libnds `SpriteColorFormat` = `OBJCOLOR_*` / `OBJMODE_BITMAP`
+    // (see <nds/arm9/sprite.h>): 16Color=0, 256Color=1, Bmp=3.
+    /// 16 colours per palette, 4bpp tiles (`OBJCOLOR_16`).
+    pub const _16COLOR: c_int = 0;
+    /// 256 colours, 8bpp tiles (`OBJCOLOR_256`).
     pub const _256COLOR: c_int = 1;
 }
 
 /// `SpriteMapping_1D_32`: 1D tile mapping with 32-byte stride (smallest /
-/// densest packing, what `grit` produces by default).
-pub const SPRITE_MAPPING_1D_32: c_int = 0x0010_0000 | 0;
+/// densest packing, what `grit` produces by default). libnds
+/// `DISPLAY_SPR_1D | DISPLAY_SPR_1D_SIZE_32 = (1 << 4) | (0 << 20)` — see
+/// <nds/arm9/video.h> / <nds/arm9/sprite.h>.
+pub const SPRITE_MAPPING_1D_32: c_int = (1 << 4) | (0 << 20);
 
 /// Opaque OAM state — libnds defines this as `OamState`. We only ever hand
 /// the address of `oamSub` / `oamMain` to libnds; we never inspect the struct.
