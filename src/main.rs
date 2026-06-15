@@ -1,805 +1,468 @@
-//! The game: a Bevy app that runs on the Nintendo DS.
+//! **Spike A — stylus virtual-analog locomotion** (Milestone 1, issue #18).
 //!
-//! Everything here is ordinary Bevy — components, systems, resources. The DS
-//! itself is handled entirely by the [`bevy_nds`] library via [`DsPlugins`]
-//! (the platform layer), [`bevy_nds_3d`] via [`Ds3dPlugin`] (the hardware 3D
-//! backend) and [`bevy_nds_audio`] via [`AudioPlugin`] (maxmod sound): this
-//! file contains no FFI, no allocator and no panic handler.
+//! A throwaway feel-spike, not production code. It exists to answer the single
+//! highest-risk unknown in the design (OQ-1): *does a relative stylus
+//! virtual-stick feel like an analog stick, not mud* — in both open and tight
+//! spaces? Everything else in the control model is built on the assumption that
+//! it does, so we prove it before any systems work.
 //!
-//! The demo is a tiny "tile-grid exploration": a hardware-rendered, hardware-lit
-//! Utah teapot sits on the bottom screen (the 3D engine's permanent home) and
-//! moves one cell at a time around a small map. The top screen shows the map
-//! as ASCII (a placeholder for the upcoming sprite plugin) with the player's
-//! `@` and a stationary companion `O` drawn over the walkable floor `.` and
-//! walls `#`. D-pad snaps the player between adjacent walkable cells; ABXY
-//! still tumble the player teapot so the hardware lighting plays across the
-//! surface. Looping piano music plays from the baked soundbank (START toggles
-//! it), and tapping a teapot fires a click SFX.
+//! Layout (locked in #17): the **top** LCD shows the 3D world (a flat arena with
+//! a hero teapot threading a grid of low-poly pillars), the **bottom** LCD is
+//! the touch surface — a *relative* virtual stick: pen-down sets an origin, the
+//! drag offset becomes a continuous heading + magnitude. Because the avatar and
+//! the touch panel live on different screens there is no shared coordinate
+//! space, so the stick must be relative (no absolute point-to-move).
+//!
+//! The feel-critical conditioning (radial deadzone, magnitude ramp, low-pass
+//! smoothing) is the pure, host-tested [`bevy_nds_math::stick`] module; this
+//! file is the ROM-side arena that wires it to hardware and exposes every knob
+//! to live tuning so the feel pass can dial it in. The camera is a position-only
+//! soft-follow (the DS 3D view matrix is translation-only — it can pan but not
+//! rotate), matching the "authored camera, no player camera control" decision.
+//!
+//! Controls (right-handed defaults; handedness mirroring is a later epic):
+//! - **Pen on bottom screen** — move (drag from the touch-down origin).
+//! - **L / R** — deadzone − / +      **Left / Right** — max-radius − / +
+//! - **Up / Down** — max-speed + / −  **Y / B** — smoothing + / −
+//! - **X** — recentre the hero        **Start** — reset all tunables
 
 #![no_std]
 #![no_main]
 
 extern crate alloc;
 
+use alloc::vec::Vec;
 use core::fmt::Write;
 
 use bevy_app::prelude::*;
 use bevy_ecs::prelude::*;
 use bevy_nds::prelude::*;
-use bevy_nds::SavePlugin;
 use bevy_nds_3d::prelude::*;
-use bevy_nds_audio::prelude::*;
-use bevy_nds_bg::prelude::*;
-use bevy_nds_sprite::prelude::*;
+use bevy_nds_math::stick::{StickConfig, smooth, stick_vector};
+use bevy_nds_math::{Fx32, FxVec2};
 
-/// Numeric sound IDs generated at build time by `wav2bank` from the soundbank
-/// header (e.g. `SFX_PIANO_LOOP`, `SFX_BLIP_SELECT`), so game code never hard-codes
-/// indices. Written to `$OUT_DIR/sounds.rs` by `build.rs`.
-mod sounds {
-    #![allow(dead_code)] // mmutil also emits MSL_* bank-metadata counts we don't use.
-    include!(concat!(env!("OUT_DIR"), "/sounds.rs"));
+// --- Tunable feel constants (starting points for the feel pass) --------------
+
+/// Half-extent of the square play-field, in world units. The hero is clamped
+/// here; the pillar grid sits inside it, leaving an open margin ring outside.
+const ARENA_HALF: f32 = 2.0;
+
+/// Landmark/obstacle pillars, in world XY. Kept deliberately few: each drawn
+/// mesh costs ~2 ms of per-frame CPU matrix compose on the 33 MHz ARM9
+/// (see #34), so the scene is object-count-bound, not polygon-bound, at 60 fps.
+/// The top pair forms a narrow **gate** to thread (the "tight space" feel test);
+/// the lower pair are spread landmarks giving motion parallax across the **open**
+/// field. The hero starts at the origin and can roam the open margin to
+/// ±`ARENA_HALF`.
+const PILLAR_CELLS: [(f32, f32); 4] = [
+    (-0.25, 0.7),
+    (0.25, 0.7),
+    (-1.2, -0.85),
+    (1.2, -0.95),
+];
+
+/// Camera height above the z=0 play-plane (it looks straight down −Z).
+const CAM_Z: f32 = 3.6;
+/// Per-frame camera follow lerp (0 = locked, 1 = instant snap).
+const CAM_FOLLOW: f32 = 0.15;
+
+/// Hero collision radius (world units).
+const PLAYER_RADIUS: f32 = 0.12;
+/// Pillar collision radius (world units).
+const PILLAR_RADIUS: f32 = 0.13;
+
+/// How far ahead of the hero the heading-nose marker sits.
+const NOSE_DIST: f32 = 0.26;
+/// Below this smoothed speed the hero is "stopped" and the nose hides.
+const MOVING_EPS: f32 = 0.03;
+
+/// Common forward tilt applied to every object so the straight-down camera
+/// reads as an angled 3/4 view (the view matrix can't tilt, so the meshes do).
+const TILT_X: f32 = -1.0;
+const PLAYER_SCALE: f32 = 0.11;
+const PILLAR_SCALE: f32 = 0.18;
+const NOSE_SCALE: f32 = 0.06;
+
+// --- Resources ----------------------------------------------------------------
+
+/// Live feel knobs, all adjustable on-device so the feel pass can tune without
+/// a rebuild. `deadzone` / `max_radius` are in touch pixels; `max_speed` is in
+/// world units/second; `smoothing` is the low-pass factor in `[0, 1)`.
+#[derive(Resource, Clone, Copy)]
+struct StickTuning {
+    deadzone: Fx32,
+    max_radius: Fx32,
+    max_speed: Fx32,
+    smoothing: Fx32,
 }
 
-/// NitroFS paths for every baked sprite under `assets/sprites/**/*.png`,
-/// generated at build time by `png2sprite` (e.g. `sprites::SPRITE`,
-/// `sprites::ui::CURSOR`). Pass one to `Sprite::image` instead of hard-coding
-/// the `nitro:/...` path. Written to `$OUT_DIR/sprites.rs` by `build.rs`.
-mod sprites {
-    #![allow(dead_code)]
-    include!(concat!(env!("OUT_DIR"), "/sprites.rs"));
+impl Default for StickTuning {
+    fn default() -> Self {
+        // Values from the Spike A feel pass (2026-06-14): a slightly raised
+        // deadzone, generous max-radius and moderate smoothing read as a
+        // responsive analog stick (OQ-1).
+        Self {
+            deadzone: Fx32::from_f32(8.0),
+            max_radius: Fx32::from_f32(70.0),
+            max_speed: Fx32::from_f32(1.6),
+            smoothing: Fx32::from_f32(0.5),
+        }
+    }
 }
 
-/// NitroFS paths for baked backgrounds under `assets/backgrounds/`. The
-/// `tiled::*` constants are passed to `Backgrounds::set_tile`; the
-/// `bitmap::*` constants to `Backgrounds::set_bitmap`. Written to
-/// `$OUT_DIR/backgrounds.rs` by `build.rs`.
-mod backgrounds {
-    #![allow(dead_code)]
-    include!(concat!(env!("OUT_DIR"), "/backgrounds.rs"));
+impl StickTuning {
+    fn config(&self) -> StickConfig {
+        StickConfig {
+            deadzone: self.deadzone,
+            max_radius: self.max_radius,
+            smoothing: self.smoothing,
+        }
+    }
 }
+
+/// Mutable per-frame stick state: where the current drag started, the smoothed
+/// movement vector (unit direction × magnitude in `[0, 1]`), and whether the
+/// pen is currently down (so a fresh touch re-seats the origin).
+#[derive(Resource, Default)]
+struct StickState {
+    origin: FxVec2,
+    vel: FxVec2,
+    active: bool,
+}
+
+/// Static pillar centres (world XY), built once at setup and read by the
+/// collision pass.
+#[derive(Resource, Default)]
+struct Pillars(Vec<FxVec2>);
+
+// --- Components ---------------------------------------------------------------
+
+/// The pen-driven hero.
+#[derive(Component)]
+struct Player;
+
+/// A small marker that floats ahead of the hero in its heading direction —
+/// visual proof that the stick yields a *continuous* heading, not 8-way snaps.
+#[derive(Component)]
+struct Nose;
+
+/// The hero's authoritative world position, in fixed-point. Movement and
+/// collision run here (hardware sqrt/divide on the hot path); `sync_player`
+/// copies it into the float [`Transform3d`] the renderer wants.
+#[derive(Component, Clone, Copy)]
+struct WorldPos(FxVec2);
+
+/// HUD line: live stick readout (heading magnitude + components).
+#[derive(Component)]
+struct StickHud;
+/// HUD line: the current tunable values.
+#[derive(Component)]
+struct TuneHud;
+/// HUD line: fps + hero position.
+#[derive(Component)]
+struct StatHud;
 
 /// Program entry point, called by the BlocksDS crt0.
 #[unsafe(no_mangle)]
 pub extern "C" fn main() -> core::ffi::c_int {
     let mut app = App::new();
-    // Override the engine-default save directory (`fat:/bevy_nds/`) with this
-    // game's own, so Kill the Serpent's slot files live under `fat:/kts/`.
-    app.add_plugins(DsPlugins.set(SavePlugin {
-        base_dir: Some("fat:/kts/".into()),
-    }))
+    app.add_plugins(DsPlugins)
         .add_plugins(Ds3dPlugin)
-        .add_plugins(AudioPlugin)
-        .add_plugins(SpritePlugin)
-        .add_plugins(BackgroundPlugin)
-        .add_plugins(GamePlugin);
+        .add_plugins(SpikePlugin);
     bevy_nds::run(app)
 }
 
-/// The actual game, as a self-contained Bevy plugin.
-struct GamePlugin;
+/// The whole spike, as one Bevy plugin.
+struct SpikePlugin;
 
-impl Plugin for GamePlugin {
+impl Plugin for SpikePlugin {
     fn build(&self, app: &mut App) {
-        // The 3D engine lives permanently on the bottom screen; the top screen
-        // (the sub engine's text console) is the map + HUD.
+        // 3D on the top LCD; the sub-engine text console + touch land on the
+        // bottom LCD (the two engines swap together — see bevy_nds_3d::Display3d).
         app.insert_resource(Display3d {
-            screen: DsScreen::Bottom,
+            screen: DsScreen::Top,
         })
-        .insert_resource(Map::new())
-        .init_resource::<FrameCounter>()
-        .init_resource::<PendingSave>()
-        .add_systems(Startup, (setup, load_counter))
+        .init_resource::<StickTuning>()
+        .init_resource::<StickState>()
+        .init_resource::<Pillars>()
+        .add_systems(Startup, setup)
         .add_systems(
             Update,
+            // Chained so the camera + transforms read the freshly-moved hero,
+            // and the HUD reflects this frame's state. The DS is single-core, so
+            // sequential ordering costs nothing here.
             (
-                step_player,
-                spin_companion,
-                sync_map_to_world,
-                sync_marker_glyph,
-                sync_marker_sprite,
+                adjust_tuning,
+                drive_player,
+                sync_player,
+                sync_nose,
+                follow_camera,
                 update_hud,
-                update_touch_hud,
-                update_pick_hud,
-                update_gesture_hud,
-                poke_picked,
-                toggle_music,
-                update_audio_hud,
-                bg_task_demo,
-                update_clock_hud,
-                tick_and_autosave,
-                update_save_hud,
-            ),
+            )
+                .chain(),
         );
     }
 }
 
-// --- Map ---------------------------------------------------------------------
-
-/// Map width in cells.
-const MAP_W: usize = 16;
-/// Map height in cells.
-const MAP_H: usize = 8;
-/// World-units per map cell. The map's full extent (`MAP_W * CELL`, `MAP_H * CELL`)
-/// is sized to fit inside the camera frustum at z=0.
-const CELL: f32 = 0.2;
-
-/// World position of the centre of cell `(0, 0)`. The map is centred on the
-/// origin, so cell `(MAP_W-1, MAP_H-1)` lands at the negative of this on each
-/// axis.
-const MAP_ORIGIN: Vec3 = Vec3::new(
-    -CELL * (MAP_W as f32 - 1.0) * 0.5,
-    CELL * (MAP_H as f32 - 1.0) * 0.5,
-    0.0,
-);
-
-/// Where the map is drawn on the text console. Centres the 16x8 cell display
-/// horizontally and leaves a title row above it.
-const MAP_TILE_COL: i16 = (32 - MAP_W as i16) / 2;
-const MAP_TILE_ROW: i16 = 2;
-
-/// The level: walkable floors (`.`) and walls (`#`). Row 0 is the top.
-const MAP_DATA: [&[u8; MAP_W]; MAP_H] = [
-    b"################",
-    b"#..............#",
-    b"#.####.##.####.#",
-    b"#..............#",
-    b"#.####.##.####.#",
-    b"#..............#",
-    b"#.####.##.####.#",
-    b"################",
-];
-
-/// The map. Holds the static tile layout; entity positions are separate
-/// (carried by [`MapPos`] components) so multiple things can share a cell.
-#[derive(Resource)]
-struct Map {
-    tiles: [[u8; MAP_W]; MAP_H],
-}
-
-impl Map {
-    fn new() -> Self {
-        let mut tiles = [[b' '; MAP_W]; MAP_H];
-        for (row, src) in MAP_DATA.iter().enumerate() {
-            tiles[row] = **src;
-        }
-        Self { tiles }
-    }
-
-    /// Is `(col, row)` inside the map and a floor cell?
-    fn walkable(&self, col: i16, row: i16) -> bool {
-        if col < 0 || row < 0 || col >= MAP_W as i16 || row >= MAP_H as i16 {
-            return false;
-        }
-        self.tiles[row as usize][col as usize] == b'.'
-    }
-}
-
-/// A cell coordinate on the [`Map`]. Carried by anything that occupies a tile
-/// (the player teapot, the companion). A separate system ([`sync_map_to_world`])
-/// keeps [`Transform3d::translation`] in step with this each frame.
-#[derive(Component, Clone, Copy, PartialEq, Eq)]
-struct MapPos {
-    col: i16,
-    row: i16,
-}
-
-impl MapPos {
-    fn to_world(self) -> Vec3 {
-        Vec3::new(
-            MAP_ORIGIN.x + CELL * self.col as f32,
-            MAP_ORIGIN.y - CELL * self.row as f32,
-            0.0,
-        )
-    }
-}
-
-// --- Components --------------------------------------------------------------
-
-/// The player-controlled teapot.
-#[derive(Component)]
-struct Player;
-
-/// A second, stationary teapot that simply spins in place. It shares the
-/// player's geometry but has its own [`Transform3d`], so every frame the
-/// renderer composes and uploads two independent model matrices.
-#[derive(Component)]
-struct Companion;
-
-/// Marker for the player's on-map `Glyph` overlay (the moving `@`). A separate
-/// entity so we can update just its `TilePos` when the player walks, without
-/// recomposing any text.
-#[derive(Component)]
-struct PlayerMarker;
-
-/// The live status line on the text console.
-#[derive(Component)]
-struct Hud;
-
-/// A second status line that echoes the touch-screen position.
-#[derive(Component)]
-struct TouchHud;
-
-/// A status line naming which teapot the pen is currently over (via picking).
-#[derive(Component)]
-struct PickHud;
-
-/// A status line showing the most recent touch gesture.
-#[derive(Component)]
-struct GestureHud;
-
-/// A status line reflecting the music state (playing/muted).
-#[derive(Component)]
-struct AudioHud;
-
-/// A status line for the cothread demo. SELECT spawns a task that yields once
-/// per vblank for ~2 seconds; this line shows idle/running/done so you can
-/// watch the frame loop keep ticking (fps stays at 60, teapot still walks)
-/// while a background cothread chips away at its work.
-#[derive(Component)]
-struct BgTaskHud;
-
-/// A status line showing wall-clock time (YYYY-MM-DD HH:MM:SS) from the DS RTC.
-#[derive(Component)]
-struct ClockHud;
-
-/// A status line for the save-storage demo: shows the live frame counter
-/// plus the last value committed to `fat:/kts/counter.sav`. The counter
-/// resumes across reboots, proving the SD-card write/read round-trip.
-#[derive(Component)]
-struct SaveHud;
-
-/// Counts frames since the last load; the resource itself is the canonical
-/// state we round-trip through `SaveStorage`. `last_saved` is shown on the
-/// HUD so you can see autosaves fire (the live counter overtakes it, then it
-/// catches up).
-#[derive(Resource, Default)]
-struct FrameCounter {
-    frames: u32,
-    last_saved: u32,
-}
-
-/// The currently-in-flight async save, if any. We only kick off a new
-/// `write_async` when the previous one has finished — dropping an unfinished
-/// `Task` would block the frame loop.
-#[derive(Resource, Default)]
-struct PendingSave(Option<Task<bool>>);
-
 // --- Setup -------------------------------------------------------------------
 
-fn setup(
-    mut commands: Commands,
-    nitrofs: Res<NitroFs>,
-    mut music: ResMut<Music>,
-    mut bgs: ResMut<Backgrounds>,
-) {
-    // Paint a subtle blue grid behind the text console on the bottom screen
-    // (map + HUD layer). Uses palette bank 1 so the console's bank-0 font
-    // keeps rendering on top. The grid only shows through the transparent
-    // tile-console cells where there is no text.
-    bgs.set_tile(DsScreen::Bottom, backgrounds::tiled::GRID);
-    // Load the teapot model: prefer NitroFS (so large models stay out of main
-    // RAM and can be swapped without relinking), fall back to the copy baked
-    // into the binary by `include_obj!`. Both paths produce byte-identical
-    // geometry. The model is authored on the XY plane (pivot at its base);
-    // both paths recentre it so it rotates about its visual middle.
-    let loaded = nitrofs
-        .ready
-        .then(|| DsMesh::load(b"nitro:/teapot.dl\0"))
-        .flatten();
-    let from_nitrofs = loaded.is_some();
-    let teapot = loaded.unwrap_or_else(|| include_obj!("assets/teapot.obj", center));
-    // The companion shares the same geometry (cheap Cow clone of the display list).
-    let companion = teapot.clone();
+fn setup(mut commands: Commands, mut camera: ResMut<Camera3d>, mut pillars: ResMut<Pillars>) {
+    // Low-poly cube (12 tris) for the pillars — cheap enough to instance a whole
+    // grid under the DS ~2048-poly/frame budget, unlike the 552-face teapot.
+    let cube = include_obj!("assets/cube.obj", center);
+    // The hero is the teapot, so it reads as a distinct "character".
+    let teapot = include_obj!("assets/teapot.obj", center);
 
-    // Player teapot — at a known floor cell on the upper-left of the map.
-    let player_start = MapPos { col: 2, row: 1 };
+    // Hero — starts at the open centre cell.
     commands.spawn((
         Player,
-        player_start,
+        WorldPos(FxVec2::ZERO),
         teapot,
         DsMaterial {
-            diffuse: [120, 170, 215],
-            ambient: [28, 36, 56],
+            diffuse: [110, 180, 235],
+            ambient: [26, 40, 58],
         },
         Transform3d {
-            translation: player_start.to_world(),
+            translation: Vec3::ZERO,
             rotation: Vec3::new(-1.3, 0.5, 0.0),
-            scale: Vec3::splat(0.18),
+            scale: Vec3::splat(PLAYER_SCALE),
         },
     ));
 
-    // Companion teapot — fixed on the right-hand side, spinning. Proves out
-    // multiple transformed meshes per frame (per-object CPU matrix compose +
-    // frustum culling) without the player having to move into it.
-    let companion_pos = MapPos { col: 13, row: 5 };
+    // Heading nose — bright, hidden (scale 0) until the hero moves.
     commands.spawn((
-        Companion,
-        companion_pos,
-        companion,
+        Nose,
+        cube.clone(),
         DsMaterial {
-            diffuse: [215, 150, 90],
-            ambient: [48, 34, 20],
+            diffuse: [245, 220, 70],
+            ambient: [60, 52, 16],
         },
         Transform3d {
-            translation: companion_pos.to_world(),
-            rotation: Vec3::new(-1.3, 0.0, 0.0),
-            scale: Vec3::splat(0.14),
+            translation: Vec3::ZERO,
+            rotation: Vec3::new(TILT_X, 0.0, 0.0),
+            scale: Vec3::ZERO,
         },
     ));
 
-    // Top screen: title, map rows (composed each frame from `Map` + entities),
-    // and HUD lines.
-    let source = if from_nitrofs {
-        "kts map demo  (nitrofs)"
-    } else {
-        "kts map demo  (baked-in)"
-    };
-    commands.spawn((DsScreen::Bottom, TilePos::new(2, 0), DsText::new(source)));
-
-    // Static map rows: one `DsText` per row, written once. Composition cost
-    // disappears for unchanged frames; the text-renderer's per-cell diff only
-    // ever fires on the cells where the moving `@`/`O` glyphs overlap. The
-    // game crate runs at `opt-level = 0`, so recomposing 8 × 16 characters
-    // every frame here noticeably halved fps before this change.
-    let mut row_buf = alloc::string::String::with_capacity(MAP_W);
-    for row in 0..MAP_H {
-        row_buf.clear();
-        for &byte in MAP_DATA[row].iter() {
-            row_buf.push(byte as char);
-        }
+    // Pillars: a few hand-placed landmarks/obstacles (see PILLAR_CELLS).
+    let mut centres = Vec::new();
+    for (i, &(x, y)) in PILLAR_CELLS.iter().enumerate() {
+        centres.push(FxVec2::from_f32(x, y));
         commands.spawn((
-            DsScreen::Bottom,
-            TilePos::new(MAP_TILE_COL, MAP_TILE_ROW + row as i16),
-            DsText::new(row_buf.as_str()),
+            cube.clone(),
+            DsMaterial {
+                diffuse: [120, 120, 138],
+                ambient: [34, 34, 44],
+            },
+            Transform3d {
+                translation: Vec3::new(x, y, 0.0),
+                // A little yaw variety so the boxes don't look stamped.
+                rotation: Vec3::new(TILT_X, 0.4 * i as f32, 0.0),
+                scale: Vec3::splat(PILLAR_SCALE),
+            },
         ));
     }
+    pillars.0 = centres;
 
-    // Player marker — a tile-console `Glyph` (`@`) that the text renderer
-    // overlays on the static map, PLUS a 16x16 hardware sprite drawn on top
-    // of the same cell by `bevy_nds_sprite`. The sprite proves the OAM
-    // pipeline; the glyph remains as a fallback if the sprite engine isn't
-    // up. Both follow the player's `MapPos` via `sync_marker_*`.
-    let start_tile = cell_to_tile(player_start);
-    commands.spawn((
-        PlayerMarker,
-        DsScreen::Bottom,
-        start_tile,
-        Glyph(b'@'),
-        Sprite::new(sprites::SPRITE).at(start_tile.x * 8, start_tile.y * 8),
-    ));
+    // Camera starts centred over the hero.
+    camera.position = Vec3::new(0.0, 0.0, CAM_Z);
 
-    // Companion marker (`O`). It doesn't move, so its `TilePos` is static.
-    commands.spawn((DsScreen::Bottom, cell_to_tile(companion_pos), Glyph(b'O')));
-
-    // HUD lines, below the map.
-    commands.spawn((
-        DsScreen::Bottom,
-        TilePos::new(2, MAP_TILE_ROW + MAP_H as i16 + 1),
-        Hud,
-        DsText::new(""),
-    ));
-    commands.spawn((
-        DsScreen::Bottom,
-        TilePos::new(2, MAP_TILE_ROW + MAP_H as i16 + 2),
-        TouchHud,
-        DsText::new("touch: --"),
-    ));
-    commands.spawn((
-        DsScreen::Bottom,
-        TilePos::new(2, MAP_TILE_ROW + MAP_H as i16 + 3),
-        PickHud,
-        DsText::new("picked: none"),
-    ));
-    commands.spawn((
-        DsScreen::Bottom,
-        TilePos::new(2, MAP_TILE_ROW + MAP_H as i16 + 4),
-        GestureHud,
-        DsText::new("gesture: --"),
-    ));
-    commands.spawn((
-        DsScreen::Bottom,
-        TilePos::new(2, MAP_TILE_ROW + MAP_H as i16 + 5),
-        AudioHud,
-        DsText::new("music: --"),
-    ));
-    commands.spawn((
-        DsScreen::Bottom,
-        TilePos::new(2, MAP_TILE_ROW + MAP_H as i16 + 6),
-        BgTaskHud,
-        DsText::new("task: idle (SELECT to run)"),
-    ));
-    commands.spawn((
-        DsScreen::Bottom,
-        TilePos::new(2, MAP_TILE_ROW + MAP_H as i16 + 7),
-        ClockHud,
-        DsText::new("clock: --"),
-    ));
-    commands.spawn((
-        DsScreen::Bottom,
-        TilePos::new(2, MAP_TILE_ROW + MAP_H as i16 + 8),
-        SaveHud,
-        DsText::new("save: --"),
-    ));
-    commands.spawn((
-        DsScreen::Bottom,
-        TilePos::new(2, 22),
-        DsText::new("D-pad walk  ABXY tumble  SEL task"),
-    ));
-    commands.spawn((
-        DsScreen::Bottom,
-        TilePos::new(2, 23),
-        DsText::new("tap teapot for SFX   START: mute"),
-    ));
-
-    // Kick off the looping piano. `Music` is declarative — the audio backend
-    // reconciles the hardware to it each frame.
-    music.play(SoundId(sounds::SFX_PIANO_LOOP));
+    // Bottom-screen text HUD (sub engine). Top is the 3D view.
+    let s = DsScreen::Bottom;
+    commands.spawn((s, TilePos::new(1, 0), DsText::new("Spike A: stylus virtual-stick")));
+    commands.spawn((s, TilePos::new(1, 1), DsText::new("drag below to move the hero")));
+    commands.spawn((s, TilePos::new(1, 3), StickHud, DsText::new("")));
+    commands.spawn((s, TilePos::new(1, 4), TuneHud, DsText::new("")));
+    commands.spawn((s, TilePos::new(1, 5), StatHud, DsText::new("")));
+    commands.spawn((s, TilePos::new(1, 18), DsText::new("L/R deadzone  <>/ max radius")));
+    commands.spawn((s, TilePos::new(1, 19), DsText::new("Up/Dn speed   Y/B smoothing")));
+    commands.spawn((s, TilePos::new(1, 20), DsText::new("X recentre    START reset knobs")));
 }
 
 // --- Movement ----------------------------------------------------------------
 
-/// Move the player one cell on D-pad press (not hold), if the target is
-/// walkable. Discrete cell-snapped movement: the world position follows in
-/// [`sync_map_to_world`].
-fn step_player(
-    input: Res<ButtonInput<DsButton>>,
-    map: Res<Map>,
-    mut query: Query<&mut MapPos, With<Player>>,
+/// Read the relative virtual stick, smooth it, and integrate the hero's
+/// fixed-point world position with arena-bound clamping and circular pillar
+/// push-out. This is the heart of the spike.
+fn drive_player(
+    time: Res<Time>,
+    touches: Res<Touches>,
+    tuning: Res<StickTuning>,
+    pillars: Res<Pillars>,
+    mut state: ResMut<StickState>,
+    mut query: Query<&mut WorldPos, With<Player>>,
 ) {
-    let (dx, dy) = if input.just_pressed(DsButton::Left) {
-        (-1, 0)
-    } else if input.just_pressed(DsButton::Right) {
-        (1, 0)
-    } else if input.just_pressed(DsButton::Up) {
-        (0, -1)
-    } else if input.just_pressed(DsButton::Down) {
-        (0, 1)
+    let cfg = tuning.config();
+
+    // Target movement vector from the pen, in world axes (screen-y points down,
+    // world-y points up, so flip y). Releasing the pen targets zero, and the
+    // low-pass below makes the hero glide to a stop rather than snap.
+    let target = if let Some(touch) = touches.iter().next() {
+        let p = touch.position();
+        let cur = FxVec2::from_f32(p.x, p.y);
+        if !state.active {
+            state.origin = cur;
+            state.active = true;
+        }
+        let raw = cur - state.origin;
+        let offset = FxVec2::new(raw.x, -raw.y);
+        stick_vector(offset, &cfg)
     } else {
-        return;
+        state.active = false;
+        FxVec2::ZERO
     };
+
+    state.vel = smooth(state.vel, target, cfg.smoothing);
+
+    // Integrate: delta = dir·magnitude × speed × dt.
+    let dt = Fx32::from_f32(time.delta_secs());
+    let delta = state.vel * (tuning.max_speed * dt);
+
+    let bound = Fx32::from_f32(ARENA_HALF);
+    let min_dist = Fx32::from_f32(PLAYER_RADIUS + PILLAR_RADIUS);
     for mut pos in &mut query {
-        let target_col = pos.col + dx;
-        let target_row = pos.row + dy;
-        if map.walkable(target_col, target_row) {
-            pos.col = target_col;
-            pos.row = target_row;
+        let mut np = pos.0 + delta;
+        np.x = np.x.clamp(-bound, bound);
+        np.y = np.y.clamp(-bound, bound);
+
+        // Push out of any pillar we've entered (sequential resolution is fine
+        // for this sparse, non-overlapping grid).
+        for &c in &pillars.0 {
+            let sep = np - c;
+            let d = sep.length();
+            if d > Fx32::ZERO && d < min_dist {
+                np = c + sep.normalize_or_zero() * min_dist;
+            }
         }
+        pos.0 = np;
     }
 }
 
-/// Tumble the player with the face buttons so the hardware lighting is visible:
-/// Y/A yaw left/right, X/B pitch up/down.
-fn tumble_player(input: &ButtonInput<DsButton>, transform: &mut Transform3d) {
-    const SPEED: f32 = 0.06;
-    if input.pressed(DsButton::A) {
-        transform.rotation.y += SPEED;
-    }
-    if input.pressed(DsButton::Y) {
-        transform.rotation.y -= SPEED;
-    }
-    if input.pressed(DsButton::X) {
-        transform.rotation.x -= SPEED;
-    }
-    if input.pressed(DsButton::B) {
-        transform.rotation.x += SPEED;
+/// Copy the hero's fixed-point world position into its float transform.
+fn sync_player(mut query: Query<(&WorldPos, &mut Transform3d), With<Player>>) {
+    for (pos, mut transform) in &mut query {
+        transform.translation.x = pos.0.x.to_f32();
+        transform.translation.y = pos.0.y.to_f32();
     }
 }
 
-/// Slowly spin the companion in place, and apply the face-button tumble to the
-/// player. Both are folded into the same `MapPos -> world` sync below so any
-/// rotation here lands in the same frame's transform.
-fn spin_companion(time: Res<Time>, mut query: Query<&mut Transform3d, With<Companion>>) {
-    let dt = time.delta_secs();
-    for mut transform in &mut query {
-        transform.rotation.y += dt;
-    }
-}
-
-/// Drive `Transform3d.translation` from `MapPos` each frame. Cheap (a handful
-/// of entities) and keeps map position the source of truth.
-fn sync_map_to_world(
-    input: Res<ButtonInput<DsButton>>,
-    mut query: Query<(&MapPos, &mut Transform3d, Option<&Player>)>,
-) {
-    for (pos, mut transform, is_player) in &mut query {
-        transform.translation = pos.to_world();
-        if is_player.is_some() {
-            tumble_player(&input, &mut transform);
-        }
-    }
-}
-
-// --- Map display -------------------------------------------------------------
-
-/// Convert a map cell to the tile position of its glyph on the text console.
-fn cell_to_tile(pos: MapPos) -> TilePos {
-    TilePos::new(MAP_TILE_COL + pos.col, MAP_TILE_ROW + pos.row)
-}
-
-/// Keep the player's `@` glyph aligned with its current cell. Triggered by
-/// `Changed<MapPos>`, so it only does work on the frames the player actually
-/// walks — no per-frame map recomposition.
-fn sync_marker_glyph(
-    player: Query<&MapPos, (With<Player>, Changed<MapPos>)>,
-    mut marker: Query<&mut TilePos, With<PlayerMarker>>,
+/// Float the heading nose ahead of the hero in its travel direction, or hide it
+/// (scale 0) when stopped.
+fn sync_nose(
+    state: Res<StickState>,
+    player: Query<&WorldPos, With<Player>>,
+    mut nose: Query<&mut Transform3d, With<Nose>>,
 ) {
     let Some(pos) = player.iter().next() else {
         return;
     };
-    for mut tile in &mut marker {
-        *tile = cell_to_tile(*pos);
-    }
-}
-
-/// Keep the hardware sprite covering the player's `@` glyph aligned with its
-/// current cell. Same `Changed<MapPos>` gating as the glyph: the sprite only
-/// moves on the frame the player walks.
-fn sync_marker_sprite(
-    player: Query<&MapPos, (With<Player>, Changed<MapPos>)>,
-    mut marker: Query<&mut Sprite, With<PlayerMarker>>,
-) {
-    let Some(pos) = player.iter().next() else {
-        return;
-    };
-    let tile = cell_to_tile(*pos);
-    for mut sprite in &mut marker {
-        sprite.x = tile.x * 8;
-        sprite.y = tile.y * 8;
-    }
-}
-
-// --- HUDs --------------------------------------------------------------------
-
-/// Echo the touch-screen state to its HUD line.
-fn update_touch_hud(touches: Res<Touches>, mut query: Query<&mut DsText, With<TouchHud>>) {
-    for mut text in &mut query {
-        text.0.clear();
-        if let Some(touch) = touches.iter().next() {
-            let pos = touch.position();
-            let _ = write!(text.0, "touch: {:>3},{:>3}", pos.x as i32, pos.y as i32);
+    let speed = state.vel.length();
+    let moving = speed > Fx32::from_f32(MOVING_EPS);
+    let dir = state.vel.normalize_or_zero();
+    let nose_dist = Fx32::from_f32(NOSE_DIST);
+    for mut transform in &mut nose {
+        if moving {
+            let p = pos.0 + dir * nose_dist;
+            transform.translation = Vec3::new(p.x.to_f32(), p.y.to_f32(), 0.0);
+            transform.scale = Vec3::splat(NOSE_SCALE);
         } else {
-            let _ = write!(text.0, "touch: --");
+            transform.scale = Vec3::ZERO;
         }
     }
 }
 
-/// Name the entity the pen is over, by checking it against the teapot markers.
-fn pick_name(pick: &TouchPick, player: Entity, companion: Entity) -> &'static str {
-    match pick.entity {
-        Some(e) if e == player => "player",
-        Some(e) if e == companion => "companion",
-        Some(_) => "?",
-        None => "none",
-    }
-}
-
-/// Report which teapot the pen is hovering over, using the engine's hardware
-/// [`TouchPick`] result.
-fn update_pick_hud(
-    pick: Res<TouchPick>,
-    player: Single<Entity, With<Player>>,
-    companion: Single<Entity, With<Companion>>,
-    mut query: Query<&mut DsText, With<PickHud>>,
-) {
-    let name = pick_name(&pick, *player, *companion);
-    for mut text in &mut query {
-        text.0.clear();
-        let _ = write!(text.0, "picked: {name}");
-    }
-}
-
-/// Tapping a teapot tumbles it and fires a click SFX. Gated on the
-/// [`Gesture::Tap`] event (a quick press-and-release in place) so dragging /
-/// swiping across the teapots doesn't trigger it. The tap is emitted on
-/// pen-up, which reaches `Update` before [`TouchPick`] is cleared in `Last`,
-/// so `pick.entity` still holds whatever teapot was under the pen during the
-/// press.
-fn poke_picked(
-    pick: Res<TouchPick>,
-    mut gestures: EventReader<GestureEvent>,
-    mut sfx: EventWriter<PlaySfx>,
-    mut query: Query<&mut Transform3d>,
-) {
-    let tapped = gestures
-        .read()
-        .any(|GestureEvent(g)| matches!(g, Gesture::Tap(_)));
-    if !tapped {
+/// Position-only soft follow: the camera pans toward the hero but never rotates
+/// (the DS view matrix is translation-only).
+fn follow_camera(mut camera: ResMut<Camera3d>, player: Query<&WorldPos, With<Player>>) {
+    let Some(pos) = player.iter().next() else {
         return;
-    }
-    if let Some(entity) = pick.entity
-        && let Ok(mut transform) = query.get_mut(entity)
-    {
-        transform.rotation.y += core::f32::consts::FRAC_PI_2;
-        sfx.write(PlaySfx::new(SoundId(sounds::SFX_BLIP_SELECT)));
-    }
+    };
+    let tx = pos.0.x.to_f32();
+    let ty = pos.0.y.to_f32();
+    camera.position.x += (tx - camera.position.x) * CAM_FOLLOW;
+    camera.position.y += (ty - camera.position.y) * CAM_FOLLOW;
+    camera.position.z = CAM_Z;
 }
 
-/// Toggle the background music on and off with START. Demonstrates the
-/// declarative [`Music`] resource: the game sets the desired track and the
-/// backend reconciles the hardware.
-fn toggle_music(input: Res<ButtonInput<DsButton>>, mut music: ResMut<Music>) {
+// --- Tuning ------------------------------------------------------------------
+
+/// Adjust the feel knobs live from the button cluster, so the feel pass can dial
+/// the stick in on real hardware without a rebuild.
+fn adjust_tuning(input: Res<ButtonInput<DsButton>>, mut tuning: ResMut<StickTuning>) {
+    let px = Fx32::from_int(1);
+    let two_px = Fx32::from_int(2);
+    let small = Fx32::from_f32(0.1);
+    let fine = Fx32::from_f32(0.05);
+
+    if input.just_pressed(DsButton::L) {
+        tuning.deadzone = (tuning.deadzone - px).max(Fx32::ZERO);
+    }
+    if input.just_pressed(DsButton::R) {
+        tuning.deadzone = (tuning.deadzone + px).min(Fx32::from_int(30));
+    }
+    if input.just_pressed(DsButton::Left) {
+        let floor = tuning.deadzone + px;
+        tuning.max_radius = (tuning.max_radius - two_px).max(floor);
+    }
+    if input.just_pressed(DsButton::Right) {
+        tuning.max_radius = (tuning.max_radius + two_px).min(Fx32::from_int(100));
+    }
+    if input.just_pressed(DsButton::Up) {
+        tuning.max_speed = (tuning.max_speed + small).min(Fx32::from_f32(5.0));
+    }
+    if input.just_pressed(DsButton::Down) {
+        tuning.max_speed = (tuning.max_speed - small).max(Fx32::from_f32(0.2));
+    }
+    if input.just_pressed(DsButton::Y) {
+        tuning.smoothing = (tuning.smoothing + fine).min(Fx32::from_f32(0.95));
+    }
+    if input.just_pressed(DsButton::B) {
+        tuning.smoothing = (tuning.smoothing - fine).max(Fx32::ZERO);
+    }
     if input.just_pressed(DsButton::Start) {
-        if music.is_playing() {
-            music.stop();
-        } else {
-            music.play(SoundId(sounds::SFX_PIANO_LOOP));
-        }
+        *tuning = StickTuning::default();
     }
 }
 
-/// On boot, pull the persisted frame count off the SD card (if any) so the
-/// counter resumes where it left off. Synchronous read — fine for startup
-/// since we're not yet inside the per-frame loop.
-fn load_counter(save: Res<SaveStorage>, mut counter: ResMut<FrameCounter>) {
-    if let Some(bytes) = save.read("counter")
-        && let Ok(arr) = <[u8; 4]>::try_from(bytes.as_slice())
-    {
-        counter.frames = u32::from_le_bytes(arr);
-        counter.last_saved = counter.frames;
-    }
-}
+// --- HUD ---------------------------------------------------------------------
 
-/// Per-frame: bump the counter, and every ~5 s (300 vblanks) kick off an
-/// async save via cothread so the write doesn't stall vblank. We hold the
-/// in-flight `Task` in `PendingSave` and poll it each frame; we only start a
-/// new save once the previous one has joined (dropping an unfinished `Task`
-/// would block).
-fn tick_and_autosave(
-    mut counter: ResMut<FrameCounter>,
-    mut pending: ResMut<PendingSave>,
-    save: Res<SaveStorage>,
+fn update_hud(
+    fps: Res<Fps>,
+    state: Res<StickState>,
+    tuning: Res<StickTuning>,
+    player: Query<&WorldPos, With<Player>>,
+    mut stick_hud: Query<&mut DsText, (With<StickHud>, Without<TuneHud>, Without<StatHud>)>,
+    mut tune_hud: Query<&mut DsText, (With<TuneHud>, Without<StatHud>)>,
+    mut stat_hud: Query<&mut DsText, With<StatHud>>,
 ) {
-    counter.frames = counter.frames.wrapping_add(1);
-
-    // Reap a completed save first.
-    if let Some(task) = &mut pending.0
-        && task.poll().is_some()
-    {
-        counter.last_saved = counter.frames;
-        pending.0 = None;
-    }
-
-    // Kick off a new autosave every 5 s, unless one is still running.
-    if pending.0.is_none() && counter.frames.is_multiple_of(300) {
-        let bytes = counter.frames.to_le_bytes().to_vec();
-        pending.0 = Some(save.write_async("counter", bytes));
-    }
-}
-
-/// Reflect the live counter and the last persisted value on the HUD.
-fn update_save_hud(
-    counter: Res<FrameCounter>,
-    save: Res<SaveStorage>,
-    mut query: Query<&mut DsText, With<SaveHud>>,
-) {
-    for mut text in &mut query {
-        text.0.clear();
-        if save.status().is_ready() {
-            let _ = write!(
-                text.0,
-                "save: live={} disk={}",
-                counter.frames, counter.last_saved,
-            );
-        } else {
-            let _ = write!(text.0, "save: unavailable");
-        }
-    }
-}
-
-/// Reflect the DS RTC's wall-clock time on its HUD line.
-fn update_clock_hud(clock: Res<WallClock>, mut query: Query<&mut DsText, With<ClockHud>>) {
-    for mut text in &mut query {
+    let mag = state.vel.length().to_f32();
+    for mut text in &mut stick_hud {
         text.0.clear();
         let _ = write!(
             text.0,
-            "clock: {:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-            clock.year, clock.month, clock.day, clock.hour, clock.minute, clock.second,
+            "mag={:.2} dir {:+.2},{:+.2}",
+            mag,
+            state.vel.x.to_f32(),
+            state.vel.y.to_f32(),
         );
     }
-}
-
-/// Reflect the music state on its HUD line.
-fn update_audio_hud(
-    audio: Res<Audio>,
-    music: Res<Music>,
-    mut query: Query<&mut DsText, With<AudioHud>>,
-) {
-    let state = if !audio.ready {
-        "unavailable"
-    } else if music.is_playing() {
-        "playing"
-    } else {
-        "muted"
-    };
-    for mut text in &mut query {
+    for mut text in &mut tune_hud {
         text.0.clear();
-        let _ = write!(text.0, "music: {state}");
+        let _ = write!(
+            text.0,
+            "dz{:.0} mR{:.0} spd{:.1} sm{:.2}",
+            tuning.deadzone.to_f32(),
+            tuning.max_radius.to_f32(),
+            tuning.max_speed.to_f32(),
+            tuning.smoothing.to_f32(),
+        );
     }
-}
-
-/// Show the latest touch gesture on its HUD line.
-fn update_gesture_hud(
-    mut events: EventReader<GestureEvent>,
-    mut query: Query<&mut DsText, With<GestureHud>>,
-) {
-    let Some(GestureEvent(gesture)) = events.read().last() else {
-        return;
+    let (px, py) = match player.iter().next() {
+        Some(p) => (p.0.x.to_f32(), p.0.y.to_f32()),
+        None => (0.0, 0.0),
     };
-    let label = match gesture {
-        Gesture::Tap(_) => "tap",
-        Gesture::LongPress(_) => "long press",
-        Gesture::Swipe { direction, .. } => match direction {
-            SwipeDir::Up => "swipe up",
-            SwipeDir::Down => "swipe down",
-            SwipeDir::Left => "swipe left",
-            SwipeDir::Right => "swipe right",
-        },
-        Gesture::DragStart(_) => "drag start",
-        Gesture::Drag { .. } => "drag",
-        Gesture::DragEnd(_) => "drag end",
-    };
-    for mut text in &mut query {
+    for mut text in &mut stat_hud {
         text.0.clear();
-        let _ = write!(text.0, "gesture: {label}");
-    }
-}
-
-/// Cothread demo: SELECT spawns a background task that yields once per vblank
-/// for ~2 seconds (120 frames), counting iterations. The HUD line cycles
-/// idle → running → done while the game loop keeps drawing the teapot at 60
-/// fps — proof that blocking work has moved off the critical path.
-fn bg_task_demo(
-    input: Res<ButtonInput<DsButton>>,
-    tasks: Res<Tasks>,
-    mut slot: Local<Option<Task<u64>>>,
-    mut last_result: Local<Option<u64>>,
-    mut query: Query<&mut DsText, With<BgTaskHud>>,
-) {
-    if input.just_pressed(DsButton::Select) && slot.is_none() {
-        *slot = Some(tasks.spawn(|| {
-            let mut count: u64 = 0;
-            for _ in 0..120 {
-                bevy_nds::yield_until_vblank();
-                count += 1;
-            }
-            count
-        }));
-    }
-
-    if let Some(task) = slot.as_mut()
-        && let Some(n) = task.poll()
-    {
-        *last_result = Some(n);
-        *slot = None;
-    }
-
-    for mut text in &mut query {
-        text.0.clear();
-        if slot.is_some() {
-            let _ = write!(text.0, "task: running ...");
-        } else if let Some(n) = *last_result {
-            let _ = write!(text.0, "task: done ({n})  SELECT=run");
-        } else {
-            let _ = write!(text.0, "task: idle (SELECT to run)");
-        }
-    }
-}
-
-/// Refresh the HUD from `Time`, `Fps`, and the player's map cell.
-fn update_hud(
-    time: Res<Time>,
-    fps: Res<Fps>,
-    player: Query<&MapPos, With<Player>>,
-    mut query: Query<&mut DsText, With<Hud>>,
-) {
-    let secs = time.elapsed_secs() as u32;
-    let fps = fps.0;
-    let (pc, pr) = match player.iter().next() {
-        Some(p) => (p.col, p.row),
-        None => (0, 0),
-    };
-    for mut text in &mut query {
-        text.0.clear();
-        let _ = write!(text.0, "t={secs:>4}s fps={fps:>2.0} cell=({pc:>2},{pr:>2})");
+        let _ = write!(text.0, "fps={:>2.0} pos {:+.2},{:+.2}", fps.0, px, py);
     }
 }

@@ -718,6 +718,7 @@ dependencies = [
  "bevy_nds_3d",
  "bevy_nds_audio",
  "bevy_nds_bg",
+ "bevy_nds_math",
  "bevy_nds_sprite",
  "bevy_time",
  "obj2dl",
