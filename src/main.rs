@@ -44,6 +44,8 @@ use bevy_nds_math::stick::{StickConfig, smooth as vel_smooth, stick_vector};
 use bevy_nds_math::{Fx32, FxVec2};
 use bevy_nds_sprite::prelude::*;
 
+mod control;
+
 mod sprites {
     #![allow(dead_code)]
     include!(concat!(env!("OUT_DIR"), "/sprites.rs"));

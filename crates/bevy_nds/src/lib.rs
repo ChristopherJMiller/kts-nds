@@ -54,7 +54,7 @@ pub use bevy_nds_diagnostics::{DiagnosticsPlugin, Fps};
 pub use bevy_nds_gesture::{
     Gesture, GestureEvent, GesturePlugin, GestureRecognizer, Gestures, SwipeDir,
 };
-pub use bevy_nds_input::{DsButton, InputPlugin};
+pub use bevy_nds_input::{Cluster, DsButton, Handedness, InputPlugin, Shoulder};
 pub use bevy_nds_math::{Fx32, FxVec2, FxVec3};
 pub use bevy_nds_nitrofs::{NitroFs, NitroFsPlugin, flush_dcache, init_nitrofs, read_file};
 pub use bevy_nds_rtc::{RtcPlugin, WallClock};
@@ -88,9 +88,9 @@ impl PluginGroup for DsPlugins {
 /// Common imports for games built on `bevy_nds`.
 pub mod prelude {
     pub use crate::{
-        Backgrounds, DsButton, DsPlugins, DsScreen, DsText, Fps, Fx32, FxVec2, FxVec3, Gesture,
-        GestureEvent, Gestures, Glyph, NitroFs, SaveStorage, StorageStatus, SwipeDir, Task, Tasks,
-        TilePos, WallClock, run,
+        Backgrounds, Cluster, DsButton, DsPlugins, DsScreen, DsText, Fps, Fx32, FxVec2, FxVec3,
+        Gesture, GestureEvent, Gestures, Glyph, Handedness, NitroFs, SaveStorage, Shoulder,
+        StorageStatus, SwipeDir, Task, Tasks, TilePos, WallClock, run,
     };
     pub use bevy_input::ButtonInput;
     pub use bevy_input::touch::{TouchInput, TouchPhase, Touches};

@@ -75,6 +75,82 @@ pub enum DsButton {
     Right,
 }
 
+/// Which hand holds the stylus. The stylus is the precision instrument and
+/// always sits in the dominant hand (pillar 1); the **other** hand works the
+/// face cluster + a shoulder, so the cluster mirrors between the d-pad
+/// (right-handed) and the ABXY diamond (left-handed), and the two shoulders
+/// swap. See the control model in issue #17. Set this resource from the game's
+/// handedness setting; defaults to [`Handedness::Right`].
+#[derive(Resource, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Handedness {
+    /// Stylus in the right hand → the **left** hand works the d-pad cluster and
+    /// the L shoulder.
+    #[default]
+    Right,
+    /// Stylus in the left hand → the **right** hand works the ABXY cluster and
+    /// the R shoulder.
+    Left,
+}
+
+/// A logical direction on the four-button face *cluster* (the diamond), free of
+/// any specific physical button. Resolve it to a [`DsButton`] for the current
+/// [`Handedness`] with [`Cluster::button`]: right-handed it is the d-pad,
+/// left-handed it mirrors onto the ABXY diamond by position (Up↔X, Down↔B,
+/// Left↔Y, Right↔A). This is how a binding stays hand-agnostic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cluster {
+    Up,
+    Down,
+    Left,
+    Right,
+}
+
+/// One of the two shoulder buttons, named by *role* rather than side so it
+/// mirrors with handedness. [`Shoulder::Primary`] is the shoulder under the
+/// non-stylus hand (the capture-device / radial home — L when right-handed, R
+/// when left-handed); [`Shoulder::Secondary`] is the other (the reserve).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shoulder {
+    Primary,
+    Secondary,
+}
+
+impl Cluster {
+    /// The physical [`DsButton`] this cluster direction maps to for `handedness`.
+    pub fn button(self, handedness: Handedness) -> DsButton {
+        match handedness {
+            // Right-handed: the cluster is the d-pad.
+            Handedness::Right => match self {
+                Cluster::Up => DsButton::Up,
+                Cluster::Down => DsButton::Down,
+                Cluster::Left => DsButton::Left,
+                Cluster::Right => DsButton::Right,
+            },
+            // Left-handed: mirror onto the ABXY diamond by screen position
+            // (X top, B bottom, Y left, A right).
+            Handedness::Left => match self {
+                Cluster::Up => DsButton::X,
+                Cluster::Down => DsButton::B,
+                Cluster::Left => DsButton::Y,
+                Cluster::Right => DsButton::A,
+            },
+        }
+    }
+}
+
+impl Shoulder {
+    /// The physical [`DsButton`] this shoulder role maps to for `handedness`.
+    /// The non-stylus hand's shoulder is `Primary`, so the two swap L↔R.
+    pub fn button(self, handedness: Handedness) -> DsButton {
+        match (self, handedness) {
+            (Shoulder::Primary, Handedness::Right) => DsButton::L,
+            (Shoulder::Secondary, Handedness::Right) => DsButton::R,
+            (Shoulder::Primary, Handedness::Left) => DsButton::R,
+            (Shoulder::Secondary, Handedness::Left) => DsButton::L,
+        }
+    }
+}
+
 impl DsButton {
     /// Every button paired with its libnds key mask.
     const ALL: [(DsButton, u32); 12] = [
@@ -121,6 +197,7 @@ impl Plugin for InputPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<ButtonInput<DsButton>>()
             .init_resource::<Touches>()
+            .init_resource::<Handedness>()
             .add_event::<TouchInput>()
             // `scanKeys` (in `read_keys`) must latch the hardware before
             // `read_touch` inspects `KEY_TOUCH`, and our raw `TouchInput` events
@@ -212,6 +289,58 @@ mod tests {
             assert_eq!(mask & (mask - 1), 0, "mask must be a single bit");
             assert_eq!(seen & mask, 0, "masks must be disjoint");
             seen |= mask;
+        }
+    }
+
+    #[test]
+    fn handedness_defaults_to_right() {
+        assert_eq!(Handedness::default(), Handedness::Right);
+    }
+
+    #[test]
+    fn cluster_is_dpad_when_right_handed() {
+        let h = Handedness::Right;
+        assert_eq!(Cluster::Up.button(h), DsButton::Up);
+        assert_eq!(Cluster::Down.button(h), DsButton::Down);
+        assert_eq!(Cluster::Left.button(h), DsButton::Left);
+        assert_eq!(Cluster::Right.button(h), DsButton::Right);
+    }
+
+    #[test]
+    fn cluster_mirrors_to_abxy_diamond_when_left_handed() {
+        // By screen position: X top, B bottom, Y left, A right.
+        let h = Handedness::Left;
+        assert_eq!(Cluster::Up.button(h), DsButton::X);
+        assert_eq!(Cluster::Down.button(h), DsButton::B);
+        assert_eq!(Cluster::Left.button(h), DsButton::Y);
+        assert_eq!(Cluster::Right.button(h), DsButton::A);
+    }
+
+    #[test]
+    fn shoulders_swap_with_handedness() {
+        // Primary = non-stylus hand's shoulder.
+        assert_eq!(Shoulder::Primary.button(Handedness::Right), DsButton::L);
+        assert_eq!(Shoulder::Secondary.button(Handedness::Right), DsButton::R);
+        assert_eq!(Shoulder::Primary.button(Handedness::Left), DsButton::R);
+        assert_eq!(Shoulder::Secondary.button(Handedness::Left), DsButton::L);
+    }
+
+    #[test]
+    fn mirror_is_a_bijection_per_handedness() {
+        // The four cluster directions must map to four distinct buttons (no two
+        // logical directions collide) under each handedness.
+        for h in [Handedness::Right, Handedness::Left] {
+            let mapped = [
+                Cluster::Up.button(h),
+                Cluster::Down.button(h),
+                Cluster::Left.button(h),
+                Cluster::Right.button(h),
+            ];
+            for i in 0..4 {
+                for j in (i + 1)..4 {
+                    assert_ne!(mapped[i], mapped[j], "collision under {h:?}");
+                }
+            }
         }
     }
 
