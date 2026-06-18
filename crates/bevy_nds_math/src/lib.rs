@@ -75,6 +75,8 @@
 mod fx;
 mod fx_vec;
 pub mod hw;
+pub mod stick;
 
 pub use fx::{FRAC_BITS, Fx32, ONE_RAW};
 pub use fx_vec::{FxVec2, FxVec3};
+pub use stick::{StickConfig, stick_vector};

@@ -37,6 +37,13 @@ impl FxVec2 {
         Self { x, y }
     }
 
+    /// Convenience constructor from f32 components (compile-/startup-time only;
+    /// per-frame code should already be in `Fx32`).
+    #[inline]
+    pub fn from_f32(x: f32, y: f32) -> Self {
+        Self::new(Fx32::from_f32(x), Fx32::from_f32(y))
+    }
+
     #[inline]
     pub fn dot(self, rhs: Self) -> Fx32 {
         self.x * rhs.x + self.y * rhs.y
@@ -58,6 +65,25 @@ impl FxVec2 {
         // sqrt((x*2^12)^2 + (y*2^12)^2) = sqrt(x^2 + y^2) * 2^12, exactly the
         // 20.12 representation of the Euclidean length. No extra shifting.
         Fx32::from_raw(hw::sqrt_u64(self.length_sq_raw_u64()) as i32)
+    }
+
+    /// Unit vector. Hardware-accelerated: one sqrt + two divides on the math
+    /// coprocessor. Returns [`Self::ZERO`] when the input length is zero. See
+    /// [`FxVec3::normalize_or_zero`] for the 3D analogue.
+    #[inline]
+    pub fn normalize_or_zero(self) -> Self {
+        let len_raw = hw::sqrt_u64(self.length_sq_raw_u64()) as i32;
+        if len_raw == 0 {
+            return Self::ZERO;
+        }
+        // Each component c (20.12) normalized: c / length = (c << 12) / length_raw.
+        let n = |c: Fx32| -> Fx32 {
+            Fx32::from_raw(hw::div_64_32((c.raw() as i64) << FRAC_BITS, len_raw))
+        };
+        Self {
+            x: n(self.x),
+            y: n(self.y),
+        }
     }
 }
 

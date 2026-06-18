@@ -63,6 +63,7 @@ test *args:
         -p bevy_nds_sprite \
         -p bevy_nds_bg \
         -p bevy_nds_3d_cull \
+        -p bevy_nds_loop \
         -p wav2bank \
         -p bevy_nds_audio \
         -p bevy_nds_math \
@@ -99,7 +100,7 @@ rom profile="debug": (_build profile)
     [ -d build/nitrofs ] && nitrofs_args=(-d build/nitrofs)
     "$ndstool" -c "{{rom}}" -7 "$arm7" -9 "$elf" \
         "${nitrofs_args[@]}" \
-        -h 0x200 -g KTSE ME "Kill the Serpent"
+        -h 0x200 -g KTSE ME "Kill Serpent"
     echo "Wrote {{rom}} from $elf"
 
 # Build a ROM (debug by default) and run it in the melonDS emulator.

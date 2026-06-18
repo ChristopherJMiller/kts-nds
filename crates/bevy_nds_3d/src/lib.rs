@@ -400,6 +400,13 @@ impl Transform3d {
     }
 }
 
+/// Marker: skip drawing (and picking) this mesh entity. Insert to hide, remove
+/// to show — the analogue of Bevy's `Visibility::Hidden`, the cheap way to toggle
+/// a mesh off without despawning it or zeroing its scale (a scale-0 mesh still
+/// plots a degenerate point).
+#[derive(Component, Default, Clone, Copy)]
+pub struct Hidden;
+
 /// The (single) 3D camera. The DS has one projection matrix and the 3D core
 /// only drives one screen at a time, so this is a resource, not a component.
 #[derive(Resource, Clone, Copy)]
@@ -552,7 +559,7 @@ fn mesh_visible(
 fn render_3d(
     camera: Res<Camera3d>,
     lights: Res<DsLights>,
-    meshes: Query<(&Transform3d, &DsMesh, Option<&DsMaterial>)>,
+    meshes: Query<(&Transform3d, &DsMesh, Option<&DsMaterial>), Without<Hidden>>,
 ) {
     let aspect = to_fix(256.0 / 192.0);
     let fovy = rad_to_angle(camera.fov_degrees * (TAU / 360.0));
@@ -707,7 +714,7 @@ fn pick_3d(
     camera: Res<Camera3d>,
     touches: Res<Touches>,
     mut pick: ResMut<TouchPick>,
-    meshes: Query<(Entity, &Transform3d, &DsMesh)>,
+    meshes: Query<(Entity, &Transform3d, &DsMesh), Without<Hidden>>,
 ) {
     // Nothing under the pen if the pen is up.
     let Some(touch) = touches.iter().next() else {
@@ -838,7 +845,7 @@ impl Plugin for Ds3dPlugin {
 pub mod prelude {
     pub use crate::{
         BakedMesh, Camera3d, DirectionalLight, Display3d, Ds3dPlugin, DsLights, DsMaterial, DsMesh,
-        TouchPick, Transform3d, Vertex,
+        Hidden, TouchPick, Transform3d, Vertex,
     };
     pub use bevy_math::Vec3;
     pub use bevy_nds_3d_macros::include_obj;
