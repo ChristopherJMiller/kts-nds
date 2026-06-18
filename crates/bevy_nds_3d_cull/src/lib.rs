@@ -20,6 +20,8 @@
 
 #![no_std]
 
+use bevy_nds_math::{Fx32, FxVec3};
+
 /// A clip plane `n·p + d ≥ 0` for points inside the frustum. Normals point
 /// **inward**. Not normalised — fine for half-space containment tests.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -109,6 +111,12 @@ impl Frustum {
 /// (Euler X, then Y, then Z) → scale transform, returning the enclosing world
 /// AABB.
 ///
+/// `sincos[i]` is the `(sin, cos)` of the Euler rotation about axis `i`
+/// (`0 = X`, `1 = Y`, `2 = Z`). Taking the trig as input (rather than computing
+/// it from radians here) keeps this crate FFI-free while letting the caller
+/// source sin/cos from the DS hardware trig LUT — the per-object soft-float
+/// `sin`/`cos` were a hot-path cost (see issue #34).
+///
 /// The rotation order matches the hardware matrix stack in `bevy_nds_3d`'s
 /// renderer (successive `glRotate` X, Y, Z calls post-multiply, so a vertex is
 /// effectively `T · Rx · Ry · Rz · S · v`). Because rotation tilts the box, all
@@ -117,21 +125,12 @@ pub fn world_aabb(
     local_min: [f32; 3],
     local_max: [f32; 3],
     translation: [f32; 3],
-    rotation_radians: [f32; 3],
+    sincos: [(f32, f32); 3],
     scale: [f32; 3],
 ) -> ([f32; 3], [f32; 3]) {
-    let (sx, cx) = (
-        libm::sinf(rotation_radians[0]),
-        libm::cosf(rotation_radians[0]),
-    );
-    let (sy, cy) = (
-        libm::sinf(rotation_radians[1]),
-        libm::cosf(rotation_radians[1]),
-    );
-    let (sz, cz) = (
-        libm::sinf(rotation_radians[2]),
-        libm::cosf(rotation_radians[2]),
-    );
+    let (sx, cx) = sincos[0];
+    let (sy, cy) = sincos[1];
+    let (sz, cz) = sincos[2];
 
     let mut min = [f32::INFINITY; 3];
     let mut max = [f32::NEG_INFINITY; 3];
@@ -173,6 +172,75 @@ pub fn world_aabb(
             }
             if w[axis] > max[axis] {
                 max[axis] = w[axis];
+            }
+        }
+    }
+    (min, max)
+}
+
+/// 20.12 fixed-point twin of [`world_aabb`], for the per-frame hot path.
+///
+/// Same transform (`T · Rx · Ry · Rz · S`, vertex rotated Z→Y→X) and the same
+/// 8-corner rebounding, but entirely in [`Fx32`] — so a moving mesh's cull AABB
+/// no longer pays ~72 software `f32` multiplies per frame on the FPU-less ARM9
+/// (issue #34). `sincos[i]` is `(sin, cos)` of the Euler angle about axis `i`.
+/// The caller already holds `translation`/`scale`/`sincos` in fixed-point from
+/// composing the model matrix, so this reuses them with no extra conversion.
+pub fn world_aabb_fx(
+    local_min: [Fx32; 3],
+    local_max: [Fx32; 3],
+    translation: FxVec3,
+    sincos: [(Fx32, Fx32); 3],
+    scale: FxVec3,
+) -> ([Fx32; 3], [Fx32; 3]) {
+    let (sx, cx) = sincos[0];
+    let (sy, cy) = sincos[1];
+    let (sz, cz) = sincos[2];
+    let scale = [scale.x, scale.y, scale.z];
+    let translation = [translation.x, translation.y, translation.z];
+
+    let mut min = [Fx32::ZERO; 3];
+    let mut max = [Fx32::ZERO; 3];
+
+    for i in 0..8 {
+        let c = [
+            if i & 1 == 0 {
+                local_min[0]
+            } else {
+                local_max[0]
+            },
+            if i & 2 == 0 {
+                local_min[1]
+            } else {
+                local_max[1]
+            },
+            if i & 4 == 0 {
+                local_min[2]
+            } else {
+                local_max[2]
+            },
+        ];
+        // Scale → rotate Z, then Y, then X → translate (same order as world_aabb).
+        let s = [c[0] * scale[0], c[1] * scale[1], c[2] * scale[2]];
+        let rz = [s[0] * cz - s[1] * sz, s[0] * sz + s[1] * cz, s[2]];
+        let ry = [rz[0] * cy + rz[2] * sy, rz[1], -(rz[0] * sy) + rz[2] * cy];
+        let rx = [ry[0], ry[1] * cx - ry[2] * sx, ry[1] * sx + ry[2] * cx];
+        let w = [
+            rx[0] + translation[0],
+            rx[1] + translation[1],
+            rx[2] + translation[2],
+        ];
+        if i == 0 {
+            min = w;
+            max = w;
+        } else {
+            for axis in 0..3 {
+                if w[axis] < min[axis] {
+                    min[axis] = w[axis];
+                }
+                if w[axis] > max[axis] {
+                    max[axis] = w[axis];
+                }
             }
         }
     }
@@ -222,13 +290,34 @@ mod tests {
         assert!(f.contains_aabb([-0.5, -0.5, -5.0], [0.5, 0.5, 5.0]));
     }
 
+    /// `(sin, cos)` triples for a no-rotation transform.
+    const NO_ROT: [(f32, f32); 3] = [(0.0, 1.0); 3];
+
+    /// `(sin, cos)` of an Euler angle triple (radians), test-side trig.
+    fn sincos(rotation_radians: [f32; 3]) -> [(f32, f32); 3] {
+        [
+            (
+                libm::sinf(rotation_radians[0]),
+                libm::cosf(rotation_radians[0]),
+            ),
+            (
+                libm::sinf(rotation_radians[1]),
+                libm::cosf(rotation_radians[1]),
+            ),
+            (
+                libm::sinf(rotation_radians[2]),
+                libm::cosf(rotation_radians[2]),
+            ),
+        ]
+    }
+
     #[test]
     fn world_aabb_translates() {
         let (min, max) = world_aabb(
             [-1.0, -1.0, -1.0],
             [1.0, 1.0, 1.0],
             [10.0, 0.0, -5.0],
-            [0.0, 0.0, 0.0],
+            NO_ROT,
             [1.0, 1.0, 1.0],
         );
         assert_eq!(min, [9.0, -1.0, -6.0]);
@@ -241,7 +330,7 @@ mod tests {
             [-1.0, -1.0, -1.0],
             [1.0, 1.0, 1.0],
             [0.0, 0.0, 0.0],
-            [0.0, 0.0, 0.0],
+            NO_ROT,
             [2.0, 3.0, 4.0],
         );
         assert_eq!(min, [-2.0, -3.0, -4.0]);
@@ -255,7 +344,7 @@ mod tests {
             [-2.0, -0.5, -0.5],
             [2.0, 0.5, 0.5],
             [0.0, 0.0, 0.0],
-            [0.0, 0.0, core::f32::consts::FRAC_PI_2],
+            sincos([0.0, 0.0, core::f32::consts::FRAC_PI_2]),
             [1.0, 1.0, 1.0],
         );
         // X extent shrinks to ~0.5, Y extent grows to ~2.0.
@@ -263,5 +352,54 @@ mod tests {
         assert!((max[1] - 2.0).abs() < 1e-4, "max.y = {}", max[1]);
         assert!((min[0] + 0.5).abs() < 1e-4);
         assert!((min[1] + 2.0).abs() < 1e-4);
+    }
+
+    /// The fixed-point twin must track the f32 reference within 20.12 resolution
+    /// across a representative translate/rotate/scale.
+    #[test]
+    fn world_aabb_fx_matches_f32() {
+        let lmin = [-1.0f32, -0.5, -0.25];
+        let lmax = [1.0f32, 0.5, 0.25];
+        let translation = [2.0f32, -1.0, 0.5];
+        let scale = [0.16f32, 0.16, 0.16];
+        let angles = [0.4f32, 1.1, -0.7];
+        let sc = sincos(angles);
+
+        let (fmin, fmax) = world_aabb(lmin, lmax, translation, sc, scale);
+
+        let to_fx3 = |a: [f32; 3]| {
+            [
+                Fx32::from_f32(a[0]),
+                Fx32::from_f32(a[1]),
+                Fx32::from_f32(a[2]),
+            ]
+        };
+        let sc_fx = [
+            (Fx32::from_f32(sc[0].0), Fx32::from_f32(sc[0].1)),
+            (Fx32::from_f32(sc[1].0), Fx32::from_f32(sc[1].1)),
+            (Fx32::from_f32(sc[2].0), Fx32::from_f32(sc[2].1)),
+        ];
+        let (xmin, xmax) = world_aabb_fx(
+            to_fx3(lmin),
+            to_fx3(lmax),
+            FxVec3::from_f32(translation[0], translation[1], translation[2]),
+            sc_fx,
+            FxVec3::from_f32(scale[0], scale[1], scale[2]),
+        );
+
+        for axis in 0..3 {
+            assert!(
+                (xmin[axis].to_f32() - fmin[axis]).abs() < 2e-3,
+                "min[{axis}]: fx {} vs f32 {}",
+                xmin[axis].to_f32(),
+                fmin[axis]
+            );
+            assert!(
+                (xmax[axis].to_f32() - fmax[axis]).abs() < 2e-3,
+                "max[{axis}]: fx {} vs f32 {}",
+                xmax[axis].to_f32(),
+                fmax[axis]
+            );
+        }
     }
 }

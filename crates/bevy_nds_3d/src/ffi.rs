@@ -175,6 +175,13 @@ unsafe extern "C" {
     /// everything not under the cursor. See `<nds/arm9/videoGL.h>`.
     pub fn gluPickMatrix(x: c_int, y: c_int, width: c_int, height: c_int, viewport: *const c_int);
 
+    /// Hardware trig LUT (`<nds/arm9/trig_lut.h>`). `angle` is in DS angle units
+    /// (`DEGREES_IN_CIRCLE = 1 << 15 = 32768` per full circle); the result is
+    /// 20.12 fixed-point (`4096 = 1.0`). A table lookup + lerp — vastly cheaper
+    /// than the software `sinf`/`cosf` that capped scene density (issue #34).
+    pub fn sinLerp(angle: i16) -> i16;
+    pub fn cosLerp(angle: i16) -> i16;
+
 }
 
 /// Safe-to-call (still `unsafe`: they touch MMIO) reimplementations of the

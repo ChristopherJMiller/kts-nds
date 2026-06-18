@@ -10,5 +10,10 @@ description = "Pure view-frustum culling math for bevy_nds_3d (host-testable, no
 # whose world AABB lies entirely outside the camera frustum before drawing them.
 
 [dependencies]
-# Trig for the Euler-rotation AABB transform; pure Rust, works on host and DS.
+# Trig for the frustum's `tanf` (built once per frame from the camera). The
+# per-object Euler-rotation sin/cos was removed from `world_aabb` — the caller
+# now supplies it from the DS hardware trig LUT (see issue #34).
 libm = "0.2"
+# 20.12 fixed-point for the per-object hot-path AABB transform (`world_aabb_fx`),
+# so culling no longer pays soft-float on every moving mesh. Pure + host-tested.
+bevy_nds_math = { path = "../bevy_nds_math" }

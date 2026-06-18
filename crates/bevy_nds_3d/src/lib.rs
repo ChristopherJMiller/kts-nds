@@ -42,8 +42,9 @@ use core::f32::consts::TAU;
 use bevy_app::prelude::*;
 use bevy_ecs::prelude::*;
 use bevy_input::touch::Touches;
-use bevy_math::{Mat4, Vec3};
-use bevy_nds_3d_cull::{Frustum, world_aabb};
+use bevy_math::Vec3;
+use bevy_nds_3d_cull::{Frustum, world_aabb_fx};
+use bevy_nds_math::{Fx32, FxVec3};
 use bevy_nds_video::DsScreen;
 
 mod ffi;
@@ -70,17 +71,18 @@ fn rad_to_angle(rad: f32) -> i32 {
     (rad * (ANGLE_FULL_CIRCLE / TAU)) as i32
 }
 
-/// Compose an object's model matrix on the CPU (`T · Rx · Ry · Rz · S`, matching
-/// the order the Geometry Engine would apply the individual ops) and convert it
-/// to a column-major 20.12 fixed-point 4x4 for `MTX_MULT_4x4`. Sending one
-/// matrix replaces five separate GE matrix commands per object.
-fn model_matrix(transform: &Transform3d) -> [i32; 16] {
-    let m = Mat4::from_translation(transform.translation)
-        * Mat4::from_rotation_x(transform.rotation.x)
-        * Mat4::from_rotation_y(transform.rotation.y)
-        * Mat4::from_rotation_z(transform.rotation.z)
-        * Mat4::from_scale(transform.scale);
-    m.to_cols_array().map(to_fix)
+/// `(sin, cos)` of a radian angle via the DS **hardware trig LUT**
+/// (`sinLerp`/`cosLerp`), as 20.12 [`Fx32`]. This is the cheap replacement for
+/// the soft-float `sin`/`cos` that `model_matrix` and `world_aabb` used to pay
+/// per object per frame (issue #34): a table lookup instead of hundreds of
+/// emulated-float cycles. The angle is reduced into one circle (`[0, 32768)`)
+/// so it fits the `i16` the LUT takes, regardless of how many turns it carries.
+fn sin_cos_fx(rad: f32) -> (Fx32, Fx32) {
+    let angle = rad_to_angle(rad).rem_euclid(ANGLE_FULL_CIRCLE as i32) as i16;
+    // sinLerp/cosLerp return Q12 (4096 = 1.0), i.e. a raw 20.12 value.
+    let s = unsafe { ffi::sinLerp(angle) } as i32;
+    let c = unsafe { ffi::cosLerp(angle) } as i32;
+    (Fx32::from_raw(s), Fx32::from_raw(c))
 }
 
 /// A single coloured vertex in model space. Colour channels are 0-255 (the DS
@@ -135,6 +137,63 @@ pub struct BakedMesh {
     pub aabb: [Vec3; 2],
 }
 
+/// Per-object render data derived from a [`Transform3d`] (+ the mesh's local
+/// AABB), cached so it is recomputed **only when the transform or mesh changes**
+/// — not every frame. Composing the model matrix used to cost ~2 ms/object of
+/// soft-float trig every frame, which capped scenes at a handful of meshes
+/// (issue #34); static geometry now composes once and dynamic objects use the
+/// cheap hardware-LUT path ([`sin_cos_fx`]).
+///
+/// A **required component** of [`DsMesh`], so every mesh entity has one
+/// automatically. [`recompute_mesh_draw`] keeps it current; [`render_3d`] and
+/// [`pick_3d`] read it. Fields are crate-private (an implementation detail).
+#[derive(Component, Clone, Copy)]
+pub struct MeshDraw {
+    /// Composed column-major 20.12 model matrix (`T · Rx · Ry · Rz · S`), fed to
+    /// `MTX_MULT_4x4` each frame.
+    model: [i32; 16],
+    /// Cached world-space AABB (`[min, max]`) for frustum culling. Only
+    /// meaningful when `has_bounds` is set.
+    world_min: [f32; 3],
+    world_max: [f32; 3],
+    /// Whether the mesh carried a baked AABB (so culling can use `world_*`).
+    /// Hand-authored meshes without bounds always draw, as before.
+    has_bounds: bool,
+}
+
+impl Default for MeshDraw {
+    fn default() -> Self {
+        // Identity matrix; recomputed before the first draw (a freshly added
+        // Transform3d reads as `is_changed`).
+        Self {
+            model: [
+                ONE_RAW_I32,
+                0,
+                0,
+                0, //
+                0,
+                ONE_RAW_I32,
+                0,
+                0, //
+                0,
+                0,
+                ONE_RAW_I32,
+                0, //
+                0,
+                0,
+                0,
+                ONE_RAW_I32,
+            ],
+            world_min: [0.0; 3],
+            world_max: [0.0; 3],
+            has_bounds: false,
+        }
+    }
+}
+
+/// Raw 20.12 value of `1.0` (`1 << 12`), for the identity [`MeshDraw`] default.
+const ONE_RAW_I32: i32 = 1 << 12;
+
 /// A drawable mesh: a flat list of triangles. Small by design — the DS has a
 /// hard per-frame budget of a couple thousand polygons.
 ///
@@ -146,6 +205,7 @@ pub struct BakedMesh {
 /// fast lit render path; `tris` is then left empty (the geometry lives in the
 /// baked words). This is what `include_obj!` emits.
 #[derive(Component, Clone, Default)]
+#[require(MeshDraw)]
 pub struct DsMesh {
     pub tris: Cow<'static, [[Vertex; 3]]>,
     /// When set, the mesh is drawn with the DS hardware lighting pipeline
@@ -526,29 +586,79 @@ fn init_3d() {
     }
 }
 
-/// True if `mesh`'s world bounds intersect the camera frustum (so it should be
-/// drawn). Transforms the mesh's local AABB by its [`Transform3d`] and tests it
-/// in camera-relative space. The pure maths lives in [`bevy_nds_3d_cull`].
-fn mesh_visible(
-    frustum: &Frustum,
-    camera: &Camera3d,
-    transform: &Transform3d,
-    baked: &BakedMesh,
-) -> bool {
-    let [lmin, lmax] = baked.aabb;
-    let (wmin, wmax) = world_aabb(
-        lmin.to_array(),
-        lmax.to_array(),
-        transform.translation.to_array(),
-        transform.rotation.to_array(),
-        transform.scale.to_array(),
-    );
+/// True if a mesh's **cached** world bounds intersect the camera frustum (so it
+/// should be drawn). The world AABB was composed once by [`recompute_mesh_draw`]
+/// (the expensive trig is off the per-frame path); here we only shift it into
+/// camera-relative space and run the cheap plane test ([`bevy_nds_3d_cull`]).
+fn aabb_visible(frustum: &Frustum, camera: &Camera3d, draw: &MeshDraw) -> bool {
     // The view matrix is a pure translation by -camera.position, so shift the
     // world AABB into the camera-relative space the frustum is built in.
     let cam = camera.position.to_array();
-    let rel_min = [wmin[0] - cam[0], wmin[1] - cam[1], wmin[2] - cam[2]];
-    let rel_max = [wmax[0] - cam[0], wmax[1] - cam[1], wmax[2] - cam[2]];
+    let rel_min = [
+        draw.world_min[0] - cam[0],
+        draw.world_min[1] - cam[1],
+        draw.world_min[2] - cam[2],
+    ];
+    let rel_max = [
+        draw.world_max[0] - cam[0],
+        draw.world_max[1] - cam[1],
+        draw.world_max[2] - cam[2],
+    ];
     frustum.contains_aabb(rel_min, rel_max)
+}
+
+/// Recompute each mesh's cached [`MeshDraw`] (model matrix + world AABB) — but
+/// **only** for entities whose [`Transform3d`] or [`DsMesh`] changed since last
+/// frame. Static geometry composes once; moving objects use the hardware trig
+/// LUT ([`sin_cos_fx`]). This is the fix for the per-object compose cost in
+/// issue #34. Runs in [`Last`], before [`render_3d`].
+fn recompute_mesh_draw(mut meshes: Query<(Ref<Transform3d>, Ref<DsMesh>, &mut MeshDraw)>) {
+    for (transform, mesh, mut draw) in &mut meshes {
+        // `Added` reads as changed, so newly spawned entities compose here too.
+        if !transform.is_changed() && !mesh.is_changed() {
+            continue;
+        }
+
+        let sincos = [
+            sin_cos_fx(transform.rotation.x),
+            sin_cos_fx(transform.rotation.y),
+            sin_cos_fx(transform.rotation.z),
+        ];
+        let translation = FxVec3::from_f32(
+            transform.translation.x,
+            transform.translation.y,
+            transform.translation.z,
+        );
+        let scale = FxVec3::from_f32(transform.scale.x, transform.scale.y, transform.scale.z);
+
+        draw.model = bevy_nds_math::model_matrix(translation, sincos, scale);
+
+        if let Some(baked) = &mesh.baked {
+            let [lmin, lmax] = baked.aabb;
+            // All fixed-point: reuses the LUT sin/cos + the same translation/scale
+            // the matrix used, so culling adds no soft-float on a moving mesh (#34).
+            let (wmin, wmax) = world_aabb_fx(
+                [
+                    Fx32::from_f32(lmin.x),
+                    Fx32::from_f32(lmin.y),
+                    Fx32::from_f32(lmin.z),
+                ],
+                [
+                    Fx32::from_f32(lmax.x),
+                    Fx32::from_f32(lmax.y),
+                    Fx32::from_f32(lmax.z),
+                ],
+                translation,
+                sincos,
+                scale,
+            );
+            draw.world_min = [wmin[0].to_f32(), wmin[1].to_f32(), wmin[2].to_f32()];
+            draw.world_max = [wmax[0].to_f32(), wmax[1].to_f32(), wmax[2].to_f32()];
+            draw.has_bounds = true;
+        } else {
+            draw.has_bounds = false;
+        }
+    }
 }
 
 /// Submit every [`DsMesh`] to the 3D hardware each frame, transformed by its
@@ -559,7 +669,7 @@ fn mesh_visible(
 fn render_3d(
     camera: Res<Camera3d>,
     lights: Res<DsLights>,
-    meshes: Query<(&Transform3d, &DsMesh, Option<&DsMaterial>), Without<Hidden>>,
+    meshes: Query<(&MeshDraw, &DsMesh, Option<&DsMaterial>), Without<Hidden>>,
 ) {
     let aspect = to_fix(256.0 / 192.0);
     let fovy = rad_to_angle(camera.fov_degrees * (TAU / 360.0));
@@ -617,17 +727,15 @@ fn render_3d(
             }
         }
 
-        for (transform, mesh, mat) in &meshes {
+        for (draw, mesh, mat) in &meshes {
             // Cull meshes with known bounds (the baked / loaded models) that are
             // fully off-screen. Hand-authored meshes without an AABB always draw.
-            if let Some(baked) = &mesh.baked
-                && !mesh_visible(&frustum, &camera, transform, baked)
-            {
+            if draw.has_bounds && !aabb_visible(&frustum, &camera, draw) {
                 continue;
             }
 
             gl::push_matrix();
-            gl::mult_matrix_4x4(&model_matrix(transform));
+            gl::mult_matrix_4x4(&draw.model);
 
             if mesh.lit {
                 let m = mat.copied().unwrap_or_default();
@@ -714,7 +822,7 @@ fn pick_3d(
     camera: Res<Camera3d>,
     touches: Res<Touches>,
     mut pick: ResMut<TouchPick>,
-    meshes: Query<(Entity, &Transform3d, &DsMesh), Without<Hidden>>,
+    meshes: Query<(Entity, &MeshDraw, &DsMesh), Without<Hidden>>,
 ) {
     // Nothing under the pen if the pen is up.
     let Some(touch) = touches.iter().next() else {
@@ -763,15 +871,13 @@ fn pick_3d(
         // Count every polygon under the pen regardless of facing.
         gl::poly_fmt(ffi::poly_alpha(31) | ffi::POLY_CULL_NONE);
 
-        for (entity, transform, mesh) in &meshes {
-            if let Some(baked) = &mesh.baked
-                && !mesh_visible(&frustum, &camera, transform, baked)
-            {
+        for (entity, draw, mesh) in &meshes {
+            if draw.has_bounds && !aabb_visible(&frustum, &camera, draw) {
                 continue;
             }
 
             gl::push_matrix();
-            gl::mult_matrix_4x4(&model_matrix(transform));
+            gl::mult_matrix_4x4(&draw.model);
 
             // Begin checking this object: wait for the previous test/draw to
             // finish, test the object's origin, and snapshot the polygon count.
@@ -837,7 +943,17 @@ impl Plugin for Ds3dPlugin {
             .init_resource::<DsLights>()
             .init_resource::<TouchPick>()
             .add_systems(Startup, init_3d)
-            .add_systems(Last, (apply_display, render_3d, pick_3d, flush_3d).chain());
+            .add_systems(
+                Last,
+                (
+                    apply_display,
+                    recompute_mesh_draw,
+                    render_3d,
+                    pick_3d,
+                    flush_3d,
+                )
+                    .chain(),
+            );
     }
 }
 

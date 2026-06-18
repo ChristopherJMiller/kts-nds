@@ -19,3 +19,8 @@ description = "Fixed-point math and hardware divide/sqrt helpers for bevy_nds (n
 # compiles on the DS target and runs unchanged under the host test harness.
 
 [dependencies]
+
+[dev-dependencies]
+# Host-only software trig, used solely to feed reference sin/cos into the
+# `mat` module's tests (the crate itself takes sin/cos as input — see `mat`).
+libm = "0.2"
