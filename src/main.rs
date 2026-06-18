@@ -1,23 +1,31 @@
-//! **Spike B — loop-draw capture + enclosure detection** (Milestone 1, issue #19).
+//! **Spike C — the fuse: dual-screen capture mode** (Milestone 1, issue #20).
 //!
-//! A throwaway feel-spike, not production code. It proves the core capture verb
-//! in isolation (no 3D, no dodging): **does loop-drawing read clearly and feel
-//! satisfying** at 60 Hz touch sampling? You drag the stylus into a loop around
-//! the enemy "blips" on the bottom screen; whatever the loop encloses takes a
-//! capture hit, and two hits captures it.
+//! A throwaway feel-spike, not production code. It fuses Spike A (stylus
+//! locomotion) and Spike B (loop-draw capture) into the real dual-screen loop
+//! and answers **OQ-2**: is two-screen split attention fun or overwhelming
+//! (the TWEWY question), and is cluster-dodge-while-drawing mobile enough to not
+//! be a sitting duck?
 //!
-//! The feel-critical geometry — path smoothing, self-intersection loop closure,
-//! point-in-polygon enclosure — is the pure, host-tested [`bevy_nds_loop`] crate
-//! (the keeper that grows into epic #22). This file is the ROM-side harness: it
-//! captures the touch path, feeds the crate, and visualizes the stroke (a trail
-//! of dot sprites) and the blips (sprites that change as they're captured).
+//! **Phase 1** (this build) is the MVP fuse — deploy, dodge-while-draw, capture
+//! — with **simplified stand-ins** for the locked-but-unbuilt systems: deploy is
+//! a shoulder *toggle* (no radial-wheel UI — that's epic #25), dodge is d-pad
+//! steps + a roll. Phase 2 layers the crutches (tap-retract, hit-knocks-device-
+//! offline).
 //!
-//! Layout: the bottom LCD is the touch/draw surface — sprites (blips + the
-//! drawn trail) on the sub engine, over a black canvas. The top LCD is a text
-//! HUD. No 3D core this time, so there's no engine-swap dance.
+//! Layout:
+//! - **Top LCD (3D):** the arena. Avatar (teapot) + one circle-vulnerable enemy
+//!   (cube) on a waypoint patrol + landmark cubes you collide with. Position-only
+//!   follow camera. When deployed, a bright **cursor** shows the stylus position
+//!   in world space — the pen, made visible in 3D.
+//! - **Bottom LCD:** *stowed* → the stylus is a virtual-stick (Spike A) moving
+//!   the avatar. *Deployed* (tap **L/R** to toggle) → a top-down **tactical
+//!   map**: avatar (blue) + enemy (red) plotted at their world positions; the
+//!   stylus draws a loop (Spike B) to enclose the enemy while the **d-pad
+//!   dodges** (B = roll).
 //!
-//! Controls: **drag** on the bottom screen to draw a loop. **START** resets the
-//! blips for another pass.
+//! Capture: each loop that encloses the enemy on the map adds progress; two
+//! captures it (it vanishes). Enemy contact while deployed costs progress (the
+//! pressure) — unless you're mid-roll (i-frames). **START** re-arms the enemy.
 
 #![no_std]
 #![no_main]
@@ -30,103 +38,186 @@ use core::fmt::Write;
 use bevy_app::prelude::*;
 use bevy_ecs::prelude::*;
 use bevy_nds::prelude::*;
-use bevy_nds_loop::{densify, enclosed, find_closed_loop_within, smooth};
+use bevy_nds_3d::prelude::*;
+use bevy_nds_loop::{densify, enclosed, find_closed_loop_within, smooth as path_smooth};
+use bevy_nds_math::stick::{StickConfig, smooth as vel_smooth, stick_vector};
 use bevy_nds_math::{Fx32, FxVec2};
 use bevy_nds_sprite::prelude::*;
 
-/// NitroFS paths for baked sprites (`sprites::BLIP`, `sprites::BLIP_HIT`,
-/// `sprites::DOT`), generated at build time by `png2sprite`.
 mod sprites {
     #![allow(dead_code)]
     include!(concat!(env!("OUT_DIR"), "/sprites.rs"));
 }
 
-// --- Tunables ----------------------------------------------------------------
+// --- Arena / camera ----------------------------------------------------------
 
-/// Minimum stylus travel (px) between captured path points — resamples the raw
-/// ~60 Hz stream down to an even, jitter-tolerant polyline. Kept below the 8 px
-/// dot size so the trail reads as a continuous line, not a dotted one.
+const ARENA_HALF: f32 = 2.0;
+/// Fixed camera height above the z=0 plane. Chosen so the whole ±ARENA_HALF
+/// arena fits on screen, so the 3D top and the tactical-map bottom share **one
+/// world frame** (camera at the world origin, no follow) — circling the enemy on
+/// the map then lines up with circling it on top. (A perspective camera over a
+/// flat z=0 plane is already effectively orthographic: uniform depth → linear.)
+const CAM_Z: f32 = 3.2;
+const TILT_X: f32 = -1.0;
+const AVATAR_SCALE: f32 = 0.11;
+const ENEMY_SCALE: f32 = 0.16;
+const LANDMARK_SCALE: f32 = 0.16;
+const CURSOR_SCALE: f32 = 0.12;
+
+/// Static landmark cubes (world XY) — spatial reference *and* obstacles. Kept to
+/// three so the scene stays at 6 meshes (avatar + enemy + cursor + 3) for 60 fps
+/// (per-object render cost, #34).
+const LANDMARKS: [(f32, f32); 2] = [(-1.25, 0.95), (1.25, -0.95)];
+/// Avatar↔landmark separation enforced by collision (radii summed).
+const LANDMARK_COLLIDE: f32 = 0.26;
+
+// --- Stowed locomotion (Spike A defaults, locked 2026-06-14) -----------------
+
+const STOW_DEADZONE: f32 = 8.0;
+const STOW_MAX_RADIUS: f32 = 70.0;
+const STOW_SPEED: f32 = 1.6;
+const STOW_SMOOTH: f32 = 0.5;
+
+// --- Deployed dodge (one-handed: all on the d-pad, stylus is the other hand) --
+
+/// Deployed steady movement is a quarter of stowed speed — the pen is out, so
+/// you're slow; the roll is the only fast move (the evasive burst).
+const DODGE_SPEED: f32 = STOW_SPEED * 0.25;
+const ROLL_SPEED: f32 = 3.8; // dash speed; × ROLL_FRAMES sets the dodge distance
+const ROLL_FRAMES: u8 = 10; // duration + i-frame window
+/// Double-tap window (frames) for a d-pad direction to trigger a roll.
+const DOUBLE_TAP_WINDOW: u8 = 12;
+
+// --- Enemy + projectile ------------------------------------------------------
+
+const ENEMY_SPEED: f32 = 0.8;
+const ENEMY_WAYPOINTS: [(f32, f32); 4] = [(-1.4, 0.0), (0.0, 1.4), (1.4, 0.0), (0.0, -1.4)];
+/// The enemy pauses at each waypoint (stop-and-go), opening capture windows.
+const ENEMY_PAUSE: u8 = 45; // frames (~0.75 s)
+const CONTACT_DIST: f32 = 0.28;
+const CONTACT_LOSS: f32 = 0.34; // progress lost per body contact
+const CONTACT_COOLDOWN: u8 = 30; // frames between body hits
+/// The enemy lobs a projectile at the avatar while deployed — the real dodge
+/// threat. Roll (i-frames) or move out of the way.
+const PROJ_SPEED: f32 = 1.7;
+const PROJ_SCALE: f32 = 0.07;
+const FIRE_INTERVAL: u8 = 80; // frames between shots
+const PROJ_HIT_DIST: f32 = 0.18;
+const PROJ_LOSS: f32 = 0.34; // progress lost per projectile hit
+const PROJ_DESPAWN: f32 = ARENA_HALF + 0.4; // out-of-bounds cutoff
+
+// --- Capture -----------------------------------------------------------------
+
+const CAPTURE_PER_LOOP: f32 = 0.5; // 2 enclosing loops -> captured
+
+// --- Tactical map ------------------------------------------------------------
+
+// The tactical map mirrors the top camera's view so the two screens correlate:
+// scale = (screen_half_height) / (camera visible half-height at z=0)
+//       = 96 / (CAM_Z * tan(fov/2)) = 96 / (3.2 * tan(35°)) ≈ 42.8 px/world-unit.
+// Same aspect (256/192) as the camera, so one uniform scale fits both axes.
+const MAP_SCALE: f32 = 42.8;
+const MAP_CX: f32 = 128.0;
+const MAP_CY: f32 = 96.0;
+const PARK_Y: i16 = 200; // off-screen park for hidden sprites
+
+// --- Loop draw (Spike B) -----------------------------------------------------
+
 const MIN_SPACING: f32 = 4.0;
-/// Max control points retained in the live stroke (oldest dropped). Bounds the
-/// per-frame closure scan; a 4 px-spaced stroke of this many covers ~400 px.
-const MAX_POINTS: usize = 100;
-/// Sprites in the trail pool (≤ 128 OAM minus the blips). The trail is
-/// `densify`-resampled to this many points, so it reads as a continuous line.
-const DOT_POOL: usize = 110;
-/// Spacing (px) between rendered trail dots after densify (≤ 8 px dot size so
-/// they overlap into a line).
+const MAX_POINTS: usize = 80;
+const DOT_POOL: usize = 90;
 const TRAIL_STEP: f32 = 4.0;
-/// Default loop-closure proximity tolerance (px). 0 = exact self-crossing only;
-/// higher = laxer (the stroke closes when it returns *near* its trail). Live-
-/// tunable with L/R. Feel pass (2026-06-14) landed on 2: exact crossing plus a
-/// small near-miss grace.
-const DEFAULT_CLOSE_TOL: f32 = 2.0;
-/// Enclosures needed to fully capture a blip (so progress visibly accrues).
-const CAPTURE_HITS: u8 = 2;
+const CLOSE_TOL: f32 = 2.0;
 
-/// Enemy blip centres on the bottom screen (256×192 px). Clustered so several
-/// can be caught in one loop, plus loners for single captures.
-const BLIPS: [(i16, i16); 6] = [
-    (104, 64),
-    (128, 56),
-    (118, 86),
-    (196, 120),
-    (60, 132),
-    (200, 58),
-];
+/// World XY → tactical-map screen pixels (y flipped: world +y is up).
+fn world_to_map(p: FxVec2) -> (i16, i16) {
+    let x = MAP_CX + p.x.to_f32() * MAP_SCALE;
+    let y = MAP_CY - p.y.to_f32() * MAP_SCALE;
+    (x as i16, y as i16)
+}
 
-// --- Resources / components --------------------------------------------------
+/// Tactical-map screen pixels → world XY (inverse of [`world_to_map`]).
+fn map_to_world(sx: f32, sy: f32) -> Vec3 {
+    Vec3::new((sx - MAP_CX) / MAP_SCALE, (MAP_CY - sy) / MAP_SCALE, 0.0)
+}
 
-/// The in-progress stroke: resampled touch points (pixels) + whether the pen is
-/// currently down (so pen-up can finalize/clear it).
+// --- Resources ---------------------------------------------------------------
+
+/// The capture device: deployed while toggled; accrues capture progress; brief
+/// cooldown after a hit so contact doesn't drain every frame.
 #[derive(Resource, Default)]
-struct Stroke {
-    points: Vec<FxVec2>,
+struct Device {
+    deployed: bool,
+    progress: f32,
+    hit_cd: u8,
+}
+
+#[derive(Resource, Default)]
+struct StickState {
+    origin: FxVec2,
+    vel: FxVec2,
     active: bool,
 }
 
-/// Tally + last-loop feedback for the HUD.
 #[derive(Resource, Default)]
-struct Score {
-    captured: u32,
-    last_enclosed: usize,
+struct Dodge {
+    roll: u8,
+    roll_dir: FxVec2,
+    /// Per-direction double-tap countdown [Left, Right, Up, Down].
+    tap: [u8; 4],
 }
 
-/// Live loop-closure proximity tolerance (px), tuned with L/R during the feel
-/// pass. See [`DEFAULT_CLOSE_TOL`].
-#[derive(Resource)]
-struct CloseTol(Fx32);
-
-impl Default for CloseTol {
-    fn default() -> Self {
-        Self(Fx32::from_f32(DEFAULT_CLOSE_TOL))
-    }
+/// Enemy fire cadence (frames until the next shot).
+#[derive(Resource, Default)]
+struct EnemyFire {
+    cd: u8,
 }
 
-/// An enemy blip and its capture progress.
+#[derive(Resource, Default)]
+struct Stroke(Vec<FxVec2>);
+
+// --- Components ---------------------------------------------------------------
+
 #[derive(Component)]
-struct Blip {
-    hits: u8,
+struct Avatar;
+
+/// The enemy: patrol waypoint index + whether it's been captured (hidden, inert,
+/// until START re-arms it). Captured state lives here, not on the device, so the
+/// player can still stow / move / re-deploy after a capture.
+#[derive(Component)]
+struct Enemy {
+    wp: usize,
     captured: bool,
+    pause: u8,
 }
 
-/// A blip's centre in screen pixels (fixed-point, for the enclosure test).
+/// The 3D stylus cursor (shows the pen position in world space while deployed).
 #[derive(Component)]
-struct BlipPos(FxVec2);
+struct Cursor;
 
-/// One sprite in the path-trail pool.
+/// An enemy projectile — the dodge threat. Inactive ones are pooled (Hidden,
+/// inert) and reused.
+#[derive(Component)]
+struct Projectile {
+    active: bool,
+    vel: FxVec2,
+}
+
+/// World XY (fixed-point) — source of truth for the 3D transform and map marker.
+#[derive(Component, Clone, Copy)]
+struct WorldPos(FxVec2);
+
 #[derive(Component)]
 struct PathDot;
 
-/// The top-screen HUD line.
 #[derive(Component)]
 struct InfoHud;
 
-/// Program entry point, called by the BlocksDS crt0.
 #[unsafe(no_mangle)]
 pub extern "C" fn main() -> core::ffi::c_int {
     let mut app = App::new();
     app.add_plugins(DsPlugins)
+        .add_plugins(Ds3dPlugin)
         .add_plugins(SpritePlugin)
         .add_plugins(SpikePlugin);
     bevy_nds::run(app)
@@ -136,211 +227,565 @@ struct SpikePlugin;
 
 impl Plugin for SpikePlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<Stroke>()
-            .init_resource::<Score>()
-            .init_resource::<CloseTol>()
-            .add_systems(Startup, setup)
-            .add_systems(
-                Update,
-                (
-                    reset_blips,
-                    adjust_closure,
-                    capture_input,
-                    update_dots,
-                    update_blip_sprites,
-                    update_hud,
-                )
-                    .chain(),
-            );
+        app.insert_resource(Display3d {
+            screen: DsScreen::Top,
+        })
+        .init_resource::<Device>()
+        .init_resource::<StickState>()
+        .init_resource::<Dodge>()
+        .init_resource::<EnemyFire>()
+        .init_resource::<Stroke>()
+        .add_systems(Startup, setup)
+        .add_systems(
+            Update,
+            (
+                toggle_device,
+                reset_enemy,
+                move_avatar,
+                patrol_enemy,
+                fire_projectile,
+                move_projectile,
+                draw_capture,
+                enemy_contact,
+                sync_3d,
+                update_cursor,
+                sync_map_markers,
+                update_trail,
+                update_hud,
+            )
+                .chain(),
+        );
     }
 }
 
 // --- Setup -------------------------------------------------------------------
 
-fn setup(mut commands: Commands) {
-    // Enemy blips (sub-engine sprites, centred on their BLIPS coordinate).
-    for &(cx, cy) in &BLIPS {
+fn setup(mut commands: Commands, mut camera: ResMut<Camera3d>) {
+    let cube = include_obj!("assets/cube.obj", center);
+    let teapot = include_obj!("assets/teapot.obj", center);
+
+    // Avatar — one entity carrying its 3D mesh (top) and map marker (bottom).
+    commands.spawn((
+        Avatar,
+        WorldPos(FxVec2::ZERO),
+        teapot,
+        DsMaterial {
+            diffuse: [110, 180, 235],
+            ambient: [26, 40, 58],
+        },
+        Transform3d {
+            translation: Vec3::ZERO,
+            rotation: Vec3::new(-1.3, 0.5, 0.0),
+            scale: Vec3::splat(AVATAR_SCALE),
+        },
+        Sprite::new(sprites::PLAYER).at(0, PARK_Y),
+    ));
+
+    // Enemy — circle-vulnerable, patrols the waypoints.
+    let estart = FxVec2::from_f32(ENEMY_WAYPOINTS[0].0, ENEMY_WAYPOINTS[0].1);
+    commands.spawn((
+        Enemy {
+            wp: 1,
+            captured: false,
+            pause: 0,
+        },
+        WorldPos(estart),
+        cube.clone(),
+        DsMaterial {
+            diffuse: [225, 80, 70],
+            ambient: [56, 20, 18],
+        },
+        Transform3d {
+            translation: Vec3::ZERO,
+            rotation: Vec3::new(TILT_X, 0.4, 0.0),
+            scale: Vec3::splat(ENEMY_SCALE),
+        },
+        Sprite::new(sprites::BLIP).at(0, PARK_Y),
+    ));
+
+    // Stylus cursor — bright cube, starts Hidden (the mesh is skipped by the
+    // renderer) until deployed + drawing.
+    commands.spawn((
+        Cursor,
+        cube.clone(),
+        DsMaterial {
+            diffuse: [245, 240, 180],
+            ambient: [70, 68, 40],
+        },
+        Transform3d {
+            translation: Vec3::ZERO,
+            rotation: Vec3::new(TILT_X, 0.6, 0.0),
+            scale: Vec3::splat(CURSOR_SCALE),
+        },
+        Hidden,
+    ));
+
+    // Enemy projectile (3D-only threat) — pooled, starts inactive + Hidden.
+    commands.spawn((
+        Projectile {
+            active: false,
+            vel: FxVec2::ZERO,
+        },
+        WorldPos(FxVec2::ZERO),
+        cube.clone(),
+        DsMaterial {
+            diffuse: [255, 150, 40],
+            ambient: [70, 42, 12],
+        },
+        Transform3d {
+            translation: Vec3::ZERO,
+            rotation: Vec3::new(TILT_X, 0.8, 0.0),
+            scale: Vec3::splat(PROJ_SCALE),
+        },
+        Hidden,
+    ));
+
+    // Landmark cubes — 3D obstacles. A WorldPos + obstacle Sprite makes them
+    // show on the tactical map too, auto-positioned by `sync_map_markers` (the
+    // same path the avatar/enemy use).
+    for (i, &(x, y)) in LANDMARKS.iter().enumerate() {
         commands.spawn((
-            Blip {
-                hits: 0,
-                captured: false,
+            WorldPos(FxVec2::from_f32(x, y)),
+            cube.clone(),
+            DsMaterial {
+                diffuse: [120, 120, 138],
+                ambient: [34, 34, 44],
             },
-            BlipPos(FxVec2::from_f32(cx as f32, cy as f32)),
-            Sprite::new(sprites::BLIP).at(cx - 8, cy - 8),
+            Transform3d {
+                translation: Vec3::new(x, y, 0.0),
+                rotation: Vec3::new(TILT_X, 0.3 * i as f32, 0.0),
+                scale: Vec3::splat(LANDMARK_SCALE),
+            },
+            Sprite::new(sprites::OBSTACLE).at(0, PARK_Y),
         ));
     }
 
-    // Path-trail pool — parked off-screen until the stroke uses them.
+    // Trail-dot pool (map), parked.
     for _ in 0..DOT_POOL {
-        commands.spawn((PathDot, Sprite::new(sprites::DOT).at(0, 200)));
+        commands.spawn((PathDot, Sprite::new(sprites::DOT).at(0, PARK_Y)));
     }
 
-    // Top-screen HUD.
-    let t = DsScreen::Top;
-    commands.spawn((t, TilePos::new(2, 1), DsText::new("Spike B: loop-draw capture")));
-    commands.spawn((t, TilePos::new(2, 3), DsText::new("Draw a loop around the red")));
-    commands.spawn((t, TilePos::new(2, 4), DsText::new("nodes on the bottom screen.")));
-    commands.spawn((t, TilePos::new(2, 5), DsText::new("2 loops captures a node.")));
-    commands.spawn((t, TilePos::new(2, 8), InfoHud, DsText::new("")));
-    commands.spawn((t, TilePos::new(2, 21), DsText::new("L/R: closure laxness")));
-    commands.spawn((t, TilePos::new(2, 22), DsText::new("START: reset nodes")));
+    camera.position = Vec3::new(0.0, 0.0, CAM_Z);
+
+    let b = DsScreen::Bottom;
+    commands.spawn((b, TilePos::new(1, 0), InfoHud, DsText::new("")));
+    commands.spawn((b, TilePos::new(1, 22), DsText::new("L/R deploy  dpad move")));
+    commands.spawn((b, TilePos::new(1, 23), DsText::new("dbl-tap=roll  START reset")));
 }
 
-// --- Capture loop ------------------------------------------------------------
+// --- Device + movement -------------------------------------------------------
 
-/// Capture the stylus path, close the loop (self-crossing or a lax near-miss),
-/// test which blips it encloses, and accrue capture hits. The heart of the spike.
-fn capture_input(
-    touches: Res<Touches>,
-    tol: Res<CloseTol>,
+/// Tap a shoulder (L or R) to toggle the capture device deployed/stowed — a
+/// stand-in for the eventual hold→radial-wheel→equip flow (#25). State change
+/// drops the in-flight stroke.
+fn toggle_device(
+    input: Res<ButtonInput<DsButton>>,
+    mut device: ResMut<Device>,
     mut stroke: ResMut<Stroke>,
-    mut score: ResMut<Score>,
-    mut blips: Query<(&BlipPos, &mut Blip)>,
 ) {
-    let min_spacing = Fx32::from_f32(MIN_SPACING);
+    if input.just_pressed(DsButton::R) || input.just_pressed(DsButton::L) {
+        device.deployed = !device.deployed;
+        stroke.0.clear();
+    }
+}
 
+/// START re-arms the enemy (un-capture, back to its patrol start) and resets
+/// capture progress, so the loop is replayable.
+fn reset_enemy(
+    input: Res<ButtonInput<DsButton>>,
+    mut device: ResMut<Device>,
+    mut q: Query<(&mut Enemy, &mut WorldPos)>,
+) {
+    if !input.just_pressed(DsButton::Start) {
+        return;
+    }
+    for (mut enemy, mut pos) in &mut q {
+        enemy.captured = false;
+        enemy.wp = 1;
+        enemy.pause = 0;
+        pos.0 = FxVec2::from_f32(ENEMY_WAYPOINTS[0].0, ENEMY_WAYPOINTS[0].1);
+    }
+    device.progress = 0.0;
+}
+
+/// Move the avatar: stowed → stylus virtual-stick (Spike A); deployed → d-pad
+/// move + double-tap roll. Integrate the fixed-point world position, clamp to the arena,
+/// and push out of landmark obstacles.
+fn move_avatar(
+    time: Res<Time>,
+    touches: Res<Touches>,
+    input: Res<ButtonInput<DsButton>>,
+    device: Res<Device>,
+    mut stick: ResMut<StickState>,
+    mut dodge: ResMut<Dodge>,
+    mut q: Query<&mut WorldPos, With<Avatar>>,
+) {
+    let dt = Fx32::from_f32(time.delta_secs());
+    let bound = Fx32::from_f32(ARENA_HALF);
+    let Some(mut pos) = q.iter_mut().next() else {
+        return;
+    };
+
+    let delta = if device.deployed {
+        deployed_dodge(&input, &mut dodge, dt)
+    } else {
+        stowed_locomotion(&touches, &mut stick, dt)
+    };
+
+    let mut np = pos.0 + delta;
+    np.x = np.x.clamp(-bound, bound);
+    np.y = np.y.clamp(-bound, bound);
+
+    // Collide with the landmark obstacles (circular push-out).
+    let min = Fx32::from_f32(LANDMARK_COLLIDE);
+    for &(lx, ly) in &LANDMARKS {
+        let c = FxVec2::from_f32(lx, ly);
+        let sep = np - c;
+        let d = sep.length();
+        if d > Fx32::ZERO && d < min {
+            np = c + sep.normalize_or_zero() * min;
+        }
+    }
+    pos.0 = np;
+}
+
+fn stowed_locomotion(touches: &Touches, stick: &mut StickState, dt: Fx32) -> FxVec2 {
+    let cfg = StickConfig {
+        deadzone: Fx32::from_f32(STOW_DEADZONE),
+        max_radius: Fx32::from_f32(STOW_MAX_RADIUS),
+        smoothing: Fx32::from_f32(STOW_SMOOTH),
+    };
+    let target = if let Some(touch) = touches.iter().next() {
+        let p = touch.position();
+        let cur = FxVec2::from_f32(p.x, p.y);
+        if !stick.active {
+            stick.origin = cur;
+            stick.active = true;
+        }
+        let raw = cur - stick.origin;
+        stick_vector(FxVec2::new(raw.x, -raw.y), &cfg)
+    } else {
+        stick.active = false;
+        FxVec2::ZERO
+    };
+    stick.vel = vel_smooth(stick.vel, target, cfg.smoothing);
+    stick.vel * (Fx32::from_f32(STOW_SPEED) * dt)
+}
+
+fn deployed_dodge(input: &ButtonInput<DsButton>, dodge: &mut Dodge, dt: Fx32) -> FxVec2 {
+    // Tick double-tap windows.
+    for t in &mut dodge.tap {
+        *t = t.saturating_sub(1);
+    }
+
+    // A roll already in progress: keep dashing along its locked direction.
+    if dodge.roll > 0 {
+        dodge.roll -= 1;
+        return dodge.roll_dir * (Fx32::from_f32(ROLL_SPEED) * dt);
+    }
+
+    // [Left, Right, Up, Down] → unit world directions.
+    let dirs = [
+        (DsButton::Left, FxVec2::new(Fx32::NEG_ONE, Fx32::ZERO)),
+        (DsButton::Right, FxVec2::new(Fx32::ONE, Fx32::ZERO)),
+        (DsButton::Up, FxVec2::new(Fx32::ZERO, Fx32::ONE)),
+        (DsButton::Down, FxVec2::new(Fx32::ZERO, Fx32::NEG_ONE)),
+    ];
+
+    // Double-tap a direction → roll that way (one-handed: no face button).
+    for (i, (btn, vec)) in dirs.iter().enumerate() {
+        if input.just_pressed(*btn) {
+            if dodge.tap[i] > 0 {
+                dodge.roll = ROLL_FRAMES;
+                dodge.roll_dir = *vec;
+                dodge.tap[i] = 0;
+                return *vec * (Fx32::from_f32(ROLL_SPEED) * dt);
+            }
+            dodge.tap[i] = DOUBLE_TAP_WINDOW;
+        }
+    }
+
+    // Steady (held) movement at quarter speed.
+    let mut dir = FxVec2::ZERO;
+    for (btn, vec) in &dirs {
+        if input.pressed(*btn) {
+            dir = dir + *vec;
+        }
+    }
+    dir.normalize_or_zero() * (Fx32::from_f32(DODGE_SPEED) * dt)
+}
+
+/// The enemy lobs a projectile at the avatar while deployed (the dodge threat),
+/// reusing the pooled [`Projectile`] when it's free.
+fn fire_projectile(
+    device: Res<Device>,
+    mut fire: ResMut<EnemyFire>,
+    avatar: Query<&WorldPos, With<Avatar>>,
+    enemy: Query<(&WorldPos, &Enemy)>,
+    mut proj: Query<(&mut Projectile, &mut WorldPos), (Without<Avatar>, Without<Enemy>)>,
+) {
+    fire.cd = fire.cd.saturating_sub(1);
+    let (Some(a), Some((e, en))) = (avatar.iter().next(), enemy.iter().next()) else {
+        return;
+    };
+    if !device.deployed || en.captured || fire.cd > 0 {
+        return;
+    }
+    let Some((mut p, mut ppos)) = proj.iter_mut().next() else {
+        return;
+    };
+    if p.active {
+        return; // one shot in flight at a time
+    }
+    let dir = (a.0 - e.0).normalize_or_zero();
+    if dir == FxVec2::ZERO {
+        return;
+    }
+    p.active = true;
+    p.vel = dir * Fx32::from_f32(PROJ_SPEED);
+    ppos.0 = e.0;
+    fire.cd = FIRE_INTERVAL;
+}
+
+/// Fly active projectiles; a hit costs progress (unless mid-roll i-frames);
+/// out-of-bounds despawns. Inactive ones are Hidden (free).
+fn move_projectile(
+    time: Res<Time>,
+    dodge: Res<Dodge>,
+    mut device: ResMut<Device>,
+    mut commands: Commands,
+    avatar: Query<&WorldPos, With<Avatar>>,
+    mut proj: Query<(Entity, &mut Projectile, &mut WorldPos, Has<Hidden>), Without<Avatar>>,
+) {
+    let dt = Fx32::from_f32(time.delta_secs());
+    let bound = Fx32::from_f32(PROJ_DESPAWN);
+    let a = avatar.iter().next().map(|w| w.0);
+    for (e, mut p, mut pos, hidden) in &mut proj {
+        if !p.active {
+            if !hidden {
+                commands.entity(e).insert(Hidden);
+            }
+            continue;
+        }
+        if hidden {
+            commands.entity(e).remove::<Hidden>();
+        }
+        pos.0 = pos.0 + p.vel * dt;
+        if pos.0.x.abs() > bound || pos.0.y.abs() > bound {
+            p.active = false;
+            continue;
+        }
+        if let Some(a) = a
+            && dodge.roll == 0
+            && (pos.0 - a).length() < Fx32::from_f32(PROJ_HIT_DIST)
+        {
+            device.progress = (device.progress - PROJ_LOSS).max(0.0);
+            p.active = false;
+        }
+    }
+}
+
+/// Enemy walks its waypoint loop (frozen once captured).
+fn patrol_enemy(time: Res<Time>, mut q: Query<(&mut Enemy, &mut WorldPos)>) {
+    let step = Fx32::from_f32(ENEMY_SPEED * time.delta_secs());
+    for (mut enemy, mut pos) in &mut q {
+        if enemy.captured {
+            continue;
+        }
+        if enemy.pause > 0 {
+            enemy.pause -= 1; // dwelling at a waypoint — a capture window
+            continue;
+        }
+        let (tx, ty) = ENEMY_WAYPOINTS[enemy.wp];
+        let target = FxVec2::from_f32(tx, ty);
+        let to = target - pos.0;
+        if to.length() <= step {
+            pos.0 = target;
+            enemy.wp = (enemy.wp + 1) % ENEMY_WAYPOINTS.len();
+            enemy.pause = ENEMY_PAUSE;
+        } else {
+            pos.0 = pos.0 + to.normalize_or_zero() * step;
+        }
+    }
+}
+
+// --- Capture -----------------------------------------------------------------
+
+/// While deployed, capture the stylus path and, on closure, test whether it
+/// encloses the (live) enemy's map position; each enclosing loop accrues
+/// progress, and two captures it.
+fn draw_capture(
+    touches: Res<Touches>,
+    mut device: ResMut<Device>,
+    mut stroke: ResMut<Stroke>,
+    mut enemy: Query<(&WorldPos, &mut Enemy)>,
+) {
+    let Some((epos, mut enemy)) = enemy.iter_mut().next() else {
+        return;
+    };
+    if !device.deployed || enemy.captured {
+        stroke.0.clear();
+        return;
+    }
     let Some(touch) = touches.iter().next() else {
-        // Pen up: drop the stroke.
-        stroke.active = false;
-        stroke.points.clear();
+        stroke.0.clear();
         return;
     };
 
     let p = touch.position();
     let cur = FxVec2::from_f32(p.x, p.y);
-    stroke.active = true;
-
-    // Resample: only keep a point once the pen has moved far enough.
     let push = stroke
-        .points
+        .0
         .last()
-        .is_none_or(|&last| (cur - last).length() >= min_spacing);
+        .is_none_or(|&last| (cur - last).length() >= Fx32::from_f32(MIN_SPACING));
     if push {
-        stroke.points.push(cur);
-        if stroke.points.len() > MAX_POINTS {
-            stroke.points.remove(0);
+        stroke.0.push(cur);
+        if stroke.0.len() > MAX_POINTS {
+            stroke.0.remove(0);
         }
     }
-
-    if stroke.points.len() < 4 {
+    if stroke.0.len() < 4 {
         return;
     }
 
-    // Smooth, then look for a closure (exact self-crossing, or a near-miss
-    // within the live tolerance).
-    let path = smooth(&stroke.points);
-    let Some(poly) = find_closed_loop_within(&path, tol.0) else {
+    let path = path_smooth(&stroke.0);
+    let Some(poly) = find_closed_loop_within(&path, Fx32::from_f32(CLOSE_TOL)) else {
         return;
     };
 
-    // Which un-captured blips are inside? Accrue a hit on each.
-    let mut live: Vec<(FxVec2, Mut<Blip>)> = blips
-        .iter_mut()
-        .filter(|(_, b)| !b.captured)
-        .map(|(pos, b)| (pos.0, b))
-        .collect();
-    let centres: Vec<FxVec2> = live.iter().map(|(c, _)| *c).collect();
-    let inside = enclosed(&poly, &centres);
-
-    score.last_enclosed = inside.len();
-    for i in inside {
-        let blip = &mut live[i].1;
-        blip.hits += 1;
-        if blip.hits >= CAPTURE_HITS {
-            blip.captured = true;
-            score.captured += 1;
+    let (ex, ey) = world_to_map(epos.0);
+    let enemy_px = [FxVec2::from_f32(ex as f32, ey as f32)];
+    if !enclosed(&poly, &enemy_px).is_empty() {
+        device.progress += CAPTURE_PER_LOOP;
+        if device.progress >= 1.0 {
+            // Stay deployed (don't silently stow) so the pen/cursor keeps
+            // working; the enemy just vanishes. START re-arms.
+            enemy.captured = true;
         }
     }
-
-    // Consume the loop so the next one starts fresh.
-    stroke.points.clear();
+    stroke.0.clear();
 }
 
-/// START re-arms every blip for another pass.
-fn reset_blips(
-    input: Res<ButtonInput<DsButton>>,
-    mut score: ResMut<Score>,
-    mut blips: Query<&mut Blip>,
+/// Enemy contact while deployed costs capture progress — unless you're mid-roll
+/// (i-frames). Phase 1's pressure (no forced retract yet).
+fn enemy_contact(
+    dodge: Res<Dodge>,
+    mut device: ResMut<Device>,
+    avatar: Query<&WorldPos, With<Avatar>>,
+    enemy: Query<(&WorldPos, &Enemy)>,
 ) {
-    if !input.just_pressed(DsButton::Start) {
+    if device.hit_cd > 0 {
+        device.hit_cd -= 1;
+    }
+    let (Some(a), Some((e, enemy))) = (avatar.iter().next(), enemy.iter().next()) else {
+        return;
+    };
+    if !device.deployed || enemy.captured || dodge.roll > 0 || device.hit_cd > 0 {
         return;
     }
-    for mut blip in &mut blips {
-        blip.hits = 0;
-        blip.captured = false;
-    }
-    *score = Score::default();
-}
-
-/// Live-tune the loop-closure laxness with L/R (0 = exact self-crossing only).
-fn adjust_closure(input: Res<ButtonInput<DsButton>>, mut tol: ResMut<CloseTol>) {
-    let step = Fx32::from_int(2);
-    if input.just_pressed(DsButton::L) {
-        tol.0 = (tol.0 - step).max(Fx32::ZERO);
-    }
-    if input.just_pressed(DsButton::R) {
-        tol.0 = (tol.0 + step).min(Fx32::from_int(32));
+    if (a.0 - e.0).length() < Fx32::from_f32(CONTACT_DIST) {
+        device.progress = (device.progress - CONTACT_LOSS).max(0.0);
+        device.hit_cd = CONTACT_COOLDOWN;
     }
 }
 
 // --- Rendering ---------------------------------------------------------------
 
-/// Render the stroke as a continuous line: smooth it, then `densify` to evenly
-/// spaced points (filling fast-drag gaps) and lay the pooled dot sprites along
-/// them; park the rest off-screen. The dots are identical, so iteration order
-/// doesn't matter — only the set of positions does.
-fn update_dots(stroke: Res<Stroke>, mut dots: Query<&mut Sprite, With<PathDot>>) {
-    let line = densify(
-        &smooth(&stroke.points),
-        Fx32::from_f32(TRAIL_STEP),
-        DOT_POOL,
-    );
-    for (i, mut sprite) in dots.iter_mut().enumerate() {
-        if let Some(p) = line.get(i) {
-            sprite.x = p.x.to_f32() as i16 - 4; // 8×8 dot, centre on the point
-            sprite.y = p.y.to_f32() as i16 - 4;
-        } else {
-            sprite.x = 0;
-            sprite.y = 200; // off the 192-px screen
+/// WorldPos → 3D transform; toggle the captured enemy's mesh off via [`Hidden`].
+fn sync_3d(
+    mut commands: Commands,
+    mut q: Query<(Entity, &WorldPos, &mut Transform3d, Option<&Enemy>, Has<Hidden>)>,
+) {
+    for (e, pos, mut t, enemy, hidden) in &mut q {
+        t.translation.x = pos.0.x.to_f32();
+        t.translation.y = pos.0.y.to_f32();
+        if let Some(en) = enemy {
+            match (en.captured, hidden) {
+                (true, false) => {
+                    commands.entity(e).insert(Hidden);
+                }
+                (false, true) => {
+                    commands.entity(e).remove::<Hidden>();
+                }
+                _ => {}
+            }
         }
     }
 }
 
-/// Reflect each blip's capture state in its sprite: red → yellow at one hit,
-/// parked off-screen once captured.
-fn update_blip_sprites(mut blips: Query<(&Blip, &BlipPos, &mut Sprite), Without<PathDot>>) {
-    for (blip, pos, mut sprite) in &mut blips {
-        if blip.captured {
-            sprite.x = 248;
-            sprite.y = 200;
-            continue;
+/// Place the 3D stylus cursor at the pen's world position while deployed +
+/// drawing; otherwise hide its mesh via [`Hidden`].
+fn update_cursor(
+    device: Res<Device>,
+    touches: Res<Touches>,
+    mut commands: Commands,
+    mut q: Query<(Entity, &mut Transform3d, Has<Hidden>), With<Cursor>>,
+) {
+    let Some((e, mut t, hidden)) = q.iter_mut().next() else {
+        return;
+    };
+    let show = device.deployed && touches.iter().next().is_some();
+    if show {
+        let p = touches.iter().next().unwrap().position();
+        t.translation = map_to_world(p.x, p.y);
+        if hidden {
+            commands.entity(e).remove::<Hidden>();
         }
-        sprite.image = if blip.hits >= 1 {
-            sprites::BLIP_HIT
+    } else if !hidden {
+        commands.entity(e).insert(Hidden);
+    }
+}
+
+/// Map markers: shown at world→map while deployed (captured enemy parked),
+/// parked while stowed.
+fn sync_map_markers(device: Res<Device>, mut q: Query<(&WorldPos, &mut Sprite, Option<&Enemy>)>) {
+    for (pos, mut sprite, enemy) in &mut q {
+        let hide = !device.deployed || enemy.is_some_and(|e| e.captured);
+        if hide {
+            sprite.y = PARK_Y;
         } else {
-            sprites::BLIP
-        };
-        sprite.x = pos.0.x.to_f32() as i16 - 8; // 16×16 blip
-        sprite.y = pos.0.y.to_f32() as i16 - 8;
+            let (x, y) = world_to_map(pos.0);
+            sprite.x = x - 8; // 16×16 markers
+            sprite.y = y - 8;
+        }
+    }
+}
+
+/// Trail dots along the densified stroke (deployed + drawing); parked otherwise.
+fn update_trail(
+    device: Res<Device>,
+    stroke: Res<Stroke>,
+    mut dots: Query<&mut Sprite, With<PathDot>>,
+) {
+    let line = if device.deployed {
+        densify(&path_smooth(&stroke.0), Fx32::from_f32(TRAIL_STEP), DOT_POOL)
+    } else {
+        Vec::new()
+    };
+    for (i, mut sprite) in dots.iter_mut().enumerate() {
+        if let Some(p) = line.get(i) {
+            sprite.x = p.x.to_f32() as i16 - 4;
+            sprite.y = p.y.to_f32() as i16 - 4;
+        } else {
+            sprite.y = PARK_Y;
+        }
     }
 }
 
 fn update_hud(
-    stroke: Res<Stroke>,
-    score: Res<Score>,
-    tol: Res<CloseTol>,
+    device: Res<Device>,
+    enemy: Query<&Enemy>,
     mut hud: Query<&mut DsText, With<InfoHud>>,
 ) {
+    let captured = enemy.iter().next().is_some_and(|e| e.captured);
     for mut text in &mut hud {
         text.0.clear();
-        let _ = write!(
-            text.0,
-            "cap {}/{} loop:{} pts:{} lax:{:.0}",
-            score.captured,
-            BLIPS.len(),
-            score.last_enclosed,
-            stroke.points.len(),
-            tol.0.to_f32(),
-        );
+        if captured {
+            let _ = write!(text.0, "CAPTURED!  START to re-arm");
+        } else {
+            let pct = (device.progress * 100.0) as i32;
+            let state = if device.deployed { "DEPLOYED" } else { "stowed " };
+            let _ = write!(text.0, "{state}  capture {pct:>3}%");
+        }
     }
 }
