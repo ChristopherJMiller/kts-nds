@@ -13,10 +13,21 @@
 //! 2. **What's inside it?** ([`point_in_polygon`] / [`enclosed`]) — a fixed-point
 //!    even-odd ray cast against the closed polygon.
 //!
-//! Plus [`smooth`] to tame the ~60 Hz, jitter-prone touch stream. Everything is
-//! fixed-point ([`bevy_nds_math`]) and FFI-free, so it links into the ROM but is
-//! unit-tested on the host. The game owns capturing the path from the touch
-//! hardware and all per-frame state; this crate is stateless functions.
+//! Plus [`smooth`] to tame the ~60 Hz, jitter-prone touch stream, and
+//! [`area`] / [`perimeter`] / [`regularity`] loop-quality metrics (the hook for
+//! shape-based scoring, #29). The geometry is all fixed-point
+//! ([`bevy_nds_math`]) and FFI-free, so it links into the ROM but is unit-tested
+//! on the host.
+//!
+//! On top of that pure core sits a thin Bevy layer ([`LoopPlugin`]), mirroring
+//! [`bevy_nds_gesture`]: it gates the [`Touches`] stream into a [`StrokePath`]
+//! resource (pen-down starts a stroke, minimum-spacing resampling, pen-up ends
+//! it and fires a [`StrokeCompleted`] event). The buffer holds **raw
+//! touch-screen pixels** and carries no game knowledge — the consumer maps them
+//! to world / tactical-map space and decides when a stroke "counts" (e.g. only
+//! while the capture device is deployed).
+//!
+//! [`bevy_nds_gesture`]: https://docs.rs/bevy_nds_gesture
 
 #![cfg_attr(not(test), no_std)]
 
@@ -24,6 +35,9 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
+use bevy_app::prelude::*;
+use bevy_ecs::prelude::*;
+use bevy_input::touch::{Touches, touch_screen_input_system};
 use bevy_nds_math::{Fx32, FxVec2};
 
 /// 2D cross product (`z` component of the 3D cross): `a × b = a.x·b.y − a.y·b.x`.
@@ -208,6 +222,160 @@ pub fn smooth(path: &[FxVec2]) -> Vec<FxVec2> {
     out
 }
 
+// --- Loop quality metrics ----------------------------------------------------
+
+/// Enclosed area of polygon `poly` (shoelace formula), always non-negative.
+///
+/// Accumulates the cross-product sum in `i64` raw units before halving, so a
+/// big loop (a near-full-screen ~256×192 px stroke) can't overflow the 20.12
+/// range mid-sum the way a `Fx32` accumulator would. The result — the area
+/// itself — comfortably fits `Fx32`.
+pub fn area(poly: &[FxVec2]) -> Fx32 {
+    let n = poly.len();
+    if n < 3 {
+        return Fx32::ZERO;
+    }
+    let mut acc: i64 = 0;
+    let mut j = n - 1;
+    for i in 0..n {
+        // Each term is a 20.12 product (`>> 12` to rescale), summed in i64.
+        acc += (poly[j].x.raw() as i64 * poly[i].y.raw() as i64) >> 12;
+        acc -= (poly[i].x.raw() as i64 * poly[j].y.raw() as i64) >> 12;
+        j = i;
+    }
+    Fx32::from_raw((acc.abs() / 2) as i32)
+}
+
+/// Total edge length of `poly` as a **closed** loop (includes the last→first
+/// edge). Uses the fixed-point hardware sqrt per segment.
+pub fn perimeter(poly: &[FxVec2]) -> Fx32 {
+    let n = poly.len();
+    if n < 2 {
+        return Fx32::ZERO;
+    }
+    let mut total = Fx32::ZERO;
+    let mut j = n - 1;
+    for i in 0..n {
+        total += (poly[i] - poly[j]).length();
+        j = i;
+    }
+    total
+}
+
+/// Loop "regularity" — the isoperimetric quotient `4π·A / P²`, in `[0, 1]`.
+///
+/// `1.0` is a perfect circle; a square is ≈ `0.79`; a thin sliver or a jagged
+/// scribble trends toward `0`. This is the shape-quality hook for later scoring
+/// (#29) — "how clean was that capture loop." Returns `0` for a degenerate loop.
+///
+/// Computed as `((A / P) / P) · 4π` so the intermediates stay inside the 20.12
+/// range (a raw `P²` would overflow for a large loop).
+pub fn regularity(poly: &[FxVec2]) -> Fx32 {
+    let p = perimeter(poly);
+    if p <= Fx32::ZERO {
+        return Fx32::ZERO;
+    }
+    let four_pi = Fx32::from_f32(4.0 * core::f32::consts::PI);
+    area(poly) / p / p * four_pi
+}
+
+// --- Touch-stream path buffer (the Bevy layer) -------------------------------
+
+/// The in-progress stylus stroke, in **raw touch-screen pixels** (x `0..=255`,
+/// y `0..=191`, matching [`Touches`]). [`LoopPlugin`] rebuilds it each frame
+/// from the touch stream: pen-down starts a fresh stroke, each subsequent
+/// sample is appended only once it is at least [`min_spacing`](Self::min_spacing)
+/// px from the previous one (dedup + jitter rejection), and pen-up leaves the
+/// completed stroke in place until the next pen-down clears it.
+///
+/// Game-agnostic by design: it holds no world/map mapping and no notion of
+/// "deployed". The consumer reads [`points`](Self::points), maps them to
+/// whatever space it captures in, and feeds them to [`find_closed_loop_within`]
+/// / [`enclosed`].
+#[derive(Resource, Debug, Clone)]
+pub struct StrokePath {
+    /// The stroke's points so far, oldest first, in touch-screen pixels.
+    pub points: Vec<FxVec2>,
+    /// Minimum pixel spacing between retained samples. Defaults to 4 px.
+    pub min_spacing: Fx32,
+    /// Whether the pen was down last frame (drives down/up edge detection).
+    down: bool,
+}
+
+impl Default for StrokePath {
+    fn default() -> Self {
+        Self {
+            points: Vec::new(),
+            min_spacing: Fx32::from_int(4),
+            down: false,
+        }
+    }
+}
+
+impl StrokePath {
+    /// True while a stroke is actively being drawn (the pen is down).
+    pub fn is_drawing(&self) -> bool {
+        self.down
+    }
+}
+
+/// Fired on the frame the pen lifts, carrying the just-completed stroke (raw
+/// touch-screen pixels). A one-shot companion to polling [`StrokePath`] — handy
+/// for resolving a capture exactly when the loop is released.
+#[derive(Event, Debug, Clone)]
+pub struct StrokeCompleted(pub Vec<FxVec2>);
+
+/// Accumulate the touch stream into [`StrokePath`], emitting [`StrokeCompleted`]
+/// when the pen lifts. Runs after Bevy's touch system so [`Touches`] is current.
+fn accumulate_stroke(
+    touches: Res<Touches>,
+    mut stroke: ResMut<StrokePath>,
+    mut completed: EventWriter<StrokeCompleted>,
+) {
+    match touches.iter().next() {
+        Some(touch) => {
+            let p = FxVec2::from_f32(touch.position().x, touch.position().y);
+            if !stroke.down {
+                // Pen-down edge: start a fresh stroke.
+                stroke.points.clear();
+                stroke.points.push(p);
+                stroke.down = true;
+            } else {
+                let far_enough = stroke
+                    .points
+                    .last()
+                    .is_none_or(|&last| (p - last).length() >= stroke.min_spacing);
+                if far_enough {
+                    stroke.points.push(p);
+                }
+            }
+        }
+        None => {
+            if stroke.down {
+                // Pen-up edge: publish the finished stroke (left in `points` for
+                // this frame; cleared on the next pen-down).
+                stroke.down = false;
+                if !stroke.points.is_empty() {
+                    completed.write(StrokeCompleted(stroke.points.clone()));
+                }
+            }
+        }
+    }
+}
+
+/// Maintains the [`StrokePath`] resource and the [`StrokeCompleted`] event from
+/// the [`Touches`] stream. Requires `bevy_nds_input`'s plugin (for `Touches`);
+/// the pure geometry functions can be used without it.
+pub struct LoopPlugin;
+
+impl Plugin for LoopPlugin {
+    fn build(&self, app: &mut App) {
+        app.init_resource::<StrokePath>()
+            .add_event::<StrokeCompleted>()
+            .add_systems(PreUpdate, accumulate_stroke.after(touch_screen_input_system));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -341,5 +509,56 @@ mod tests {
         assert_eq!(s[2], v(2.0, 0.0));
         // The middle spike at y=10 is pulled toward the mean (~3.33).
         assert!(approx(s[1].y, 10.0 / 3.0));
+    }
+
+    #[test]
+    fn area_of_square_and_triangle() {
+        let sq = [v(0.0, 0.0), v(10.0, 0.0), v(10.0, 10.0), v(0.0, 10.0)];
+        assert!(approx(area(&sq), 100.0));
+        // Winding direction must not matter (absolute area).
+        let cw = [v(0.0, 0.0), v(0.0, 10.0), v(10.0, 10.0), v(10.0, 0.0)];
+        assert!(approx(area(&cw), 100.0));
+        // Right triangle, legs 6 and 8 → area 24.
+        let tri = [v(0.0, 0.0), v(6.0, 0.0), v(0.0, 8.0)];
+        assert!(approx(area(&tri), 24.0));
+        // Degenerate.
+        assert_eq!(area(&[v(0.0, 0.0), v(1.0, 1.0)]), Fx32::ZERO);
+    }
+
+    #[test]
+    fn area_handles_large_loop_without_overflow() {
+        // A near-full-screen box (~256×192): the i64 shoelace accumulation must
+        // not wrap the way a Fx32 accumulator would.
+        let big = [v(2.0, 2.0), v(254.0, 2.0), v(254.0, 190.0), v(2.0, 190.0)];
+        assert!(approx(area(&big), 252.0 * 188.0));
+    }
+
+    #[test]
+    fn perimeter_of_square() {
+        let sq = [v(0.0, 0.0), v(10.0, 0.0), v(10.0, 10.0), v(0.0, 10.0)];
+        assert!(approx(perimeter(&sq), 40.0));
+    }
+
+    #[test]
+    fn regularity_circle_beats_square_beats_sliver() {
+        // Approximate a circle (radius 10) with 24 segments.
+        let mut circle = alloc::vec::Vec::new();
+        for k in 0..24 {
+            let a = core::f32::consts::TAU * (k as f32) / 24.0;
+            circle.push(v(10.0 * a.cos(), 10.0 * a.sin()));
+        }
+        let sq = [v(0.0, 0.0), v(10.0, 0.0), v(10.0, 10.0), v(0.0, 10.0)];
+        let sliver = [v(0.0, 0.0), v(20.0, 0.0), v(20.0, 0.5), v(0.0, 0.5)];
+
+        let (rc, rs, rl) = (
+            regularity(&circle).to_f32(),
+            regularity(&sq).to_f32(),
+            regularity(&sliver).to_f32(),
+        );
+        // Circle ≈ 1 (polygon approximation slightly under), square ≈ 0.785.
+        assert!(rc > 0.95 && rc <= 1.05, "circle reg = {rc}");
+        assert!((rs - 0.785).abs() < 0.02, "square reg = {rs}");
+        assert!(rl < rs, "sliver {rl} should be less regular than square {rs}");
+        assert_eq!(regularity(&[v(0.0, 0.0), v(1.0, 1.0)]), Fx32::ZERO);
     }
 }

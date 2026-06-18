@@ -4,11 +4,22 @@ version = "0.1.0"
 edition = "2024"
 description = "Pure capture-loop geometry (path smoothing, self-intersection loop closure, point-in-polygon enclosure) for the loop-draw capture mechanic. no_std, fixed-point, host-testable."
 
-# The geometry half of the loop-draw capture verb (Pokémon-Ranger style). Like
-# `bevy_nds_3d_cull`, it is `no_std` and FFI-free so it links into the DS ROM yet
-# its math runs under the normal host test harness. Fixed-point throughout
-# (`bevy_nds_math`) so the per-frame closure/enclosure tests use the DS
-# divide/sqrt coprocessor on device. Born from Spike B (#19); grows into #22.
+# The loop-draw capture verb (Pokémon-Ranger style). Like `bevy_nds_gesture`, it
+# pairs **pure, host-testable geometry** (smoothing, self-intersection closure,
+# point-in-polygon enclosure, quality metrics — FFI-free, fixed-point) with a
+# thin Bevy plugin that gates the `Touches` stream into a path buffer. Fixed-point
+# throughout (`bevy_nds_math`) so the per-frame closure/enclosure tests use the DS
+# divide/sqrt coprocessor on device. Born from Spike B (#19); grown into #22.
 
 [dependencies]
 bevy_nds_math = { path = "../bevy_nds_math" }
+bevy_app = { version = "0.16", default-features = false, features = [
+  "critical-section",
+] }
+bevy_ecs = { version = "0.16", default-features = false, features = [
+  "critical-section",
+] }
+bevy_input = { version = "0.16", default-features = false, features = [
+  "critical-section",
+  "libm",
+] }
