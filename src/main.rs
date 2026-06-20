@@ -32,6 +32,7 @@
 
 extern crate alloc;
 
+use alloc::borrow::Cow;
 use alloc::vec::Vec;
 use core::fmt::Write;
 
@@ -123,6 +124,23 @@ fn world_to_map(p: FxVec2) -> (i16, i16) {
     let x = MAP_CX + p.x.to_f32() * MAP_SCALE;
     let y = MAP_CY - p.y.to_f32() * MAP_SCALE;
     (x as i16, y as i16)
+}
+
+/// A flat, **unlit**, single-colour quad in the XY plane (facing the camera).
+/// Used for the floor backdrop and the player's ground shadow — the unlit path
+/// honours the vertex colour directly (unlike [`DsMesh::cube`], whose per-face
+/// colours ignore any material).
+fn flat_quad(half_w: f32, half_h: f32, color: [u8; 3]) -> DsMesh {
+    let v = |x: f32, y: f32| Vertex::new(Vec3::new(x, y, 0.0), color);
+    let tris = alloc::vec![
+        [v(-half_w, -half_h), v(half_w, -half_h), v(half_w, half_h)],
+        [v(-half_w, -half_h), v(half_w, half_h), v(-half_w, half_h)],
+    ];
+    DsMesh {
+        tris: Cow::Owned(tris),
+        lit: false,
+        baked: None,
+    }
 }
 
 /// Tactical-map screen pixels → world XY (inverse of [`world_to_map`]).
@@ -242,6 +260,17 @@ fn setup(mut commands: Commands, mut camera: ResMut<Camera3d>) {
     let cube = include_obj!("assets/cube.obj", center);
     let teapot = include_obj!("assets/teapot.obj", center);
 
+    // Floor plane — a subdued slate quad behind the action so the play area
+    // reads as ground (and the jump shadow has something to contrast against).
+    commands.spawn((
+        flat_quad(3.4, 2.5, [50, 56, 78]),
+        Transform3d {
+            translation: Vec3::new(0.0, 0.0, -0.1),
+            rotation: Vec3::ZERO,
+            scale: Vec3::ONE,
+        },
+    ));
+
     // Avatar — one entity carrying its 3D mesh (top) and map marker (bottom).
     // `Height` is the jump axis (gravity-integrated in `player`).
     commands.spawn((
@@ -261,21 +290,18 @@ fn setup(mut commands: Commands, mut camera: ResMut<Camera3d>) {
         Sprite::new(sprites::PLAYER).at(0, PARK_Y),
     ));
 
-    // Ground shadow — a flat, dark cube under the avatar (no `Height`), so a
-    // jump's screen-Y lift reads as height. `sync_shadow` keeps it under the
-    // avatar; it has no map sprite (ground-only cue).
+    // Ground shadow — a flat dark quad (no `Height`) that stays at the avatar's
+    // ground position, so a jump's screen-Y lift opens a visible gap above it.
+    // Slightly wider than tall to read as a contact shadow; sits just in front
+    // of the floor. `sync_shadow` keeps it under the avatar.
     commands.spawn((
         Shadow,
         WorldPos(FxVec2::ZERO),
-        cube.clone(),
-        DsMaterial {
-            diffuse: [18, 20, 26],
-            ambient: [8, 8, 12],
-        },
+        flat_quad(0.14, 0.085, [16, 18, 26]),
         Transform3d {
-            translation: Vec3::ZERO,
-            rotation: Vec3::new(TILT_X, 0.0, 0.0),
-            scale: Vec3::new(AVATAR_SCALE * 0.9, AVATAR_SCALE * 0.22, AVATAR_SCALE * 0.9),
+            translation: Vec3::new(0.0, 0.0, -0.05),
+            rotation: Vec3::ZERO,
+            scale: Vec3::ONE,
         },
     ));
 
