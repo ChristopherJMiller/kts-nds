@@ -57,13 +57,25 @@ mod sprites {
 // --- Arena / camera ----------------------------------------------------------
 
 const ARENA_HALF: f32 = 2.0;
-/// Fixed camera height above the z=0 plane. Chosen so the whole ±ARENA_HALF
-/// arena fits on screen, so the 3D top and the tactical-map bottom share **one
-/// world frame** (camera at the world origin, no follow) — circling the enemy on
-/// the map then lines up with circling it on top. (A perspective camera over a
-/// flat z=0 plane is already effectively orthographic: uniform depth → linear.)
-const CAM_Z: f32 = 3.2;
-const TILT_X: f32 = -1.0;
+/// Ground plane height. Meshes are centred on their origin and rendered with
+/// their centre at Y=0, so the floor (and the ground shadow) sit a half-object
+/// below — at the objects' feet rather than slicing through their middles.
+const GROUND_Y: f32 = -0.16;
+
+// --- Camera director (#23) ---------------------------------------------------
+// The world is Y-up (ground = XZ plane). The top screen gets a real angled
+// camera; the bottom tactical map stays top-down (the two are now decoupled).
+/// Soft-follow: camera height above the ground and distance behind (+Z) the
+/// avatar, with a fixed downward pitch → a 3/4 view that stands objects upright.
+const CAM_HEIGHT: f32 = 1.7;
+const CAM_DIST: f32 = 2.0;
+const CAM_PITCH: f32 = -0.7; // ≈ -40°, looking down at the ground
+/// Top-down toggle (cluster ▲): straight above, looking down — correlates with
+/// the tactical map.
+const CAM_TD_HEIGHT: f32 = 3.2;
+/// Position low-pass factor (0 = locked, 1 = instant).
+const CAM_SMOOTH: f32 = 0.18;
+
 const AVATAR_SCALE: f32 = 0.11;
 const ENEMY_SCALE: f32 = 0.16;
 const LANDMARK_SCALE: f32 = 0.16;
@@ -126,15 +138,15 @@ fn world_to_map(p: FxVec2) -> (i16, i16) {
     (x as i16, y as i16)
 }
 
-/// A flat, **unlit**, single-colour quad in the XY plane (facing the camera).
-/// Used for the floor backdrop and the player's ground shadow — the unlit path
+/// A flat, **unlit**, single-colour quad in the horizontal **XZ** plane (the
+/// ground). Used for the floor and the player's ground shadow — the unlit path
 /// honours the vertex colour directly (unlike [`DsMesh::cube`], whose per-face
 /// colours ignore any material).
-fn flat_quad(half_w: f32, half_h: f32, color: [u8; 3]) -> DsMesh {
-    let v = |x: f32, y: f32| Vertex::new(Vec3::new(x, y, 0.0), color);
+fn flat_quad_xz(half_w: f32, half_d: f32, color: [u8; 3]) -> DsMesh {
+    let v = |x: f32, z: f32| Vertex::new(Vec3::new(x, 0.0, z), color);
     let tris = alloc::vec![
-        [v(-half_w, -half_h), v(half_w, -half_h), v(half_w, half_h)],
-        [v(-half_w, -half_h), v(half_w, half_h), v(-half_w, half_h)],
+        [v(-half_w, -half_d), v(half_w, -half_d), v(half_w, half_d)],
+        [v(-half_w, -half_d), v(half_w, half_d), v(-half_w, half_d)],
     ];
     DsMesh {
         tris: Cow::Owned(tris),
@@ -143,9 +155,10 @@ fn flat_quad(half_w: f32, half_h: f32, color: [u8; 3]) -> DsMesh {
     }
 }
 
-/// Tactical-map screen pixels → world XY (inverse of [`world_to_map`]).
+/// Tactical-map screen pixels → world ground position (inverse of
+/// [`world_to_map`]), placed on the XZ ground plane (`y = 0`).
 fn map_to_world(sx: f32, sy: f32) -> Vec3 {
-    Vec3::new((sx - MAP_CX) / MAP_SCALE, (MAP_CY - sy) / MAP_SCALE, 0.0)
+    Vec3::new((sx - MAP_CX) / MAP_SCALE, 0.0, (MAP_CY - sy) / MAP_SCALE)
 }
 
 // --- Resources ---------------------------------------------------------------
@@ -167,6 +180,15 @@ struct EnemyFire {
 
 #[derive(Resource, Default)]
 struct Stroke(Vec<FxVec2>);
+
+/// Top-screen camera framing (#23 core). Authored per-space later (#27); for now
+/// a global mode the player toggles, forced to a locked frame while deployed.
+#[derive(Resource, Default, Clone, Copy, PartialEq, Eq)]
+enum CameraMode {
+    #[default]
+    Follow,
+    TopDown,
+}
 
 // --- Components ---------------------------------------------------------------
 
@@ -227,6 +249,7 @@ impl Plugin for SpikePlugin {
         .init_resource::<Locomotion>()
         .init_resource::<StickState>()
         .init_resource::<Motion>()
+        .init_resource::<CameraMode>()
         .init_resource::<EnemyFire>()
         .init_resource::<Stroke>()
         .add_systems(Startup, setup)
@@ -238,6 +261,7 @@ impl Plugin for SpikePlugin {
                 reset_enemy,
                 player::move_player,
                 player::sync_shadow,
+                drive_camera,
                 patrol_enemy,
                 fire_projectile,
                 move_projectile,
@@ -260,12 +284,12 @@ fn setup(mut commands: Commands, mut camera: ResMut<Camera3d>) {
     let cube = include_obj!("assets/cube.obj", center);
     let teapot = include_obj!("assets/teapot.obj", center);
 
-    // Floor plane — a subdued slate quad behind the action so the play area
-    // reads as ground (and the jump shadow has something to contrast against).
+    // Floor plane — a subdued slate quad on the XZ ground so the play area reads
+    // as ground (and the jump shadow has something to sit on). Just below Y=0.
     commands.spawn((
-        flat_quad(3.4, 2.5, [50, 56, 78]),
+        flat_quad_xz(4.0, 4.0, [50, 56, 78]),
         Transform3d {
-            translation: Vec3::new(0.0, 0.0, -0.1),
+            translation: Vec3::new(0.0, GROUND_Y, 0.0),
             rotation: Vec3::ZERO,
             scale: Vec3::ONE,
         },
@@ -284,7 +308,8 @@ fn setup(mut commands: Commands, mut camera: ResMut<Camera3d>) {
         },
         Transform3d {
             translation: Vec3::ZERO,
-            rotation: Vec3::new(-1.3, 0.5, 0.0),
+            // The teapot model is Z-up; stand it on the Y-up ground (Rx -90°).
+            rotation: Vec3::new(-core::f32::consts::FRAC_PI_2, 0.0, 0.0),
             scale: Vec3::splat(AVATAR_SCALE),
         },
         Sprite::new(sprites::PLAYER).at(0, PARK_Y),
@@ -297,9 +322,9 @@ fn setup(mut commands: Commands, mut camera: ResMut<Camera3d>) {
     commands.spawn((
         Shadow,
         WorldPos(FxVec2::ZERO),
-        flat_quad(0.14, 0.085, [16, 18, 26]),
+        flat_quad_xz(0.14, 0.1, [16, 18, 26]),
         Transform3d {
-            translation: Vec3::new(0.0, 0.0, -0.05),
+            translation: Vec3::ZERO,
             rotation: Vec3::ZERO,
             scale: Vec3::ONE,
         },
@@ -321,7 +346,7 @@ fn setup(mut commands: Commands, mut camera: ResMut<Camera3d>) {
         },
         Transform3d {
             translation: Vec3::ZERO,
-            rotation: Vec3::new(TILT_X, 0.4, 0.0),
+            rotation: Vec3::new(0.0, 0.4, 0.0),
             scale: Vec3::splat(ENEMY_SCALE),
         },
         Sprite::new(sprites::BLIP).at(0, PARK_Y),
@@ -338,7 +363,7 @@ fn setup(mut commands: Commands, mut camera: ResMut<Camera3d>) {
         },
         Transform3d {
             translation: Vec3::ZERO,
-            rotation: Vec3::new(TILT_X, 0.6, 0.0),
+            rotation: Vec3::new(0.0, 0.6, 0.0),
             scale: Vec3::splat(CURSOR_SCALE),
         },
         Hidden,
@@ -358,7 +383,7 @@ fn setup(mut commands: Commands, mut camera: ResMut<Camera3d>) {
         },
         Transform3d {
             translation: Vec3::ZERO,
-            rotation: Vec3::new(TILT_X, 0.8, 0.0),
+            rotation: Vec3::new(0.0, 0.8, 0.0),
             scale: Vec3::splat(PROJ_SCALE),
         },
         Hidden,
@@ -377,7 +402,7 @@ fn setup(mut commands: Commands, mut camera: ResMut<Camera3d>) {
             },
             Transform3d {
                 translation: Vec3::new(x, y, 0.0),
-                rotation: Vec3::new(TILT_X, 0.3 * i as f32, 0.0),
+                rotation: Vec3::new(0.0, 0.3 * i as f32, 0.0),
                 scale: Vec3::splat(LANDMARK_SCALE),
             },
             Sprite::new(sprites::OBSTACLE).at(0, PARK_Y),
@@ -389,12 +414,14 @@ fn setup(mut commands: Commands, mut camera: ResMut<Camera3d>) {
         commands.spawn((PathDot, Sprite::new(sprites::DOT).at(0, PARK_Y)));
     }
 
-    camera.position = Vec3::new(0.0, 0.0, CAM_Z);
+    // Initial 3/4 follow framing (the director takes over each frame).
+    camera.position = Vec3::new(0.0, CAM_HEIGHT, CAM_DIST);
+    camera.pitch = CAM_PITCH;
 
     let b = DsScreen::Bottom;
     commands.spawn((b, TilePos::new(1, 0), InfoHud, DsText::new("")));
     commands.spawn((b, TilePos::new(1, 22), DsText::new("L deploy   stylus move/draw")));
-    commands.spawn((b, TilePos::new(1, 23), DsText::new("dpad: jump/roll  START reset")));
+    commands.spawn((b, TilePos::new(1, 23), DsText::new("up=topdown  START reset")));
 }
 
 // --- Enemy reset -------------------------------------------------------------
@@ -607,6 +634,48 @@ fn knock_device_offline(state: &mut PlayerState, stroke: &mut Stroke) {
     stroke.0.clear();
 }
 
+// --- Camera (#23 core) -------------------------------------------------------
+
+/// Drive the top-screen camera: soft-follow the avatar at a 3/4 angle; cluster ▲
+/// ([`control::Action::CamTopDown`]) toggles a top-down view (correlating with
+/// the tactical map); while deployed the frame is **locked** (CaptureFraming).
+fn drive_camera(
+    state: Res<PlayerState>,
+    input: Res<ButtonInput<DsButton>>,
+    handed: Res<Handedness>,
+    mut mode: ResMut<CameraMode>,
+    mut camera: ResMut<Camera3d>,
+    avatar: Query<&WorldPos, With<Avatar>>,
+) {
+    // Toggle top-down (only while stowed — deploying locks the frame).
+    if !state.is_deployed()
+        && control::just_pressed(control::Action::CamTopDown, *handed, &input)
+    {
+        *mode = match *mode {
+            CameraMode::Follow => CameraMode::TopDown,
+            CameraMode::TopDown => CameraMode::Follow,
+        };
+    }
+    // CaptureFraming: hold the camera still while the device is deployed.
+    if state.is_deployed() {
+        return;
+    }
+    let Some(a) = avatar.iter().next() else {
+        return;
+    };
+    let (ax, az) = (a.0.x.to_f32(), a.0.y.to_f32());
+    let (target, pitch) = match *mode {
+        CameraMode::Follow => (Vec3::new(ax, CAM_HEIGHT, az + CAM_DIST), CAM_PITCH),
+        CameraMode::TopDown => (
+            Vec3::new(ax, CAM_TD_HEIGHT, az + 0.001),
+            -core::f32::consts::FRAC_PI_2,
+        ),
+    };
+    camera.position = camera.position.lerp(target, CAM_SMOOTH);
+    camera.pitch = pitch;
+    camera.yaw = 0.0;
+}
+
 // --- Rendering ---------------------------------------------------------------
 
 /// WorldPos → 3D transform; toggle the captured enemy's mesh off via [`Hidden`].
@@ -620,13 +689,21 @@ fn sync_3d(
         &mut Transform3d,
         Option<&Enemy>,
         Option<&Height>,
+        Has<Shadow>,
         Has<Hidden>,
     )>,
 ) {
-    for (e, pos, mut t, enemy, height, hidden) in &mut q {
+    for (e, pos, mut t, enemy, height, is_shadow, hidden) in &mut q {
+        // Y-up world: the 2D ground `WorldPos(x, y)` lands on the XZ plane. The
+        // shadow rides the floor (`GROUND_Y`); other objects render centred at
+        // Y=0 (mesh-centred, so they rest on the floor); the avatar lifts on +Y.
         t.translation.x = pos.0.x.to_f32();
-        let lift = height.map_or(0.0, |h| h.z.to_f32());
-        t.translation.y = pos.0.y.to_f32() + lift;
+        t.translation.y = if is_shadow {
+            GROUND_Y
+        } else {
+            height.map_or(0.0, |h| h.z.to_f32())
+        };
+        t.translation.z = pos.0.y.to_f32();
         if let Some(en) = enemy {
             match (en.captured, hidden) {
                 (true, false) => {

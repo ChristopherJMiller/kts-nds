@@ -85,6 +85,20 @@ fn sin_cos_fx(rad: f32) -> (Fx32, Fx32) {
     (Fx32::from_raw(s), Fx32::from_raw(c))
 }
 
+/// The **inverse** camera-rotation matrix `R⁻¹ = Rx(-pitch)·Ry(-yaw)` as a
+/// column-major 20.12 4x4 — the rotation half of the view transform (the
+/// camera orientation is `R = Ry(yaw)·Rx(pitch)`). Reuses the fixed-point
+/// compose + hardware trig LUT from #34, so the per-frame view rotation costs
+/// no soft-float. Multiply it onto the modelview before the view translate.
+fn view_rotation(pitch: f32, yaw: f32) -> [i32; 16] {
+    let sincos = [
+        sin_cos_fx(-pitch),
+        sin_cos_fx(-yaw),
+        (Fx32::ZERO, Fx32::ONE), // (sin 0, cos 0): no roll
+    ];
+    bevy_nds_math::model_matrix(FxVec3::default(), sincos, FxVec3::from_f32(1.0, 1.0, 1.0))
+}
+
 /// A single coloured vertex in model space. Colour channels are 0-255 (the DS
 /// keeps the top 5 bits). `normal` is the surface normal used for hardware
 /// lighting; it is ignored for unlit meshes (and is `Vec3::ZERO` by default).
@@ -479,6 +493,12 @@ pub struct Camera3d {
     pub far: f32,
     /// Camera position; the world is drawn relative to it.
     pub position: Vec3,
+    /// Pitch (rotation about X), radians: negative looks **down**. With
+    /// [`yaw`](Self::yaw) the camera orientation is `R = Ry(yaw)·Rx(pitch)`;
+    /// both default to `0` (look straight down `-Z`, the legacy behaviour).
+    pub pitch: f32,
+    /// Yaw (rotation about Y), radians.
+    pub yaw: f32,
 }
 
 impl Default for Camera3d {
@@ -489,6 +509,8 @@ impl Default for Camera3d {
             far: 40.0,
             // Pulled back along +Z, looking toward the origin.
             position: Vec3::new(0.0, 0.0, 3.0),
+            pitch: 0.0,
+            yaw: 0.0,
         }
     }
 }
@@ -583,6 +605,8 @@ fn init_3d() {
         ffi::glClearColor(2, 2, 6, 31);
         gl::clear_depth(ffi::GL_MAX_DEPTH);
         gl::viewport(0, 0, 255, 191);
+        // Smooth polygon silhouettes — a near-free win on the 256×192 LCD.
+        gl::enable_antialias();
     }
 }
 
@@ -590,21 +614,11 @@ fn init_3d() {
 /// should be drawn). The world AABB was composed once by [`recompute_mesh_draw`]
 /// (the expensive trig is off the per-frame path); here we only shift it into
 /// camera-relative space and run the cheap plane test ([`bevy_nds_3d_cull`]).
-fn aabb_visible(frustum: &Frustum, camera: &Camera3d, draw: &MeshDraw) -> bool {
-    // The view matrix is a pure translation by -camera.position, so shift the
-    // world AABB into the camera-relative space the frustum is built in.
-    let cam = camera.position.to_array();
-    let rel_min = [
-        draw.world_min[0] - cam[0],
-        draw.world_min[1] - cam[1],
-        draw.world_min[2] - cam[2],
-    ];
-    let rel_max = [
-        draw.world_max[0] - cam[0],
-        draw.world_max[1] - cam[1],
-        draw.world_max[2] - cam[2],
-    ];
-    frustum.contains_aabb(rel_min, rel_max)
+fn aabb_visible(frustum: &Frustum, draw: &MeshDraw) -> bool {
+    // `frustum` is already in world space (built via `Frustum::to_world` for the
+    // current camera position + orientation), so the cached world AABB is tested
+    // directly — no per-object shift, and it handles a rotated camera.
+    frustum.contains_aabb(draw.world_min, draw.world_max)
 }
 
 /// Recompute each mesh's cached [`MeshDraw`] (model matrix + world AABB) — but
@@ -676,13 +690,15 @@ fn render_3d(
 
     // View-frustum culling (à la Bevy): reject meshes whose world bounds fall
     // entirely outside the camera frustum before issuing any Geometry Engine
-    // work. Built in camera-relative space, matching the translation-only view.
+    // work. Transformed into world space for the camera's position + orientation
+    // so the cached world AABBs can be tested directly.
     let frustum = Frustum::perspective(
         camera.fov_degrees * (TAU / 360.0),
         256.0 / 192.0,
         camera.near,
         camera.far,
-    );
+    )
+    .to_world(camera.pitch, camera.yaw, camera.position.to_array());
 
     unsafe {
         gl::viewport(0, 0, 255, 191);
@@ -692,9 +708,11 @@ fn render_3d(
         gl::load_identity();
         ffi::gluPerspectivef32(fovy, aspect, to_fix(camera.near), to_fix(camera.far));
 
-        // View: draw the world relative to the camera.
+        // View: rotate by R⁻¹ then translate by -position (so vertices land in
+        // the camera's rotated, translated frame).
         gl::matrix_mode(ffi::GL_MODELVIEW);
         gl::load_identity();
+        gl::mult_matrix_4x4(&view_rotation(camera.pitch, camera.yaw));
         gl::translate(
             to_fix(-camera.position.x),
             to_fix(-camera.position.y),
@@ -730,7 +748,7 @@ fn render_3d(
         for (draw, mesh, mat) in &meshes {
             // Cull meshes with known bounds (the baked / loaded models) that are
             // fully off-screen. Hand-authored meshes without an AABB always draw.
-            if draw.has_bounds && !aabb_visible(&frustum, &camera, draw) {
+            if draw.has_bounds && !aabb_visible(&frustum, draw) {
                 continue;
             }
 
@@ -842,7 +860,8 @@ fn pick_3d(
         256.0 / 192.0,
         camera.near,
         camera.far,
-    );
+    )
+    .to_world(camera.pitch, camera.yaw, camera.position.to_array());
 
     let mut nearest = i32::MAX;
     let mut hovered = None;
@@ -859,9 +878,10 @@ fn pick_3d(
         gl::pick_matrix(px, 191 - py, PICK_BOX, PICK_BOX, &viewport);
         ffi::gluPerspectivef32(fovy, aspect, to_fix(camera.near), to_fix(camera.far));
 
-        // View: identical to the display pass (translate by -camera).
+        // View: identical to the display pass (rotate by R⁻¹, then translate).
         gl::matrix_mode(ffi::GL_MODELVIEW);
         gl::load_identity();
+        gl::mult_matrix_4x4(&view_rotation(camera.pitch, camera.yaw));
         gl::translate(
             to_fix(-camera.position.x),
             to_fix(-camera.position.y),
@@ -872,7 +892,7 @@ fn pick_3d(
         gl::poly_fmt(ffi::poly_alpha(31) | ffi::POLY_CULL_NONE);
 
         for (entity, draw, mesh) in &meshes {
-            if draw.has_bounds && !aabb_visible(&frustum, &camera, draw) {
+            if draw.has_bounds && !aabb_visible(&frustum, draw) {
                 continue;
             }
 

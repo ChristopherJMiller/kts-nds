@@ -20,6 +20,11 @@ use core::ptr::{read_volatile, write_volatile};
 
 // --- Display / power registers (see <nds/arm9/video.h>, <nds/system.h>) ------
 
+/// 3D control register (`DISP3DCNT`/`GFX_CONTROL`): render-mode bits incl. edge
+/// anti-aliasing. See `<nds/arm9/videoGL.h>` `DISP3DCNT_ENUM`.
+const GFX_CONTROL: *mut u16 = 0x0400_0060 as *mut u16;
+/// `GL_ANTIALIAS = BIT(4)`: hardware edge anti-aliasing.
+const GFX_ANTIALIAS: u16 = 1 << 4;
 /// Main engine display control.
 const REG_DISPCNT: *mut u32 = 0x0400_0000 as *mut u32;
 /// ARM9 power control (16-bit). We OR in the 3D core + matrix engine bits.
@@ -199,6 +204,21 @@ pub mod gl {
             let p = read_volatile(REG_POWERCNT) | POWER_3D;
             write_volatile(REG_POWERCNT, p);
             write_volatile(REG_DISPCNT, MODE_0_3D);
+        }
+    }
+
+    /// Enable hardware **edge anti-aliasing** (`DISP3DCNT` bit 4). Smooths
+    /// polygon silhouettes — very visible at 256×192. Read-modify-write so it
+    /// preserves the render-mode bits `glInit` set. Anti-aliasing applies only
+    /// to opaque polygon edges against an opaque rear plane (our clear alpha is
+    /// 31), not to translucency, wireframe, or edge-marking.
+    ///
+    /// # Safety
+    /// Call once after `glInit`, on the DS with the 3D engine initialised.
+    pub unsafe fn enable_antialias() {
+        unsafe {
+            let c = read_volatile(GFX_CONTROL);
+            write_volatile(GFX_CONTROL, c | GFX_ANTIALIAS);
         }
     }
 

@@ -105,6 +105,31 @@ impl Frustum {
         }
         true
     }
+
+    /// Transform these **camera-space** planes into **world space** for a camera
+    /// at `cam_pos` with orientation `R = Ry(yaw)·Rx(pitch)`.
+    ///
+    /// A world point `p` is inside iff it is inside in camera space, i.e.
+    /// `n·(Rᵀ(p − t)) + d ≥ 0`, which rearranges to `(R·n)·p + (d − (R·n)·t) ≥ 0`.
+    /// So each plane's normal rotates by `R` and its offset shifts by the camera
+    /// position `t`. Lets the renderer test cached **world** AABBs against a
+    /// rotated camera directly (built once per frame). `pitch`/`yaw` in radians.
+    pub fn to_world(&self, pitch: f32, yaw: f32, cam_pos: [f32; 3]) -> Frustum {
+        let (sp, cp) = (libm::sinf(pitch), libm::cosf(pitch));
+        let (sy, cy) = (libm::sinf(yaw), libm::cosf(yaw));
+        // R·n with R = Ry(yaw)·Rx(pitch): apply Rx, then Ry.
+        let rotate = |n: [f32; 3]| -> [f32; 3] {
+            let rx = [n[0], cp * n[1] - sp * n[2], sp * n[1] + cp * n[2]];
+            [cy * rx[0] + sy * rx[2], rx[1], -sy * rx[0] + cy * rx[2]]
+        };
+        let mut planes = self.planes;
+        for plane in &mut planes {
+            let n = rotate(plane.n);
+            let d = plane.d - (n[0] * cam_pos[0] + n[1] * cam_pos[1] + n[2] * cam_pos[2]);
+            *plane = Plane { n, d };
+        }
+        Frustum { planes }
+    }
 }
 
 /// Transform a local-space AABB into world space under a translate → rotate
@@ -352,6 +377,44 @@ mod tests {
         assert!((max[1] - 2.0).abs() < 1e-4, "max.y = {}", max[1]);
         assert!((min[0] + 0.5).abs() < 1e-4);
         assert!((min[1] + 2.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn to_world_identity_is_unchanged() {
+        let f = frustum();
+        let w = f.to_world(0.0, 0.0, [0.0, 0.0, 0.0]);
+        for (a, b) in f.planes.iter().zip(w.planes.iter()) {
+            assert_eq!(a.n, b.n);
+            assert_eq!(a.d, b.d);
+        }
+    }
+
+    #[test]
+    fn to_world_matches_manual_camera_transform() {
+        // A camera pitched down 30°, yawed 20°, at (1, 2, 5). A world point is
+        // inside the world frustum iff its camera-space image is inside the
+        // original (camera-space) frustum.
+        let (pitch, yaw) = (-0.52f32, 0.35f32);
+        let cam = [1.0f32, 2.0, 5.0];
+        let f = frustum();
+        let w = f.to_world(pitch, yaw, cam);
+
+        // Camera-space → world: p_world = R·p_cam + t, R = Ry(yaw)·Rx(pitch).
+        let (sp, cp) = (libm::sinf(pitch), libm::cosf(pitch));
+        let (sy, cy) = (libm::sinf(yaw), libm::cosf(yaw));
+        let to_world_pt = |p: [f32; 3]| {
+            let rx = [p[0], cp * p[1] - sp * p[2], sp * p[1] + cp * p[2]];
+            let r = [cy * rx[0] + sy * rx[2], rx[1], -sy * rx[0] + cy * rx[2]];
+            [r[0] + cam[0], r[1] + cam[1], r[2] + cam[2]]
+        };
+        // A point clearly in front of the camera (camera space) and one behind.
+        let inside_cam = [0.0, 0.0, -5.0];
+        let behind_cam = [0.0, 0.0, 5.0];
+        let pt = |p: [f32; 3]| (w.contains_aabb(p, p), f.contains_aabb(p, p));
+        let (wi, _) = pt(to_world_pt(inside_cam));
+        let (wb, _) = pt(to_world_pt(behind_cam));
+        assert!(wi, "front point should be inside the world frustum");
+        assert!(!wb, "behind-camera point should be outside");
     }
 
     /// The fixed-point twin must track the f32 reference within 20.12 resolution

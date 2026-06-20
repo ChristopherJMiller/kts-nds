@@ -375,7 +375,10 @@ fn stowed_locomotion(touches: &Touches, stick: &mut StickState, loco: &Locomotio
             stick.active = true;
         }
         let raw = cur - stick.origin;
-        stick_vector(FxVec2::new(raw.x, -raw.y), &cfg)
+        // Y-up world: the ground depth axis (WorldPos.y → world +Z) points
+        // *toward* the camera, so dragging the pen up the screen (raw.y < 0)
+        // moves the avatar away into the scene — pass raw.y through directly.
+        stick_vector(FxVec2::new(raw.x, raw.y), &cfg)
     } else {
         stick.active = false;
         FxVec2::ZERO
