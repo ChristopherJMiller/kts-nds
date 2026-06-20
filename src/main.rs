@@ -40,11 +40,13 @@ use bevy_ecs::prelude::*;
 use bevy_nds::prelude::*;
 use bevy_nds_3d::prelude::*;
 use bevy_nds_loop::{densify, enclosed, find_closed_loop_within, smooth as path_smooth};
-use bevy_nds_math::stick::{StickConfig, smooth as vel_smooth, stick_vector};
 use bevy_nds_math::{Fx32, FxVec2};
 use bevy_nds_sprite::prelude::*;
 
 mod control;
+mod player;
+
+use player::{Height, Locomotion, Motion, PlayerState, Shadow, StickState};
 
 mod sprites {
     #![allow(dead_code)]
@@ -73,22 +75,7 @@ const LANDMARKS: [(f32, f32); 2] = [(-1.25, 0.95), (1.25, -0.95)];
 /// Avatar↔landmark separation enforced by collision (radii summed).
 const LANDMARK_COLLIDE: f32 = 0.26;
 
-// --- Stowed locomotion (Spike A defaults, locked 2026-06-14) -----------------
-
-const STOW_DEADZONE: f32 = 8.0;
-const STOW_MAX_RADIUS: f32 = 70.0;
-const STOW_SPEED: f32 = 1.6;
-const STOW_SMOOTH: f32 = 0.5;
-
-// --- Deployed dodge (one-handed: all on the d-pad, stylus is the other hand) --
-
-/// Deployed steady movement is a quarter of stowed speed — the pen is out, so
-/// you're slow; the roll is the only fast move (the evasive burst).
-const DODGE_SPEED: f32 = STOW_SPEED * 0.25;
-const ROLL_SPEED: f32 = 3.8; // dash speed; × ROLL_FRAMES sets the dodge distance
-const ROLL_FRAMES: u8 = 10; // duration + i-frame window
-/// Double-tap window (frames) for a d-pad direction to trigger a roll.
-const DOUBLE_TAP_WINDOW: u8 = 12;
+// Player locomotion tuning + the Stowed↔Deployed controller live in `player`.
 
 // --- Enemy + projectile ------------------------------------------------------
 
@@ -145,28 +132,13 @@ fn map_to_world(sx: f32, sy: f32) -> Vec3 {
 
 // --- Resources ---------------------------------------------------------------
 
-/// The capture device: deployed while toggled; accrues capture progress; brief
-/// cooldown after a hit so contact doesn't drain every frame.
+/// The capture device: accrues capture progress while deployed; brief cooldown
+/// after a hit so contact doesn't drain every frame. Deploy state itself lives
+/// in [`PlayerState`] (the controller's state machine), not here.
 #[derive(Resource, Default)]
 struct Device {
-    deployed: bool,
     progress: f32,
     hit_cd: u8,
-}
-
-#[derive(Resource, Default)]
-struct StickState {
-    origin: FxVec2,
-    vel: FxVec2,
-    active: bool,
-}
-
-#[derive(Resource, Default)]
-struct Dodge {
-    roll: u8,
-    roll_dir: FxVec2,
-    /// Per-direction double-tap countdown [Left, Right, Up, Down].
-    tap: [u8; 4],
 }
 
 /// Enemy fire cadence (frames until the next shot).
@@ -233,17 +205,21 @@ impl Plugin for SpikePlugin {
             screen: DsScreen::Top,
         })
         .init_resource::<Device>()
+        .init_resource::<PlayerState>()
+        .init_resource::<Locomotion>()
         .init_resource::<StickState>()
-        .init_resource::<Dodge>()
+        .init_resource::<Motion>()
         .init_resource::<EnemyFire>()
         .init_resource::<Stroke>()
         .add_systems(Startup, setup)
         .add_systems(
             Update,
             (
-                toggle_device,
+                player::transition_state,
+                player::toggle_tuning,
                 reset_enemy,
-                move_avatar,
+                player::move_player,
+                player::sync_shadow,
                 patrol_enemy,
                 fire_projectile,
                 move_projectile,
@@ -267,9 +243,11 @@ fn setup(mut commands: Commands, mut camera: ResMut<Camera3d>) {
     let teapot = include_obj!("assets/teapot.obj", center);
 
     // Avatar — one entity carrying its 3D mesh (top) and map marker (bottom).
+    // `Height` is the jump axis (gravity-integrated in `player`).
     commands.spawn((
         Avatar,
         WorldPos(FxVec2::ZERO),
+        Height::default(),
         teapot,
         DsMaterial {
             diffuse: [110, 180, 235],
@@ -281,6 +259,24 @@ fn setup(mut commands: Commands, mut camera: ResMut<Camera3d>) {
             scale: Vec3::splat(AVATAR_SCALE),
         },
         Sprite::new(sprites::PLAYER).at(0, PARK_Y),
+    ));
+
+    // Ground shadow — a flat, dark cube under the avatar (no `Height`), so a
+    // jump's screen-Y lift reads as height. `sync_shadow` keeps it under the
+    // avatar; it has no map sprite (ground-only cue).
+    commands.spawn((
+        Shadow,
+        WorldPos(FxVec2::ZERO),
+        cube.clone(),
+        DsMaterial {
+            diffuse: [18, 20, 26],
+            ambient: [8, 8, 12],
+        },
+        Transform3d {
+            translation: Vec3::ZERO,
+            rotation: Vec3::new(TILT_X, 0.0, 0.0),
+            scale: Vec3::new(AVATAR_SCALE * 0.9, AVATAR_SCALE * 0.22, AVATAR_SCALE * 0.9),
+        },
     ));
 
     // Enemy — circle-vulnerable, patrols the waypoints.
@@ -371,25 +367,11 @@ fn setup(mut commands: Commands, mut camera: ResMut<Camera3d>) {
 
     let b = DsScreen::Bottom;
     commands.spawn((b, TilePos::new(1, 0), InfoHud, DsText::new("")));
-    commands.spawn((b, TilePos::new(1, 22), DsText::new("L/R deploy  dpad move")));
-    commands.spawn((b, TilePos::new(1, 23), DsText::new("dbl-tap=roll  START reset")));
+    commands.spawn((b, TilePos::new(1, 22), DsText::new("L deploy   stylus move/draw")));
+    commands.spawn((b, TilePos::new(1, 23), DsText::new("dpad: jump/roll  START reset")));
 }
 
-// --- Device + movement -------------------------------------------------------
-
-/// Tap a shoulder (L or R) to toggle the capture device deployed/stowed — a
-/// stand-in for the eventual hold→radial-wheel→equip flow (#25). State change
-/// drops the in-flight stroke.
-fn toggle_device(
-    input: Res<ButtonInput<DsButton>>,
-    mut device: ResMut<Device>,
-    mut stroke: ResMut<Stroke>,
-) {
-    if input.just_pressed(DsButton::R) || input.just_pressed(DsButton::L) {
-        device.deployed = !device.deployed;
-        stroke.0.clear();
-    }
-}
+// --- Enemy reset -------------------------------------------------------------
 
 /// START re-arms the enemy (un-capture, back to its patrol start) and resets
 /// capture progress, so the loop is replayable.
@@ -410,117 +392,10 @@ fn reset_enemy(
     device.progress = 0.0;
 }
 
-/// Move the avatar: stowed → stylus virtual-stick (Spike A); deployed → d-pad
-/// move + double-tap roll. Integrate the fixed-point world position, clamp to the arena,
-/// and push out of landmark obstacles.
-fn move_avatar(
-    time: Res<Time>,
-    touches: Res<Touches>,
-    input: Res<ButtonInput<DsButton>>,
-    device: Res<Device>,
-    mut stick: ResMut<StickState>,
-    mut dodge: ResMut<Dodge>,
-    mut q: Query<&mut WorldPos, With<Avatar>>,
-) {
-    let dt = Fx32::from_f32(time.delta_secs());
-    let bound = Fx32::from_f32(ARENA_HALF);
-    let Some(mut pos) = q.iter_mut().next() else {
-        return;
-    };
-
-    let delta = if device.deployed {
-        deployed_dodge(&input, &mut dodge, dt)
-    } else {
-        stowed_locomotion(&touches, &mut stick, dt)
-    };
-
-    let mut np = pos.0 + delta;
-    np.x = np.x.clamp(-bound, bound);
-    np.y = np.y.clamp(-bound, bound);
-
-    // Collide with the landmark obstacles (circular push-out).
-    let min = Fx32::from_f32(LANDMARK_COLLIDE);
-    for &(lx, ly) in &LANDMARKS {
-        let c = FxVec2::from_f32(lx, ly);
-        let sep = np - c;
-        let d = sep.length();
-        if d > Fx32::ZERO && d < min {
-            np = c + sep.normalize_or_zero() * min;
-        }
-    }
-    pos.0 = np;
-}
-
-fn stowed_locomotion(touches: &Touches, stick: &mut StickState, dt: Fx32) -> FxVec2 {
-    let cfg = StickConfig {
-        deadzone: Fx32::from_f32(STOW_DEADZONE),
-        max_radius: Fx32::from_f32(STOW_MAX_RADIUS),
-        smoothing: Fx32::from_f32(STOW_SMOOTH),
-    };
-    let target = if let Some(touch) = touches.iter().next() {
-        let p = touch.position();
-        let cur = FxVec2::from_f32(p.x, p.y);
-        if !stick.active {
-            stick.origin = cur;
-            stick.active = true;
-        }
-        let raw = cur - stick.origin;
-        stick_vector(FxVec2::new(raw.x, -raw.y), &cfg)
-    } else {
-        stick.active = false;
-        FxVec2::ZERO
-    };
-    stick.vel = vel_smooth(stick.vel, target, cfg.smoothing);
-    stick.vel * (Fx32::from_f32(STOW_SPEED) * dt)
-}
-
-fn deployed_dodge(input: &ButtonInput<DsButton>, dodge: &mut Dodge, dt: Fx32) -> FxVec2 {
-    // Tick double-tap windows.
-    for t in &mut dodge.tap {
-        *t = t.saturating_sub(1);
-    }
-
-    // A roll already in progress: keep dashing along its locked direction.
-    if dodge.roll > 0 {
-        dodge.roll -= 1;
-        return dodge.roll_dir * (Fx32::from_f32(ROLL_SPEED) * dt);
-    }
-
-    // [Left, Right, Up, Down] → unit world directions.
-    let dirs = [
-        (DsButton::Left, FxVec2::new(Fx32::NEG_ONE, Fx32::ZERO)),
-        (DsButton::Right, FxVec2::new(Fx32::ONE, Fx32::ZERO)),
-        (DsButton::Up, FxVec2::new(Fx32::ZERO, Fx32::ONE)),
-        (DsButton::Down, FxVec2::new(Fx32::ZERO, Fx32::NEG_ONE)),
-    ];
-
-    // Double-tap a direction → roll that way (one-handed: no face button).
-    for (i, (btn, vec)) in dirs.iter().enumerate() {
-        if input.just_pressed(*btn) {
-            if dodge.tap[i] > 0 {
-                dodge.roll = ROLL_FRAMES;
-                dodge.roll_dir = *vec;
-                dodge.tap[i] = 0;
-                return *vec * (Fx32::from_f32(ROLL_SPEED) * dt);
-            }
-            dodge.tap[i] = DOUBLE_TAP_WINDOW;
-        }
-    }
-
-    // Steady (held) movement at quarter speed.
-    let mut dir = FxVec2::ZERO;
-    for (btn, vec) in &dirs {
-        if input.pressed(*btn) {
-            dir = dir + *vec;
-        }
-    }
-    dir.normalize_or_zero() * (Fx32::from_f32(DODGE_SPEED) * dt)
-}
-
 /// The enemy lobs a projectile at the avatar while deployed (the dodge threat),
 /// reusing the pooled [`Projectile`] when it's free.
 fn fire_projectile(
-    device: Res<Device>,
+    state: Res<PlayerState>,
     mut fire: ResMut<EnemyFire>,
     avatar: Query<&WorldPos, With<Avatar>>,
     enemy: Query<(&WorldPos, &Enemy)>,
@@ -530,7 +405,7 @@ fn fire_projectile(
     let (Some(a), Some((e, en))) = (avatar.iter().next(), enemy.iter().next()) else {
         return;
     };
-    if !device.deployed || en.captured || fire.cd > 0 {
+    if !state.is_deployed() || en.captured || fire.cd > 0 {
         return;
     }
     let Some((mut p, mut ppos)) = proj.iter_mut().next() else {
@@ -553,8 +428,10 @@ fn fire_projectile(
 /// out-of-bounds despawns. Inactive ones are Hidden (free).
 fn move_projectile(
     time: Res<Time>,
-    dodge: Res<Dodge>,
+    motion: Res<Motion>,
+    mut state: ResMut<PlayerState>,
     mut device: ResMut<Device>,
+    mut stroke: ResMut<Stroke>,
     mut commands: Commands,
     avatar: Query<&WorldPos, With<Avatar>>,
     mut proj: Query<(Entity, &mut Projectile, &mut WorldPos, Has<Hidden>), Without<Avatar>>,
@@ -578,11 +455,12 @@ fn move_projectile(
             continue;
         }
         if let Some(a) = a
-            && dodge.roll == 0
+            && !motion.invulnerable()
             && (pos.0 - a).length() < Fx32::from_f32(PROJ_HIT_DIST)
         {
             device.progress = (device.progress - PROJ_LOSS).max(0.0);
             p.active = false;
+            knock_device_offline(&mut state, &mut stroke);
         }
     }
 }
@@ -618,6 +496,7 @@ fn patrol_enemy(time: Res<Time>, mut q: Query<(&mut Enemy, &mut WorldPos)>) {
 /// progress, and two captures it.
 fn draw_capture(
     touches: Res<Touches>,
+    state: Res<PlayerState>,
     mut device: ResMut<Device>,
     mut stroke: ResMut<Stroke>,
     mut enemy: Query<(&WorldPos, &mut Enemy)>,
@@ -625,7 +504,7 @@ fn draw_capture(
     let Some((epos, mut enemy)) = enemy.iter_mut().next() else {
         return;
     };
-    if !device.deployed || enemy.captured {
+    if !state.is_deployed() || enemy.captured {
         stroke.0.clear();
         return;
     }
@@ -668,11 +547,14 @@ fn draw_capture(
     stroke.0.clear();
 }
 
-/// Enemy contact while deployed costs capture progress — unless you're mid-roll
-/// (i-frames). Phase 1's pressure (no forced retract yet).
+/// Enemy contact while deployed **knocks the capture device offline** — a forced
+/// retract (back to Stowed) plus progress loss — unless you're mid-roll
+/// (i-frames). The core pressure of capture-while-dodging.
 fn enemy_contact(
-    dodge: Res<Dodge>,
+    motion: Res<Motion>,
+    mut state: ResMut<PlayerState>,
     mut device: ResMut<Device>,
+    mut stroke: ResMut<Stroke>,
     avatar: Query<&WorldPos, With<Avatar>>,
     enemy: Query<(&WorldPos, &Enemy)>,
 ) {
@@ -682,25 +564,43 @@ fn enemy_contact(
     let (Some(a), Some((e, enemy))) = (avatar.iter().next(), enemy.iter().next()) else {
         return;
     };
-    if !device.deployed || enemy.captured || dodge.roll > 0 || device.hit_cd > 0 {
+    if !state.is_deployed() || enemy.captured || motion.invulnerable() || device.hit_cd > 0 {
         return;
     }
     if (a.0 - e.0).length() < Fx32::from_f32(CONTACT_DIST) {
         device.progress = (device.progress - CONTACT_LOSS).max(0.0);
         device.hit_cd = CONTACT_COOLDOWN;
+        knock_device_offline(&mut state, &mut stroke);
     }
+}
+
+/// The forced retract a hit causes: drop to Stowed and abandon the in-flight
+/// stroke. Shared by body contact and projectile hits.
+fn knock_device_offline(state: &mut PlayerState, stroke: &mut Stroke) {
+    *state = PlayerState::Stowed;
+    stroke.0.clear();
 }
 
 // --- Rendering ---------------------------------------------------------------
 
 /// WorldPos → 3D transform; toggle the captured enemy's mesh off via [`Hidden`].
+/// Entities carrying a [`Height`] (the avatar) are lifted on screen-Y by their
+/// jump height; everything else (incl. the ground [`Shadow`]) renders flat.
 fn sync_3d(
     mut commands: Commands,
-    mut q: Query<(Entity, &WorldPos, &mut Transform3d, Option<&Enemy>, Has<Hidden>)>,
+    mut q: Query<(
+        Entity,
+        &WorldPos,
+        &mut Transform3d,
+        Option<&Enemy>,
+        Option<&Height>,
+        Has<Hidden>,
+    )>,
 ) {
-    for (e, pos, mut t, enemy, hidden) in &mut q {
+    for (e, pos, mut t, enemy, height, hidden) in &mut q {
         t.translation.x = pos.0.x.to_f32();
-        t.translation.y = pos.0.y.to_f32();
+        let lift = height.map_or(0.0, |h| h.z.to_f32());
+        t.translation.y = pos.0.y.to_f32() + lift;
         if let Some(en) = enemy {
             match (en.captured, hidden) {
                 (true, false) => {
@@ -718,7 +618,7 @@ fn sync_3d(
 /// Place the 3D stylus cursor at the pen's world position while deployed +
 /// drawing; otherwise hide its mesh via [`Hidden`].
 fn update_cursor(
-    device: Res<Device>,
+    state: Res<PlayerState>,
     touches: Res<Touches>,
     mut commands: Commands,
     mut q: Query<(Entity, &mut Transform3d, Has<Hidden>), With<Cursor>>,
@@ -726,7 +626,7 @@ fn update_cursor(
     let Some((e, mut t, hidden)) = q.iter_mut().next() else {
         return;
     };
-    let show = device.deployed && touches.iter().next().is_some();
+    let show = state.is_deployed() && touches.iter().next().is_some();
     if show {
         let p = touches.iter().next().unwrap().position();
         t.translation = map_to_world(p.x, p.y);
@@ -740,9 +640,12 @@ fn update_cursor(
 
 /// Map markers: shown at world→map while deployed (captured enemy parked),
 /// parked while stowed.
-fn sync_map_markers(device: Res<Device>, mut q: Query<(&WorldPos, &mut Sprite, Option<&Enemy>)>) {
+fn sync_map_markers(
+    state: Res<PlayerState>,
+    mut q: Query<(&WorldPos, &mut Sprite, Option<&Enemy>)>,
+) {
     for (pos, mut sprite, enemy) in &mut q {
-        let hide = !device.deployed || enemy.is_some_and(|e| e.captured);
+        let hide = !state.is_deployed() || enemy.is_some_and(|e| e.captured);
         if hide {
             sprite.y = PARK_Y;
         } else {
@@ -755,11 +658,11 @@ fn sync_map_markers(device: Res<Device>, mut q: Query<(&WorldPos, &mut Sprite, O
 
 /// Trail dots along the densified stroke (deployed + drawing); parked otherwise.
 fn update_trail(
-    device: Res<Device>,
+    state: Res<PlayerState>,
     stroke: Res<Stroke>,
     mut dots: Query<&mut Sprite, With<PathDot>>,
 ) {
-    let line = if device.deployed {
+    let line = if state.is_deployed() {
         densify(&path_smooth(&stroke.0), Fx32::from_f32(TRAIL_STEP), DOT_POOL)
     } else {
         Vec::new()
@@ -775,6 +678,7 @@ fn update_trail(
 }
 
 fn update_hud(
+    pstate: Res<PlayerState>,
     device: Res<Device>,
     enemy: Query<&Enemy>,
     mut hud: Query<&mut DsText, With<InfoHud>>,
@@ -786,8 +690,12 @@ fn update_hud(
             let _ = write!(text.0, "CAPTURED!  START to re-arm");
         } else {
             let pct = (device.progress * 100.0) as i32;
-            let state = if device.deployed { "DEPLOYED" } else { "stowed " };
-            let _ = write!(text.0, "{state}  capture {pct:>3}%");
+            let label = if pstate.is_deployed() {
+                "DEPLOYED"
+            } else {
+                "stowed "
+            };
+            let _ = write!(text.0, "{label}  capture {pct:>3}%");
         }
     }
 }

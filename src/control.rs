@@ -8,7 +8,10 @@
 //! reusable handedness *mechanism* (and its host tests) lives in the library.
 //!
 //! Consumed by the player-controller state machine (#24).
-#![allow(dead_code)] // bindings declared here; wired up by the #24 controller
+// The action vocabulary is complete per #17, but a few verbs are bound and not
+// yet wired (camera toggles await #23, LockOn the reserve shoulder / OQ-7), and
+// `pressed` complements `just_pressed` — so allow the unused surface for now.
+#![allow(dead_code)]
 
 use bevy_nds::prelude::*;
 
