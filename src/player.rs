@@ -7,7 +7,7 @@
 //!
 //! - **Stowed:** stylus = virtual-stick locomotion (Spike A); cluster = `Jump`
 //!   (single = hop / double-tap = `Dash`), `Roll` (i-frame dodge), and the
-//!   camera toggles (bound but inert until #23).
+//!   camera verbs (▲ top-down toggle / ◄ orbit-set — driven by the camera director).
 //! - **Deployed:** stylus = draw (Spike B, in `main`); cluster = directional
 //!   dodge-steps + double-tap roll. Jump/dash are disabled — the pen is out.
 //!
@@ -277,6 +277,13 @@ fn stowed_step(
     loco: &Locomotion,
     dt: Fx32,
 ) -> FxVec2 {
+    // OrbitSet borrows the stylus to aim the camera while cluster ◄ is held
+    // (#23): suppress locomotion so the same drag doesn't also move the avatar.
+    // Drop the stick so the pen re-anchors cleanly when it returns to moving.
+    if control::pressed(Action::CamOrbit, handed, input) {
+        stick.active = false;
+        return FxVec2::ZERO;
+    }
     let delta = stowed_locomotion(touches, stick, loco, dt);
     let heading = if delta != FxVec2::ZERO {
         delta.normalize_or_zero()
@@ -301,7 +308,9 @@ fn stowed_step(
             height.grounded = false;
         }
     }
-    // Camera toggles (▲ CamTopDown / ◄ CamOrbit) are bound but inert until #23.
+    // Camera verbs are live (#23): ▲ CamTopDown toggles top-down, ◄ CamOrbit
+    // orbits the camera — both handled by the camera director, not here (the
+    // ◄ hold is gated above so it doesn't double as locomotion).
 
     delta
 }

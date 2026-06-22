@@ -53,9 +53,9 @@ Space(
         ),
     ],
 
-    // Graph connectivity placeholder — a real neighbour isn't authored yet, so
-    // mark it UNRESOLVED rather than invent one (#27 adjacent-space check).
+    // Arena → traversal corridor (the rest beat after this tension peak). The
+    // corridor is a real authored neighbour now (corridor.ron).
     exits: [
-        Exit(to: "UNRESOLVED", at: (0.0, 0.0, 2.5)),
+        Exit(to: "corridor", at: (0.0, 0.0, 2.5)),
     ],
 )
