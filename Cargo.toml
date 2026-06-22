@@ -26,7 +26,13 @@ members = [
   "crates/bevy_nds_save",
   "crates/bevy_nds_bg",
   "crates/png2bg",
+  "crates/bevy_nds_scene",
+  "crates/scene2bin",
 ]
+# The desktop scene editor is a standalone host GUI app, detached from this DS
+# workspace (it has its own `[workspace]` + `.cargo/config.toml`); excluded so
+# cargo doesn't try to build it for the ARM9 target.
+exclude = ["tools/scene-editor"]
 resolver = "2"
 
 [package]
@@ -42,6 +48,7 @@ edition = "2024"
 [dependencies]
 bevy_nds = { path = "crates/bevy_nds" }
 bevy_nds_3d = { path = "crates/bevy_nds_3d" }
+bevy_nds_scene = { path = "crates/bevy_nds_scene" }
 bevy_nds_audio = { path = "crates/bevy_nds_audio" }
 bevy_nds_sprite = { path = "crates/bevy_nds_sprite" }
 bevy_nds_bg = { path = "crates/bevy_nds_bg" }
@@ -77,6 +84,10 @@ png2sprite = { path = "crates/png2sprite" }
 # `build/nitrofs/backgrounds/*.{bg,bbg}` (via BlocksDS grit) so `bevy_nds_bg`
 # can load them at runtime from NitroFS.
 png2bg = { path = "crates/png2bg" }
+# Bakes `assets/spaces/*.ron` space sidecars into `build/nitrofs/spaces/*.scene`
+# (issue #27) plus a generated `spaces.rs` of NitroFS-path constants the game
+# `include!`s, loaded at runtime by `bevy_nds_scene`.
+scene2bin = { path = "crates/scene2bin" }
 
 [profile.dev]
 panic = "abort"
@@ -164,6 +175,9 @@ opt-level = 3
 opt-level = 3
 
 [profile.dev.package.bevy_nds_bg]
+opt-level = 3
+
+[profile.dev.package.bevy_nds_scene]
 opt-level = 3
 
 [profile.release]

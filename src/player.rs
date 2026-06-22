@@ -23,7 +23,7 @@ use bevy_nds::prelude::*;
 use bevy_nds_math::stick::{StickConfig, smooth as vel_smooth, stick_vector};
 
 use crate::control::{self, Action};
-use crate::{ARENA_HALF, Avatar, LANDMARK_COLLIDE, LANDMARKS, Stroke, WorldPos};
+use crate::{ARENA_HALF, Avatar, LANDMARK_COLLIDE, Landmarks, Stroke, WorldPos};
 
 // --- Stylus conditioning (Spike A defaults, locked 2026-06-14) ---------------
 
@@ -210,6 +210,7 @@ pub fn move_player(
     loco: Res<Locomotion>,
     mut stick: ResMut<StickState>,
     mut motion: ResMut<Motion>,
+    landmarks: Res<Landmarks>,
     mut q: Query<(&mut WorldPos, &mut Height), With<Avatar>>,
 ) {
     let dt = Fx32::from_f32(time.delta_secs());
@@ -254,8 +255,7 @@ pub fn move_player(
     np.x = np.x.clamp(-bound, bound);
     np.y = np.y.clamp(-bound, bound);
     let min = Fx32::from_f32(LANDMARK_COLLIDE);
-    for &(lx, ly) in &LANDMARKS {
-        let c = FxVec2::from_f32(lx, ly);
+    for &c in &landmarks.0 {
         let sep = np - c;
         let d = sep.length();
         if d > Fx32::ZERO && d < min {

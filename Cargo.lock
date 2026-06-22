@@ -38,6 +38,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "base64"
+version = "0.21.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9d297deb1925b89f2ccc13d7635fa0714f12c87adce1c75356b39ca9b7178567"
+
+[[package]]
 name = "bevy_app"
 version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -315,6 +321,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "bevy_nds_scene"
+version = "0.1.0"
+dependencies = [
+ "bevy_app",
+ "bevy_ecs",
+ "bevy_math",
+ "bevy_nds_3d",
+ "bevy_nds_nitrofs",
+]
+
+[[package]]
 name = "bevy_nds_sprite"
 version = "0.1.0"
 dependencies = [
@@ -451,6 +468,9 @@ name = "bitflags"
 version = "2.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4388bee8683e3d04af747c73422af53102d2bd24d9eadb6cbc100baef4b43f8"
+dependencies = [
+ "serde_core",
+]
 
 [[package]]
 name = "bumpalo"
@@ -734,11 +754,13 @@ dependencies = [
  "bevy_nds_bg",
  "bevy_nds_loop",
  "bevy_nds_math",
+ "bevy_nds_scene",
  "bevy_nds_sprite",
  "bevy_time",
  "obj2dl",
  "png2bg",
  "png2sprite",
+ "scene2bin",
  "wav2bank",
 ]
 
@@ -903,10 +925,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "ron"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b91f7eff05f748767f183df4320a63d6936e9c6107d97c9e6bdd9784f4289c94"
+dependencies = [
+ "base64",
+ "bitflags",
+ "serde",
+ "serde_derive",
+]
+
+[[package]]
 name = "rustversion"
 version = "1.0.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
+
+[[package]]
+name = "scene2bin"
+version = "0.1.0"
+dependencies = [
+ "ron",
+ "serde",
+]
 
 [[package]]
 name = "scopeguard"
@@ -927,6 +969,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9a8e94ea7f378bd32cbbd37198a4a91436180c5bb472411e48b5ec2e2124ae9e"
 dependencies = [
  "serde_core",
+ "serde_derive",
 ]
 
 [[package]]

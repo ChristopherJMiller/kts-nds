@@ -1,0 +1,24 @@
+[package]
+name = "scene2bin"
+version = "0.1.0"
+edition = "2024"
+description = "Host baker: assets/spaces/*.ron -> build/nitrofs/spaces/*.scene + a spaces.rs constants module."
+
+# The host half of the space pipeline (issue #27), a sibling to `obj2dl` /
+# `wav2bank` / `png2sprite`. A `build.rs` calls `build_dir` over
+# `assets/spaces/*.ron`; each space is parsed, validated (referenced meshes /
+# neighbours), and packed into a `.scene` blob under `build/nitrofs/spaces/`
+# that `just rom` packs into the ROM. `bevy_nds_scene::asset::parse` is the
+# inverse reader — keep the on-disk format in sync with it. Also emits a
+# `spaces.rs` module of NitroFS-path constants the game `include!`s (mirrors
+# `wav2bank`'s `sounds.rs`). The desktop scene editor reads/writes the same RON.
+
+[lib]
+
+[[bin]]
+name = "scene2bin"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+ron = "0.8"
