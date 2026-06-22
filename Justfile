@@ -22,6 +22,18 @@ build-release:
 check:
     cargo check
 
+# Launch the desktop space editor (issue #27). Optionally pass a .ron path:
+#   just edit                       # opens assets/spaces/atrium.ron
+#   just edit assets/spaces/foo.ron
+# The editor is a standalone host crate (its own workspace), so this cd's into
+# it; a relative path argument is rewritten to stay valid from there.
+edit *file:
+    cd tools/scene-editor && cargo run --release -- {{ if file == "" { "" } else { "../../" + file } }}
+
+# Type-check the desktop editor (host build; heavier — builds std from source).
+check-editor:
+    cd tools/scene-editor && cargo check
+
 # Run the host-side unit tests.
 #
 # `bevy_nds` normally builds for the DS (a no_std target with no test harness),
@@ -70,6 +82,8 @@ test *args:
         -p bevy_nds_cothread \
         -p bevy_nds_rtc \
         -p bevy_nds_save \
+        -p bevy_nds_scene \
+        -p scene2bin \
         --target "$(rustc -vV | sed -n 's/^host: //p')" \
         --config 'unstable.build-std=["std","panic_unwind","proc_macro"]' \
         --config 'profile.dev.panic="unwind"' \

@@ -1,0 +1,6 @@
+[build]
+target = "x86_64-unknown-linux-gnu"
+
+[unstable]
+build-std = ["std", "core", "alloc", "panic_unwind", "proc_macro"]
+build-std-features = ["panic-unwind"]

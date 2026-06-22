@@ -23,6 +23,8 @@ const AUDIO_DIR: &str = "audio";
 const SPRITE_DIR: &str = "assets/sprites";
 /// Source directory of uncompiled background PNGs (`tiled/` and `bitmap/`).
 const BG_DIR: &str = "assets/backgrounds";
+/// Source directory of authored space sidecars (`*.ron`).
+const SPACE_DIR: &str = "assets/spaces";
 /// Output directory for compiled NitroFS assets (gitignored; packed by `just rom`).
 const NITROFS_DIR: &str = "build/nitrofs";
 
@@ -31,7 +33,50 @@ fn main() {
     compile_audio();
     compile_sprites();
     compile_backgrounds();
+    compile_spaces();
     emit_link_args();
+}
+
+/// Bake every `assets/spaces/*.ron` into `build/nitrofs/spaces/*.scene` via the
+/// `scene2bin` library (issue #27), and always emit `$OUT_DIR/spaces.rs` — the
+/// constants module of NitroFS paths the game `include!`s. Unlike the sprite /
+/// audio bakers, `scene2bin` is pure Rust (no external tool), so it runs
+/// identically inside or outside `nix develop`; only RON / validation errors
+/// fall back to *predicted* constants so the game still compiles.
+fn compile_spaces() {
+    let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let src = manifest.join(SPACE_DIR);
+    let dst = manifest.join(NITROFS_DIR).join(scene2bin::NITROFS_SUBDIR);
+    let assets = manifest.join(ASSET_DIR);
+    let out_rs = PathBuf::from(env::var("OUT_DIR").unwrap()).join("spaces.rs");
+
+    println!("cargo:rerun-if-changed={}", src.display());
+    // Mesh validation reads the geometry source dir, so a new `.obj` can flip a
+    // space from invalid to valid.
+    println!("cargo:rerun-if-changed={}", assets.display());
+
+    if !src.is_dir() {
+        std::fs::write(&out_rs, scene2bin::predict_consts(&src)).ok();
+        return;
+    }
+
+    match scene2bin::build_dir(&src, &dst, &assets) {
+        Ok(built) => {
+            for b in &built {
+                println!("cargo:rerun-if-changed={}", b.input.display());
+                for w in &b.warnings {
+                    println!("cargo:warning={}: {w}", b.input.display());
+                }
+            }
+            if let Err(e) = std::fs::write(&out_rs, scene2bin::emit_rust_consts(&built)) {
+                println!("cargo:warning=could not write {}: {e}", out_rs.display());
+            }
+        }
+        Err(e) => {
+            println!("cargo:warning=space baking failed: {e}");
+            std::fs::write(&out_rs, scene2bin::predict_consts(&src)).ok();
+        }
+    }
 }
 
 /// Bake every `assets/*.obj` into `build/nitrofs/*.dl` using the `obj2dl`

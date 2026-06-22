@@ -1,0 +1,31 @@
+[package]
+name = "bevy_nds_scene"
+version = "0.1.0"
+edition = "2024"
+description = "Load baked .scene space blobs from NitroFS and spawn them as ECS entities (no_std)."
+
+# A *game-agnostic* scene/space loader for `bevy_nds`. A "space" (issue #27) is
+# baked geometry (`.obj`->`.dl`, the existing `bevy_nds_3d` path) plus a sidecar
+# of instances / camera mode / enemy spawns / exits, packed host-side by
+# `scene2bin` into a flat little-endian `.scene` blob. This crate reads that blob
+# from NitroFS and spawns generic `SceneInstance` mesh entities tagged with an
+# *opaque* `role` string — the game maps roles onto its own components, so the
+# engine never learns game-specific names (Avatar/Enemy/...). It adds no
+# allocator / panic handler of its own; it composes `bevy_nds_nitrofs` (bytes)
+# and `bevy_nds_3d` (meshes, transforms, materials, camera).
+
+[lib]
+
+[dependencies]
+bevy_nds_nitrofs = { path = "../bevy_nds_nitrofs" }
+bevy_nds_3d = { path = "../bevy_nds_3d" }
+
+bevy_app = { version = "0.16", default-features = false, features = [
+  "critical-section",
+] }
+bevy_ecs = { version = "0.16", default-features = false, features = [
+  "critical-section",
+] }
+# glam (via bevy_math) for the f32 Vec2/Vec3 the spawn path builds; `libm`
+# keeps it no_std. Mirrors `bevy_nds_3d`.
+bevy_math = { version = "0.16", default-features = false, features = ["libm"] }

@@ -1,0 +1,30 @@
+[package]
+name = "scene-editor"
+version = "0.1.0"
+edition = "2024"
+description = "Desktop editor for Kill the Serpent space sidecars (issue #27): edit assets/spaces/*.ron visually."
+
+[[bin]]
+name = "scene-editor"
+path = "src/main.rs"
+
+[dependencies]
+# Same authoring types + RON read/write the `build.rs` baker uses, so the editor
+# is a pure front-end over the format (no schema drift, no second RON version).
+scene2bin = { version = "0.1.0", path = "../../crates/scene2bin" }
+# Immediate-mode GUI. `glow` (OpenGL) backend avoids the heavier wgpu stack;
+# `x11` + `wayland` are the Linux windowing backends (winit fails to build with
+# neither). Drop wgpu/accesskit to keep the tree smaller.
+eframe = { version = "0.34.3", default-features = false, features = [
+  "default_fonts",
+  "glow",
+  "x11",
+  "wayland",
+] }
+egui = "0.34.3"
+
+# Detached from the root (DS) workspace so normal host cargo applies. The
+# sibling `.cargo/config.toml` re-targets the host and forces a full-`std`
+# build-std (the repo root forces `build-std=[core,alloc]`, which this overrides
+# to a consistent set so the non-`no_std` GUI deps link).
+[workspace]

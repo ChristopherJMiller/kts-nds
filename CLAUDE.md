@@ -205,6 +205,27 @@ they don't need (e.g. drop `bevy_nds_text` for a sprite-only game).
   `assets/backgrounds/bitmap/**/*.png` into `.bbg`. Emits
   `$OUT_DIR/backgrounds.rs` (constants module of NitroFS paths,
   `backgrounds::tiled::*` / `backgrounds::bitmap::*`).
+- **`crates/bevy_nds_scene`** — *game-agnostic* space/scene loader (issue #27).
+  Loads a baked `.scene` blob from NitroFS and spawns each authored instance as
+  a rendered entity (mesh + `Transform3d` + `DsMaterial`) tagged with a
+  `SceneInstance { role }` — an **opaque** role string the game maps onto its
+  own components. Also exposes a `LoadedScene` resource (camera mode, exits) and
+  a `LoadSpace` event. No new FFI: it composes `bevy_nds_nitrofs` (bytes) +
+  `bevy_nds_3d` (meshes). Pure `asset::parse` host-tested. Depended on directly
+  (not in `DsPlugins`).
+- **`crates/scene2bin`** — host CLI + library: bakes `assets/spaces/*.ron`
+  space sidecars into `build/nitrofs/spaces/*.scene` (+ a `spaces.rs` constants
+  module the game `include!`s). Parse + validate (referenced meshes/neighbours)
+  + encode; the authoritative writer for the `.scene` format (`bevy_nds_scene`
+  is the reader — keep the two in sync). Also `to_ron` for the editor. RON is
+  **host-only**; it never reaches the DS.
+- **`tools/scene-editor`** — standalone desktop GUI (eframe/egui) for authoring
+  spaces: a top-down ground-plane canvas (drag instances/waypoints) + a
+  properties panel, reading/writing the same RON via `scene2bin`. **Detached
+  from this workspace** (its own `[workspace]` + `.cargo/config.toml` re-target
+  the host with a full-`std` build-std, since the repo root forces
+  `build-std=[core,alloc]`). Run with `just edit [file.ron]`. `preview-rom`
+  stays the DS-faithful check; the editor is for fast spatial layout.
 - **`kts`** (root, `src/main.rs`) — *Kill the Serpent*, the game. A *pure-Bevy
   consumer*: only components and systems, **no FFI / allocator / panic handler**.
 

@@ -42,6 +42,7 @@ use bevy_nds::prelude::*;
 use bevy_nds_3d::prelude::*;
 use bevy_nds_loop::{densify, enclosed, find_closed_loop_within, smooth as path_smooth};
 use bevy_nds_math::{Fx32, FxVec2};
+use bevy_nds_scene::{SceneInstance, ScenePath};
 use bevy_nds_sprite::prelude::*;
 
 mod control;
@@ -52,6 +53,11 @@ use player::{Height, Locomotion, Motion, PlayerState, Shadow, StickState};
 mod sprites {
     #![allow(dead_code)]
     include!(concat!(env!("OUT_DIR"), "/sprites.rs"));
+}
+
+mod spaces {
+    #![allow(dead_code)]
+    include!(concat!(env!("OUT_DIR"), "/spaces.rs"));
 }
 
 // --- Arena / camera ----------------------------------------------------------
@@ -76,16 +82,11 @@ const CAM_TD_HEIGHT: f32 = 3.2;
 /// Position low-pass factor (0 = locked, 1 = instant).
 const CAM_SMOOTH: f32 = 0.18;
 
-const AVATAR_SCALE: f32 = 0.11;
-const ENEMY_SCALE: f32 = 0.16;
-const LANDMARK_SCALE: f32 = 0.16;
 const CURSOR_SCALE: f32 = 0.12;
 
-/// Static landmark cubes (world XY) — spatial reference *and* obstacles. Kept to
-/// three so the scene stays at 6 meshes (avatar + enemy + cursor + 3) for 60 fps
-/// (per-object render cost, #34).
-const LANDMARKS: [(f32, f32); 2] = [(-1.25, 0.95), (1.25, -0.95)];
-/// Avatar↔landmark separation enforced by collision (radii summed).
+/// Avatar↔landmark separation enforced by collision (radii summed). The
+/// landmark *positions* now come from the loaded space (the `Landmarks`
+/// resource), not a const — only the collision radius is tuning.
 const LANDMARK_COLLIDE: f32 = 0.26;
 
 // Player locomotion tuning + the Stowed↔Deployed controller live in `player`.
@@ -93,7 +94,8 @@ const LANDMARK_COLLIDE: f32 = 0.26;
 // --- Enemy + projectile ------------------------------------------------------
 
 const ENEMY_SPEED: f32 = 0.8;
-const ENEMY_WAYPOINTS: [(f32, f32); 4] = [(-1.4, 0.0), (0.0, 1.4), (1.4, 0.0), (0.0, -1.4)];
+// The enemy's patrol path now lives on its `ScenePath` (authored in the space),
+// not a const — see `assets/spaces/atrium.ron`.
 /// The enemy pauses at each waypoint (stop-and-go), opening capture windows.
 const ENEMY_PAUSE: u8 = 45; // frames (~0.75 s)
 const CONTACT_DIST: f32 = 0.28;
@@ -195,6 +197,17 @@ enum CameraMode {
 #[derive(Component)]
 struct Avatar;
 
+/// A static landmark obstacle, attached by `specialize_scene` to every scene
+/// instance with `role: "landmark"`.
+#[derive(Component)]
+struct Landmark;
+
+/// Landmark world positions, harvested from the loaded space by
+/// `specialize_scene` so avatar collision has a single source of truth (no
+/// duplicated const). Populated once when the space's instances first appear.
+#[derive(Resource, Default)]
+struct Landmarks(alloc::vec::Vec<FxVec2>);
+
 /// The enemy: patrol waypoint index + whether it's been captured (hidden, inert,
 /// until START re-arms it). Captured state lives here, not on the device, so the
 /// player can still stow / move / re-deploy after a capture.
@@ -252,10 +265,12 @@ impl Plugin for SpikePlugin {
         .init_resource::<CameraMode>()
         .init_resource::<EnemyFire>()
         .init_resource::<Stroke>()
+        .init_resource::<Landmarks>()
         .add_systems(Startup, setup)
         .add_systems(
             Update,
             (
+                specialize_scene,
                 player::transition_state,
                 player::toggle_tuning,
                 reset_enemy,
@@ -282,7 +297,6 @@ impl Plugin for SpikePlugin {
 
 fn setup(mut commands: Commands, mut camera: ResMut<Camera3d>) {
     let cube = include_obj!("assets/cube.obj", center);
-    let teapot = include_obj!("assets/teapot.obj", center);
 
     // Floor plane — a subdued slate quad on the XZ ground so the play area reads
     // as ground (and the jump shadow has something to sit on). Just below Y=0.
@@ -295,25 +309,14 @@ fn setup(mut commands: Commands, mut camera: ResMut<Camera3d>) {
         },
     ));
 
-    // Avatar — one entity carrying its 3D mesh (top) and map marker (bottom).
-    // `Height` is the jump axis (gravity-integrated in `player`).
-    commands.spawn((
-        Avatar,
-        WorldPos(FxVec2::ZERO),
-        Height::default(),
-        teapot,
-        DsMaterial {
-            diffuse: [110, 180, 235],
-            ambient: [26, 40, 58],
-        },
-        Transform3d {
-            translation: Vec3::ZERO,
-            // The teapot model is Z-up; stand it on the Y-up ground (Rx -90°).
-            rotation: Vec3::new(-core::f32::consts::FRAC_PI_2, 0.0, 0.0),
-            scale: Vec3::splat(AVATAR_SCALE),
-        },
-        Sprite::new(sprites::PLAYER).at(0, PARK_Y),
-    ));
+    // Level content — avatar, enemy, landmarks — is authored data (issue #27).
+    // Load the baked space and spawn its instances; `specialize_scene` attaches
+    // the gameplay components (Avatar / Enemy / Landmark) by role. Floor (above),
+    // shadow, cursor, projectile, trail-dot pool and HUD (below) stay runtime
+    // chrome — pools and systems, not level geometry.
+    if let Some(scene) = bevy_nds_scene::load(spaces::ATRIUM) {
+        bevy_nds_scene::spawn(&mut commands, scene);
+    }
 
     // Ground shadow — a flat dark quad (no `Height`) that stays at the avatar's
     // ground position, so a jump's screen-Y lift opens a visible gap above it.
@@ -328,28 +331,6 @@ fn setup(mut commands: Commands, mut camera: ResMut<Camera3d>) {
             rotation: Vec3::ZERO,
             scale: Vec3::ONE,
         },
-    ));
-
-    // Enemy — circle-vulnerable, patrols the waypoints.
-    let estart = FxVec2::from_f32(ENEMY_WAYPOINTS[0].0, ENEMY_WAYPOINTS[0].1);
-    commands.spawn((
-        Enemy {
-            wp: 1,
-            captured: false,
-            pause: 0,
-        },
-        WorldPos(estart),
-        cube.clone(),
-        DsMaterial {
-            diffuse: [225, 80, 70],
-            ambient: [56, 20, 18],
-        },
-        Transform3d {
-            translation: Vec3::ZERO,
-            rotation: Vec3::new(0.0, 0.4, 0.0),
-            scale: Vec3::splat(ENEMY_SCALE),
-        },
-        Sprite::new(sprites::BLIP).at(0, PARK_Y),
     ));
 
     // Stylus cursor — bright cube, starts Hidden (the mesh is skipped by the
@@ -389,26 +370,6 @@ fn setup(mut commands: Commands, mut camera: ResMut<Camera3d>) {
         Hidden,
     ));
 
-    // Landmark cubes — 3D obstacles. A WorldPos + obstacle Sprite makes them
-    // show on the tactical map too, auto-positioned by `sync_map_markers` (the
-    // same path the avatar/enemy use).
-    for (i, &(x, y)) in LANDMARKS.iter().enumerate() {
-        commands.spawn((
-            WorldPos(FxVec2::from_f32(x, y)),
-            cube.clone(),
-            DsMaterial {
-                diffuse: [120, 120, 138],
-                ambient: [34, 34, 44],
-            },
-            Transform3d {
-                translation: Vec3::new(x, y, 0.0),
-                rotation: Vec3::new(0.0, 0.3 * i as f32, 0.0),
-                scale: Vec3::splat(LANDMARK_SCALE),
-            },
-            Sprite::new(sprites::OBSTACLE).at(0, PARK_Y),
-        ));
-    }
-
     // Trail-dot pool (map), parked.
     for _ in 0..DOT_POOL {
         commands.spawn((PathDot, Sprite::new(sprites::DOT).at(0, PARK_Y)));
@@ -424,6 +385,54 @@ fn setup(mut commands: Commands, mut camera: ResMut<Camera3d>) {
     commands.spawn((b, TilePos::new(1, 23), DsText::new("up=topdown  START reset")));
 }
 
+/// The game-specific half of the scene pipeline: turn freshly loaded, opaque
+/// scene instances into gameplay entities by their authored `role`.
+/// `bevy_nds_scene` stays game-agnostic (it only knows meshes, transforms,
+/// materials, and a role string); this is where `"avatar"` / `"enemy"` /
+/// `"landmark"` become the game's components. The `Added` filter runs it once
+/// per instance; a loaded instance's ground position comes from its spawned
+/// `Transform3d` (x, z), seeding the `WorldPos` that `sync_3d` then drives.
+fn specialize_scene(
+    mut commands: Commands,
+    mut landmarks: ResMut<Landmarks>,
+    q: Query<(Entity, &SceneInstance, &Transform3d), Added<SceneInstance>>,
+) {
+    for (e, inst, tf) in &q {
+        let pos = WorldPos(FxVec2::from_f32(tf.translation.x, tf.translation.z));
+        match inst.role.as_str() {
+            "avatar" => {
+                commands.entity(e).insert((
+                    Avatar,
+                    pos,
+                    Height::default(),
+                    Sprite::new(sprites::PLAYER).at(0, PARK_Y),
+                ));
+            }
+            "enemy" => {
+                commands.entity(e).insert((
+                    Enemy {
+                        wp: 1,
+                        captured: false,
+                        pause: 0,
+                    },
+                    pos,
+                    Sprite::new(sprites::BLIP).at(0, PARK_Y),
+                ));
+            }
+            "landmark" => {
+                landmarks.0.push(pos.0);
+                commands.entity(e).insert((
+                    Landmark,
+                    pos,
+                    Sprite::new(sprites::OBSTACLE).at(0, PARK_Y),
+                ));
+            }
+            // Unknown roles render (mesh + transform) but carry no behaviour.
+            _ => {}
+        }
+    }
+}
+
 // --- Enemy reset -------------------------------------------------------------
 
 /// START re-arms the enemy (un-capture, back to its patrol start) and resets
@@ -431,16 +440,18 @@ fn setup(mut commands: Commands, mut camera: ResMut<Camera3d>) {
 fn reset_enemy(
     input: Res<ButtonInput<DsButton>>,
     mut device: ResMut<Device>,
-    mut q: Query<(&mut Enemy, &mut WorldPos)>,
+    mut q: Query<(&mut Enemy, &mut WorldPos, &ScenePath)>,
 ) {
     if !input.just_pressed(DsButton::Start) {
         return;
     }
-    for (mut enemy, mut pos) in &mut q {
+    for (mut enemy, mut pos, path) in &mut q {
         enemy.captured = false;
         enemy.wp = 1;
         enemy.pause = 0;
-        pos.0 = FxVec2::from_f32(ENEMY_WAYPOINTS[0].0, ENEMY_WAYPOINTS[0].1);
+        if let Some(start) = path.0.first() {
+            pos.0 = FxVec2::from_f32(start.x, start.y);
+        }
     }
     device.progress = 0.0;
 }
@@ -518,23 +529,24 @@ fn move_projectile(
     }
 }
 
-/// Enemy walks its waypoint loop (frozen once captured).
-fn patrol_enemy(time: Res<Time>, mut q: Query<(&mut Enemy, &mut WorldPos)>) {
+/// Enemy walks its authored patrol loop (the `ScenePath` from the space; frozen
+/// once captured).
+fn patrol_enemy(time: Res<Time>, mut q: Query<(&mut Enemy, &mut WorldPos, &ScenePath)>) {
     let step = Fx32::from_f32(ENEMY_SPEED * time.delta_secs());
-    for (mut enemy, mut pos) in &mut q {
-        if enemy.captured {
+    for (mut enemy, mut pos, path) in &mut q {
+        if enemy.captured || path.0.is_empty() {
             continue;
         }
         if enemy.pause > 0 {
             enemy.pause -= 1; // dwelling at a waypoint — a capture window
             continue;
         }
-        let (tx, ty) = ENEMY_WAYPOINTS[enemy.wp];
-        let target = FxVec2::from_f32(tx, ty);
+        let wp = path.0[enemy.wp % path.0.len()];
+        let target = FxVec2::from_f32(wp.x, wp.y);
         let to = target - pos.0;
         if to.length() <= step {
             pos.0 = target;
-            enemy.wp = (enemy.wp + 1) % ENEMY_WAYPOINTS.len();
+            enemy.wp = (enemy.wp + 1) % path.0.len();
             enemy.pause = ENEMY_PAUSE;
         } else {
             pos.0 = pos.0 + to.normalize_or_zero() * step;

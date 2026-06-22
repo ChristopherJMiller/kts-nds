@@ -1,0 +1,61 @@
+// atrium — the Spike-C arena, now authored data instead of a hardcoded
+// `setup()` spawn wall (issue #27, the first baked space).
+//
+// `role` is an opaque tag the engine keeps generic; `src/main.rs`'s
+// `specialize_scene` maps each role onto the game's components. Positions are
+// world-space (x, height, z); the ground is the XZ plane (Y-up). For avatar /
+// enemy / landmark the (x, z) seeds a `WorldPos` and `sync_3d` drives the mesh
+// from there, so only rotation + scale on the transform are load-bearing.
+//
+// Floor, ground shadow, the stylus cursor, the projectile, the map trail-dot
+// pool and the HUD are runtime *chrome* (pools / systems), not level content —
+// they stay in game code.
+Space(
+    // Soft 3/4 follow (the Spike-C CAM_* defaults).
+    camera: Follow(height: 1.7, dist: 2.0, pitch: -0.7),
+
+    instances: [
+        // The player avatar (teapot is Z-up, so stand it on the ground with Rx -90°).
+        Instance(
+            mesh: Some("teapot"),
+            role: "avatar",
+            pos: (0.0, 0.0, 0.0),
+            rot: (-1.5708, 0.0, 0.0),
+            scale: (0.11, 0.11, 0.11),
+            material: Some((diffuse: (110, 180, 235), ambient: (26, 40, 58))),
+        ),
+        // Circle-vulnerable enemy on a four-point patrol (path[0] == spawn).
+        Instance(
+            mesh: Some("cube"),
+            role: "enemy",
+            pos: (-1.4, 0.0, 0.0),
+            rot: (0.0, 0.4, 0.0),
+            scale: (0.16, 0.16, 0.16),
+            material: Some((diffuse: (225, 80, 70), ambient: (56, 20, 18))),
+            path: [(-1.4, 0.0), (0.0, 1.4), (1.4, 0.0), (0.0, -1.4)],
+        ),
+        // Landmark obstacles (also plotted on the tactical map).
+        Instance(
+            mesh: Some("cube"),
+            role: "landmark",
+            pos: (-1.25, 0.0, 0.95),
+            rot: (0.0, 0.0, 0.0),
+            scale: (0.16, 0.16, 0.16),
+            material: Some((diffuse: (120, 120, 138), ambient: (34, 34, 44))),
+        ),
+        Instance(
+            mesh: Some("cube"),
+            role: "landmark",
+            pos: (1.25, 0.0, -0.95),
+            rot: (0.0, 0.3, 0.0),
+            scale: (0.16, 0.16, 0.16),
+            material: Some((diffuse: (120, 120, 138), ambient: (34, 34, 44))),
+        ),
+    ],
+
+    // Graph connectivity placeholder — a real neighbour isn't authored yet, so
+    // mark it UNRESOLVED rather than invent one (#27 adjacent-space check).
+    exits: [
+        Exit(to: "UNRESOLVED", at: (0.0, 0.0, 2.5)),
+    ],
+)
