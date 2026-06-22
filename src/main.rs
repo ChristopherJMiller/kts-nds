@@ -42,7 +42,7 @@ use bevy_nds::prelude::*;
 use bevy_nds_3d::prelude::*;
 use bevy_nds_loop::{densify, enclosed, find_closed_loop_within, smooth as path_smooth};
 use bevy_nds_math::{Fx32, FxVec2};
-use bevy_nds_scene::{SceneInstance, ScenePath};
+use bevy_nds_scene::{CameraMode, LoadedScene, SceneInstance, ScenePath};
 use bevy_nds_sprite::prelude::*;
 
 mod control;
@@ -183,13 +183,35 @@ struct EnemyFire {
 #[derive(Resource, Default)]
 struct Stroke(Vec<FxVec2>);
 
-/// Top-screen camera framing (#23 core). Authored per-space later (#27); for now
-/// a global mode the player toggles, forced to a locked frame while deployed.
-#[derive(Resource, Default, Clone, Copy, PartialEq, Eq)]
-enum CameraMode {
-    #[default]
-    Follow,
-    TopDown,
+/// The player's top-down camera toggle (cluster ▲, [`control::Action::CamTopDown`]).
+/// The *base* framing is now authored per-space (the loaded space's
+/// [`CameraMode`], read from [`LoadedScene`] — #27); this is the one player-facing
+/// override the control model locks in (#17): force a straight-down tactical view
+/// over whatever the space authored. Off = use the authored framing. Gated to
+/// while-stowed (deploying locks the frame — CaptureFraming).
+#[derive(Resource, Default)]
+struct TopDownToggle(bool);
+
+/// OrbitSet camera state (#23, last deferred camera mode). Hold cluster ◄
+/// ([`control::Action::CamOrbit`]) and drag the stylus to choose a **yaw** the
+/// camera orbits the avatar at; release **locks** it; a bare tap (hold with no
+/// drag) **resets** to the space's default framing. It's a yaw *offset* on the
+/// still-avatar-following [`CameraMode::Follow`] camera — not a free camera (#17:
+/// "No free player-driven camera"). Stowed-only (deploying locks the frame) and
+/// Follow-only (the open-arena mode #17 pairs orbit-set with).
+#[derive(Resource, Default)]
+struct Orbit {
+    /// Locked yaw offset (radians). 0 = the default (camera directly behind).
+    yaw: f32,
+    /// Live yaw while ◄ is held + dragging (previewed before it locks).
+    live: Option<f32>,
+    /// Stylus x at the start of the current drag + the yaw it builds on.
+    anchor: Option<f32>,
+    base: f32,
+    /// Did the stylus move far enough this hold to count as a drag (vs a tap)?
+    dragged: bool,
+    /// Was ◄ held last frame (to detect the release that resolves the gesture)?
+    holding: bool,
 }
 
 // --- Components ---------------------------------------------------------------
@@ -262,7 +284,8 @@ impl Plugin for SpikePlugin {
         .init_resource::<Locomotion>()
         .init_resource::<StickState>()
         .init_resource::<Motion>()
-        .init_resource::<CameraMode>()
+        .init_resource::<TopDownToggle>()
+        .init_resource::<Orbit>()
         .init_resource::<EnemyFire>()
         .init_resource::<Stroke>()
         .init_resource::<Landmarks>()
@@ -276,6 +299,7 @@ impl Plugin for SpikePlugin {
                 reset_enemy,
                 player::move_player,
                 player::sync_shadow,
+                orbit_camera,
                 drive_camera,
                 patrol_enemy,
                 fire_projectile,
@@ -314,7 +338,18 @@ fn setup(mut commands: Commands, mut camera: ResMut<Camera3d>) {
     // the gameplay components (Avatar / Enemy / Landmark) by role. Floor (above),
     // shadow, cursor, projectile, trail-dot pool and HUD (below) stay runtime
     // chrome — pools and systems, not level geometry.
+    // Default 3/4 follow framing — the fallback if the space fails to load (the
+    // authored camera below overrides it, and `drive_camera` takes over per-frame).
+    camera.position = Vec3::new(0.0, CAM_HEIGHT, CAM_DIST);
+    camera.pitch = CAM_PITCH;
     if let Some(scene) = bevy_nds_scene::load(spaces::ATRIUM) {
+        // Seed the initial framing from the space's authored camera (avatar at
+        // origin) so boot lands on the right view instead of gliding in from the
+        // default. The per-frame `drive_camera` director then takes over.
+        let (pos, pitch, yaw) = frame_for(scene.camera, 0.0, 0.0, 0.0);
+        camera.position = pos;
+        camera.pitch = pitch;
+        camera.yaw = yaw;
         bevy_nds_scene::spawn(&mut commands, scene);
     }
 
@@ -374,10 +409,6 @@ fn setup(mut commands: Commands, mut camera: ResMut<Camera3d>) {
     for _ in 0..DOT_POOL {
         commands.spawn((PathDot, Sprite::new(sprites::DOT).at(0, PARK_Y)));
     }
-
-    // Initial 3/4 follow framing (the director takes over each frame).
-    camera.position = Vec3::new(0.0, CAM_HEIGHT, CAM_DIST);
-    camera.pitch = CAM_PITCH;
 
     let b = DsScreen::Bottom;
     commands.spawn((b, TilePos::new(1, 0), InfoHud, DsText::new("")));
@@ -646,27 +677,32 @@ fn knock_device_offline(state: &mut PlayerState, stroke: &mut Stroke) {
     stroke.0.clear();
 }
 
-// --- Camera (#23 core) -------------------------------------------------------
+// --- Camera director (#23 / #27) ---------------------------------------------
 
-/// Drive the top-screen camera: soft-follow the avatar at a 3/4 angle; cluster ▲
-/// ([`control::Action::CamTopDown`]) toggles a top-down view (correlating with
-/// the tactical map); while deployed the frame is **locked** (CaptureFraming).
+/// A small offset off straight-down so a top-down view never looks *exactly*
+/// along -Y (degenerate orientation); pushes the look-at just off the avatar.
+const TD_EPS: f32 = 0.001;
+
+/// Drive the top-screen camera from the **space's authored base mode**
+/// ([`LoadedScene`] — Follow / TopDown / Rail2.5D / CaptureFraming), with the
+/// player's cluster-▲ top-down toggle layered on top (#17 control model) and a
+/// **locked frame while deployed** (CaptureFraming pressure). The framing params
+/// are authored data now — no hardcoded camera mode.
 fn drive_camera(
     state: Res<PlayerState>,
     input: Res<ButtonInput<DsButton>>,
     handed: Res<Handedness>,
-    mut mode: ResMut<CameraMode>,
+    scene: Option<Res<LoadedScene>>,
+    mut topdown: ResMut<TopDownToggle>,
+    orbit: Res<Orbit>,
     mut camera: ResMut<Camera3d>,
     avatar: Query<&WorldPos, With<Avatar>>,
 ) {
-    // Toggle top-down (only while stowed — deploying locks the frame).
+    // Player top-down override (only while stowed — deploying locks the frame).
     if !state.is_deployed()
         && control::just_pressed(control::Action::CamTopDown, *handed, &input)
     {
-        *mode = match *mode {
-            CameraMode::Follow => CameraMode::TopDown,
-            CameraMode::TopDown => CameraMode::Follow,
-        };
+        topdown.0 = !topdown.0;
     }
     // CaptureFraming: hold the camera still while the device is deployed.
     if state.is_deployed() {
@@ -676,16 +712,143 @@ fn drive_camera(
         return;
     };
     let (ax, az) = (a.0.x.to_f32(), a.0.y.to_f32());
-    let (target, pitch) = match *mode {
-        CameraMode::Follow => (Vec3::new(ax, CAM_HEIGHT, az + CAM_DIST), CAM_PITCH),
-        CameraMode::TopDown => (
-            Vec3::new(ax, CAM_TD_HEIGHT, az + 0.001),
+
+    // The space's authored framing (a soft-follow default if no space loaded).
+    let base = scene.map(|s| s.0.camera).unwrap_or(CameraMode::Follow {
+        height: CAM_HEIGHT,
+        dist: CAM_DIST,
+        pitch: CAM_PITCH,
+    });
+    // The live orbit angle previews while dragging, else the locked offset.
+    let orbit_yaw = orbit.live.unwrap_or(orbit.yaw);
+    // The player's top-down toggle overrides whatever the space authored.
+    let (target, pitch, yaw) = if topdown.0 {
+        (
+            Vec3::new(ax, CAM_TD_HEIGHT, az + TD_EPS),
             -core::f32::consts::FRAC_PI_2,
-        ),
+            0.0,
+        )
+    } else {
+        frame_for(base, ax, az, orbit_yaw)
     };
     camera.position = camera.position.lerp(target, CAM_SMOOTH);
     camera.pitch = pitch;
-    camera.yaw = 0.0;
+    camera.yaw = yaw;
+}
+
+/// Resolve an authored [`CameraMode`] + the avatar's ground position `(ax, az)`
+/// into a camera `(position, pitch, yaw)`. The single source of truth for how
+/// each authored framing maps to the hardware camera (used by both the per-frame
+/// director and the boot-time seed in `setup`). `orbit_yaw` is the OrbitSet angle
+/// (radians) applied to the Follow framing; 0 = the default (camera behind).
+fn frame_for(mode: CameraMode, ax: f32, az: f32, orbit_yaw: f32) -> (Vec3, f32, f32) {
+    match mode {
+        // Soft 3/4 follow (open arenas): camera trails the avatar at distance
+        // `dist`, on a circle the player can orbit with the pen (OrbitSet). At
+        // yaw 0 it sits directly behind (+Z); a yaw θ rotates that offset around
+        // the avatar (offset = (sinθ, cosθ)·dist), and the camera yaw matches so
+        // it keeps looking at the avatar — a chosen angle, never a free camera.
+        CameraMode::Follow {
+            height,
+            dist,
+            pitch,
+        } => {
+            let (s, c) = (libm::sinf(orbit_yaw), libm::cosf(orbit_yaw));
+            (
+                Vec3::new(ax + dist * s, height, az + dist * c),
+                pitch,
+                orbit_yaw,
+            )
+        }
+        // Straight-down tactical framing.
+        CameraMode::TopDown { height } => (
+            Vec3::new(ax, height, az + TD_EPS),
+            -core::f32::consts::FRAC_PI_2,
+            0.0,
+        ),
+        // Side-on **rail** for 2.5D corridors. The corridor runs along world X;
+        // the camera tracks the avatar's X but its depth is **locked** to the
+        // rail (fixed Z = `dist`), so the avatar's depth excursions never move
+        // the camera — "can't fall the wrong way". `pitch` tilts it down onto
+        // the floor; yaw stays 0 (looking into -Z), so the corridor reads as a
+        // flat side-on plane.
+        CameraMode::Rail2_5D {
+            height,
+            dist,
+            pitch,
+        } => (Vec3::new(ax, height, dist), pitch, 0.0),
+        // Capture-framing: a fixed elevated frame on the arena origin that does
+        // **not** track the avatar — the camera holds while you draw + dodge.
+        CameraMode::CaptureFraming => (Vec3::new(0.0, CAM_HEIGHT, CAM_DIST), CAM_PITCH, 0.0),
+    }
+}
+
+/// Radians of camera yaw per screen-pixel of stylus drag (a full 256-px sweep ≈
+/// 165°, enough to swing the arena well past side-on).
+const ORBIT_SENS: f32 = 0.0113;
+/// Stylus travel (px) before a ◄-hold counts as a *drag* (set the angle) rather
+/// than a *tap* (reset to default) — debounces a jittery touch on a bare tap.
+const ORBIT_DRAG_MIN: f32 = 6.0;
+
+/// OrbitSet (#23): while stowed in a Follow space, holding cluster ◄
+/// ([`control::Action::CamOrbit`]) and dragging the stylus chooses the yaw the
+/// camera orbits the avatar at (`drive_camera`/`frame_for` apply it). Releasing
+/// after a drag **locks** the angle; releasing a bare tap **resets** to default.
+/// Locomotion is suppressed during the hold (`player::move_player`), so the same
+/// drag doesn't also move the avatar — the pen is borrowed for the camera.
+fn orbit_camera(
+    state: Res<PlayerState>,
+    input: Res<ButtonInput<DsButton>>,
+    handed: Res<Handedness>,
+    touches: Res<Touches>,
+    scene: Option<Res<LoadedScene>>,
+    mut orbit: ResMut<Orbit>,
+) {
+    // Only meaningful for the open-arena Follow base, and only while stowed
+    // (deploying locks the frame). Otherwise the ◄ input is inert here.
+    let follow_base = scene
+        .map(|s| matches!(s.0.camera, CameraMode::Follow { .. }))
+        .unwrap_or(true);
+    let held = !state.is_deployed()
+        && follow_base
+        && control::pressed(control::Action::CamOrbit, *handed, &input);
+
+    if held {
+        // Track the stylus drag → a live yaw the camera previews.
+        if let Some(touch) = touches.iter().next() {
+            let x = touch.position().x;
+            match orbit.anchor {
+                None => {
+                    orbit.anchor = Some(x);
+                    orbit.base = orbit.yaw; // build on the currently locked angle
+                }
+                Some(a) => {
+                    let dx = x - a;
+                    if dx.abs() >= ORBIT_DRAG_MIN {
+                        orbit.dragged = true;
+                    }
+                    orbit.live = Some(orbit.base + dx * ORBIT_SENS);
+                }
+            }
+        }
+        orbit.holding = true;
+    } else {
+        // The frame ◄ is released: resolve the gesture (a drag locks the chosen
+        // angle; a bare tap resets to the default framing), then clear transients.
+        if orbit.holding {
+            if orbit.dragged {
+                if let Some(live) = orbit.live {
+                    orbit.yaw = live;
+                }
+            } else {
+                orbit.yaw = 0.0;
+            }
+        }
+        orbit.holding = false;
+        orbit.anchor = None;
+        orbit.live = None;
+        orbit.dragged = false;
+    }
 }
 
 // --- Rendering ---------------------------------------------------------------

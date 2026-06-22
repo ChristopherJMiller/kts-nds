@@ -55,6 +55,9 @@ bevy_nds_bg = { path = "crates/bevy_nds_bg" }
 bevy_nds_math = { path = "crates/bevy_nds_math" }
 bevy_nds_loop = { path = "crates/bevy_nds_loop" }
 
+# Soft-float trig for the orbit-camera yaw (no FPU; matches the engine crates).
+libm = "0.2"
+
 bevy_app = { version = "0.16", default-features = false, features = [
   "critical-section",
 ] }
