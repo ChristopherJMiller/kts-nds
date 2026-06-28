@@ -22,8 +22,10 @@ use serde::{Deserialize, Serialize};
 /// ASCII `"BSC1"` — magic prefix of a baked `.scene` file. Matches
 /// `bevy_nds_scene::asset::MAGIC`.
 pub const ASSET_MAGIC: u32 = u32::from_le_bytes(*b"BSC1");
-/// `.scene` format version. Matches `bevy_nds_scene::asset::VERSION`.
-pub const VERSION: u16 = 1;
+/// `.scene` format version. Matches `bevy_nds_scene::asset::VERSION`. v2 replaced
+/// hand-authored `exits` with a zone `bounds` + baker-**derived** `connections`
+/// (the Euclidean map rework, #27).
+pub const VERSION: u16 = 2;
 /// Extension of a baked space.
 pub const ASSET_EXT: &str = "scene";
 /// NitroFS subdirectory holding baked spaces (mirrors the source `spaces/`).
@@ -31,19 +33,40 @@ pub const NITROFS_SUBDIR: &str = "spaces";
 
 // --- RON authoring model -----------------------------------------------------
 
-/// A space as authored in RON. Terse: most fields default so a hand-written
-/// file only states what differs.
+/// A zone as authored in RON. Terse: most fields default so a hand-written file
+/// only states what differs. A zone is one cell of the **Euclidean map** (#27):
+/// it lives at `place` in the shared global frame and the baker derives its
+/// connections from which zones abut it there — the author never writes exits.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Space {
-    /// Per-space camera framing (#27). Defaults to a soft follow.
+    /// Per-zone camera framing (#27). Defaults to a soft follow.
     #[serde(default)]
     pub camera: Camera,
-    /// Placed objects (geometry + role).
+    /// This zone's placement in the shared global map frame (XZ). **Authoring
+    /// only** — the baker uses it to derive connections; it never reaches the
+    /// runtime (only the resulting per-connection deltas do).
+    #[serde(default)]
+    pub place: [f32; 2],
+    /// The zone's walkable extent, in **local** coordinates. Drives the runtime
+    /// clamp and the boundary derivation. Defaults to a ±2 arena pad.
+    #[serde(default)]
+    pub bounds: Bounds,
+    /// Placed objects (geometry + role), in local coordinates.
     #[serde(default)]
     pub instances: Vec<Instance>,
-    /// Connections to neighbouring spaces in the level graph.
-    #[serde(default)]
-    pub exits: Vec<Exit>,
+}
+
+/// A rectangle on the ground (XZ) plane, in a zone's **local** coordinates.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct Bounds {
+    pub min: [f32; 2],
+    pub max: [f32; 2],
+}
+
+impl Default for Bounds {
+    fn default() -> Self {
+        Self { min: [-2.0, -2.0], max: [2.0, 2.0] }
+    }
 }
 
 /// Per-space authored camera. Variant order is the wire enum (#27); extend at
@@ -98,22 +121,78 @@ pub struct Material {
     pub ambient: [u8; 3],
 }
 
-/// A graph connection to a neighbouring space.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Exit {
-    /// Name (stem) of the neighbouring space, e.g. `"corridor_b"`. Use
-    /// `"UNRESOLVED"` to deliberately defer a neighbour (#27 checklist).
-    pub to: String,
-    #[serde(default)]
-    pub at: [f32; 3],
-    /// Gate/objective id (0 = always open).
-    #[serde(default)]
+/// Edge of a zone a boundary lies on, west/east along ±X and south/north along
+/// ±Z. The wire value baked into the `.scene` blob.
+pub const SIDE_WEST: u8 = 0; // -X
+pub const SIDE_EAST: u8 = 1; // +X
+pub const SIDE_SOUTH: u8 = 2; // -Z
+pub const SIDE_NORTH: u8 = 3; // +Z
+
+/// A **derived** connection from one zone across a shared boundary to a
+/// neighbour — computed by [`derive_connections`] from the zones' global
+/// placement, never hand-authored. `side` is which edge of *this* zone the
+/// boundary lies on; `lo`/`hi` bound the boundary segment along that edge (in
+/// this zone's local coordinates, on the axis parallel to the edge); `delta` is
+/// added to the avatar's local position when it crosses, placing it in the
+/// neighbour's frame with its global position unchanged.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Connection {
+    pub neighbour: String,
+    pub side: u8,
+    pub lo: f32,
+    pub hi: f32,
+    pub delta: [f32; 2],
     pub gate: u32,
 }
 
-/// Sentinel a designer writes for a not-yet-authored neighbour, so a dangling
-/// exit is an intentional marker, not a typo.
-pub const UNRESOLVED: &str = "UNRESOLVED";
+/// Derive each zone's connections from the whole map's global layout: two zones
+/// connect wherever their `bounds` (placed at `place`) **abut** along a shared
+/// edge with overlapping extent. This is the heart of the Euclidean model — the
+/// designer lays zones out in one frame and the connections (and the cross-over
+/// `delta`) fall out of the geometry. Pure + host-tested.
+pub fn derive_connections(zones: &[(String, Space)]) -> std::collections::BTreeMap<String, Vec<Connection>> {
+    /// Abutment / overlap tolerance (world units).
+    const TOL: f32 = 0.01;
+    let mut out = std::collections::BTreeMap::new();
+    for (an, a) in zones {
+        let (axmin, axmax) = (a.place[0] + a.bounds.min[0], a.place[0] + a.bounds.max[0]);
+        let (azmin, azmax) = (a.place[1] + a.bounds.min[1], a.place[1] + a.bounds.max[1]);
+        let mut conns: Vec<Connection> = Vec::new();
+        for (bn, b) in zones {
+            if bn == an {
+                continue;
+            }
+            let (bxmin, bxmax) = (b.place[0] + b.bounds.min[0], b.place[0] + b.bounds.max[0]);
+            let (bzmin, bzmax) = (b.place[1] + b.bounds.min[1], b.place[1] + b.bounds.max[1]);
+            let delta = [a.place[0] - b.place[0], a.place[1] - b.place[1]];
+            // East/west edges share a vertical (Z) seam; north/south share a
+            // horizontal (X) seam. `lo`/`hi` are the overlap along the seam,
+            // expressed back in A's local coordinates.
+            let mut push = |side: u8, edge_meets: bool, lo_g: f32, hi_g: f32, axis_origin: f32| {
+                if edge_meets && hi_g - lo_g > TOL {
+                    conns.push(Connection {
+                        neighbour: bn.clone(),
+                        side,
+                        lo: lo_g - axis_origin,
+                        hi: hi_g - axis_origin,
+                        delta,
+                        gate: 0,
+                    });
+                }
+            };
+            let zlo = azmin.max(bzmin);
+            let zhi = azmax.min(bzmax);
+            push(SIDE_EAST, (axmax - bxmin).abs() < TOL, zlo, zhi, a.place[1]);
+            push(SIDE_WEST, (axmin - bxmax).abs() < TOL, zlo, zhi, a.place[1]);
+            let xlo = axmin.max(bxmin);
+            let xhi = axmax.min(bxmax);
+            push(SIDE_NORTH, (azmax - bzmin).abs() < TOL, xlo, xhi, a.place[0]);
+            push(SIDE_SOUTH, (azmin - bzmax).abs() < TOL, xlo, xhi, a.place[0]);
+        }
+        out.insert(an.clone(), conns);
+    }
+    out
+}
 
 // --- Parse / validate / encode ----------------------------------------------
 
@@ -132,10 +211,8 @@ pub fn to_ron(space: &Space) -> Result<String, String> {
     ron::ser::to_string_pretty(space, cfg).map_err(|e| format!("RON serialize error: {e}"))
 }
 
-/// Hard-validate a space (errors that *guarantee* a broken ROM). `mesh_exists`
-/// reports whether a referenced mesh has a source `.obj`; `space_exists` whether
-/// a neighbour space file is present. Soft issues are returned via
-/// [`validate_warnings`] instead.
+/// Hard-validate a zone (errors that *guarantee* a broken ROM). `mesh_exists`
+/// reports whether a referenced mesh has a source `.obj`.
 pub fn validate(
     space: &Space,
     mesh_exists: impl Fn(&str) -> bool,
@@ -153,27 +230,43 @@ pub fn validate(
             }
         }
     }
+    let b = &space.bounds;
+    if b.min[0] >= b.max[0] || b.min[1] >= b.max[1] {
+        return Err(format!(
+            "bounds min {:?} must be strictly less than max {:?} on both axes",
+            b.min, b.max
+        ));
+    }
     Ok(())
 }
 
-/// Non-fatal authoring warnings (a dangling exit not marked `UNRESOLVED`). The
-/// caller (build.rs) surfaces these as `cargo:warning=` lines.
-pub fn validate_warnings(space: &Space, space_exists: impl Fn(&str) -> bool) -> Vec<String> {
-    let mut warnings = Vec::new();
-    for exit in &space.exits {
-        if exit.to != UNRESOLVED && !space_exists(&exit.to) {
-            warnings.push(format!(
-                "exit to `{}`: no such space `{}.ron` (mark it `UNRESOLVED` to defer)",
-                exit.to, exit.to
-            ));
+/// Non-fatal authoring warnings, given the whole map's derived connections: a
+/// zone that abuts nothing (isolated) in a multi-zone map is almost certainly a
+/// misplacement. The caller (build.rs) surfaces these as `cargo:warning=` lines.
+pub fn isolation_warnings(
+    conns: &std::collections::BTreeMap<String, Vec<Connection>>,
+) -> std::collections::BTreeMap<String, Vec<String>> {
+    let mut warnings = std::collections::BTreeMap::new();
+    if conns.len() < 2 {
+        return warnings; // a single-zone map is legitimately unconnected
+    }
+    for (stem, cs) in conns {
+        if cs.is_empty() {
+            warnings.insert(
+                stem.clone(),
+                std::vec![format!(
+                    "zone `{stem}` is isolated — no other zone's bounds abut it; check its `place`/`bounds`"
+                )],
+            );
         }
     }
     warnings
 }
 
-/// Encode a space to the `.scene` blob. Authoritative writer; the inverse is
+/// Encode a zone to the `.scene` blob, with its baker-derived `conns` (see
+/// [`derive_connections`]). Authoritative writer; the inverse is
 /// `bevy_nds_scene::asset::parse`.
-pub fn encode(space: &Space) -> Vec<u8> {
+pub fn encode(space: &Space, conns: &[Connection]) -> Vec<u8> {
     let mut w = Writer::default();
     w.u32(ASSET_MAGIC);
     w.u16(VERSION);
@@ -244,13 +337,21 @@ pub fn encode(space: &Space) -> Vec<u8> {
             w.f32(p[1]);
         }
     }
-    w.u32(space.exits.len() as u32);
-    for exit in &space.exits {
-        w.string(&exit.to);
-        for v in exit.at {
-            w.f32(v);
-        }
-        w.u32(exit.gate);
+    // Zone bounds (local rect: min_x, min_z, max_x, max_z).
+    w.f32(space.bounds.min[0]);
+    w.f32(space.bounds.min[1]);
+    w.f32(space.bounds.max[0]);
+    w.f32(space.bounds.max[1]);
+    // Derived connections.
+    w.u32(conns.len() as u32);
+    for c in conns {
+        w.string(&c.neighbour);
+        w.u8(c.side);
+        w.f32(c.lo);
+        w.f32(c.hi);
+        w.f32(c.delta[0]);
+        w.f32(c.delta[1]);
+        w.u32(c.gate);
     }
     w.0
 }
@@ -314,28 +415,36 @@ pub fn build_dir(src_dir: &Path, dst_dir: &Path, assets_dir: &Path) -> Result<Ve
 
     let mesh_exists = |name: &str| assets_dir.join(format!("{name}.obj")).is_file();
 
-    let mut built = Vec::new();
+    // Parse + hard-validate every zone first — connection derivation needs the
+    // whole map at once (each zone's neighbours depend on the global layout).
+    let mut zones: Vec<(String, Space)> = Vec::new();
     for (stem, input) in stems.iter().zip(inputs.iter()) {
         let src = std::fs::read_to_string(input)
             .map_err(|e| format!("could not read {}: {e}", input.display()))?;
         let space = parse_ron(&src).map_err(|e| format!("{}: {e}", input.display()))?;
         validate(&space, mesh_exists).map_err(|e| format!("{}: {e}", input.display()))?;
-        let space_exists = |name: &str| stems.iter().any(|s| s == name);
-        let warnings = validate_warnings(&space, space_exists);
+        zones.push((stem.clone(), space));
+    }
 
+    let conns = derive_connections(&zones);
+    let warns = isolation_warnings(&conns);
+
+    let mut built = Vec::new();
+    for ((stem, space), input) in zones.iter().zip(inputs.iter()) {
+        let zone_conns = conns.get(stem).map(Vec::as_slice).unwrap_or(&[]);
         let output = dst_dir.join(format!("{stem}.{ASSET_EXT}"));
         if let Some(parent) = output.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("could not create {}: {e}", parent.display()))?;
         }
-        std::fs::write(&output, encode(&space))
+        std::fs::write(&output, encode(space, zone_conns))
             .map_err(|e| format!("could not write {}: {e}", output.display()))?;
 
         built.push(Built {
             input: input.clone(),
             output,
             stem: stem.clone(),
-            warnings,
+            warnings: warns.get(stem).cloned().unwrap_or_default(),
         });
     }
     Ok(built)
@@ -430,9 +539,17 @@ mod tests {
                 ),
                 Instance(role: "spawn"),
             ],
-            exits: [ Exit(to: "corridor_b", at: (2.0, 0.0, 0.0)) ],
         )
     "#;
+
+    fn zone(place: [f32; 2], min: [f32; 2], max: [f32; 2]) -> Space {
+        Space {
+            camera: Camera::default(),
+            place,
+            bounds: Bounds { min, max },
+            instances: Vec::new(),
+        }
+    }
 
     #[test]
     fn parses_terse_ron_with_defaults() {
@@ -449,7 +566,7 @@ mod tests {
     #[test]
     fn encodes_with_expected_header() {
         let space = parse_ron(SAMPLE).unwrap();
-        let blob = encode(&space);
+        let blob = encode(&space, &[]);
         assert_eq!(&blob[0..4], b"BSC1");
         assert_eq!(u16::from_le_bytes([blob[4], blob[5]]), VERSION);
         assert_eq!(u16::from_le_bytes([blob[6], blob[7]]), 0); // Follow
@@ -466,13 +583,51 @@ mod tests {
     }
 
     #[test]
-    fn warns_on_dangling_exit() {
-        let space = parse_ron(SAMPLE).unwrap();
-        let warns = validate_warnings(&space, |_| false);
-        assert_eq!(warns.len(), 1);
-        assert!(warns[0].contains("corridor_b"));
-        // Present neighbour → no warning.
-        assert!(validate_warnings(&space, |n| n == "corridor_b").is_empty());
+    fn derives_connection_between_abutting_zones() {
+        // Atrium (±2 pad) at the origin; corridor placed east so its west edge
+        // (local -2.2 + place 4.2 = 2.0) meets the atrium's east edge (2.0).
+        let zones = std::vec![
+            ("atrium".to_string(), zone([0.0, 0.0], [-2.0, -2.0], [2.0, 2.0])),
+            ("corridor".to_string(), zone([4.2, 0.0], [-2.2, -0.55], [2.2, 0.55])),
+        ];
+        let conns = derive_connections(&zones);
+
+        let a = &conns["atrium"];
+        assert_eq!(a.len(), 1, "atrium should connect to exactly the corridor");
+        assert_eq!(a[0].neighbour, "corridor");
+        assert_eq!(a[0].side, SIDE_EAST);
+        // Crossing east adds (place_atrium - place_corridor) to land in the
+        // corridor's frame: (0 - 4.2, 0) = (-4.2, 0).
+        assert!((a[0].delta[0] - (-4.2)).abs() < 1e-4, "delta {:?}", a[0].delta);
+        assert!(a[0].delta[1].abs() < 1e-4);
+        // Boundary span = the z-overlap (the corridor's narrow rail), in atrium-local z.
+        assert!((a[0].lo - (-0.55)).abs() < 1e-4 && (a[0].hi - 0.55).abs() < 1e-4);
+
+        let c = &conns["corridor"];
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].side, SIDE_WEST);
+        assert!((c[0].delta[0] - 4.2).abs() < 1e-4, "delta {:?}", c[0].delta);
+    }
+
+    #[test]
+    fn isolated_zone_warns_only_in_a_multi_zone_map() {
+        // Two zones far apart → both isolated → both warn.
+        let zones = std::vec![
+            ("a".to_string(), zone([0.0, 0.0], [-1.0, -1.0], [1.0, 1.0])),
+            ("b".to_string(), zone([100.0, 0.0], [-1.0, -1.0], [1.0, 1.0])),
+        ];
+        let warns = isolation_warnings(&derive_connections(&zones));
+        assert_eq!(warns.len(), 2);
+        // A lone zone is legitimately unconnected → no warning.
+        let lone = std::vec![("solo".to_string(), zone([0.0, 0.0], [-1.0, -1.0], [1.0, 1.0]))];
+        assert!(isolation_warnings(&derive_connections(&lone)).is_empty());
+    }
+
+    #[test]
+    fn validate_rejects_degenerate_bounds() {
+        let mut space = parse_ron(SAMPLE).unwrap();
+        space.bounds = Bounds { min: [2.0, -2.0], max: [-2.0, 2.0] }; // min.x >= max.x
+        assert!(validate(&space, |_| true).is_err());
     }
 
     #[test]
@@ -482,7 +637,7 @@ mod tests {
         let text = to_ron(&original).unwrap();
         let reparsed = parse_ron(&text).unwrap();
         // Compare the encoded blobs (covers every field without deriving PartialEq).
-        assert_eq!(encode(&original), encode(&reparsed));
+        assert_eq!(encode(&original, &[]), encode(&reparsed, &[]));
     }
 
     #[test]

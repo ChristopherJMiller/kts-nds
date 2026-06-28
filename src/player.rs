@@ -22,8 +22,10 @@ use bevy_ecs::prelude::*;
 use bevy_nds::prelude::*;
 use bevy_nds_math::stick::{StickConfig, smooth as vel_smooth, stick_vector};
 
+use bevy_nds_scene::CameraMode;
+
 use crate::control::{self, Action};
-use crate::{ARENA_HALF, Avatar, LANDMARK_COLLIDE, Landmarks, Stroke, WorldPos};
+use crate::{Avatar, LANDMARK_COLLIDE, Landmarks, Stroke, WorldPos};
 
 // --- Stylus conditioning (Spike A defaults, locked 2026-06-14) ---------------
 
@@ -159,6 +161,18 @@ impl Locomotion {
             gravity: Fx32::from_f32(10.0),
         }
     }
+
+    /// Pick the movement preset implied by a space's authored camera (#27): a
+    /// side-on [`CameraMode::Rail2_5D`] is a traversal corridor (tighter feel);
+    /// everything else is an open arena. Lets a space transition swap the feel
+    /// without a separate authored field — the camera mode already encodes the
+    /// space's role (arena tension vs corridor rest).
+    pub fn for_camera(mode: CameraMode) -> Self {
+        match mode {
+            CameraMode::Rail2_5D { .. } => Self::corridor(),
+            _ => Self::arena(),
+        }
+    }
 }
 
 impl Default for Locomotion {
@@ -208,6 +222,7 @@ pub fn move_player(
     handed: Res<Handedness>,
     state: Res<PlayerState>,
     loco: Res<Locomotion>,
+    zone: Res<crate::transition::Zone>,
     mut stick: ResMut<StickState>,
     mut motion: ResMut<Motion>,
     landmarks: Res<Landmarks>,
@@ -249,11 +264,14 @@ pub fn move_player(
         height.grounded = false;
     }
 
-    // Apply horizontal move: clamp to the arena, push out of landmark obstacles.
-    let bound = Fx32::from_f32(ARENA_HALF);
+    // Apply horizontal move: clamp to the current zone's bounds (the depth band
+    // is tight for a 2.5D corridor, so the avatar can't walk into the rail
+    // camera), push out of landmark obstacles. `WorldPos.y` is the world depth
+    // (Z) axis; `Zone.bounds` is `[min_x, min_z, max_x, max_z]`.
+    let [min_x, min_z, max_x, max_z] = zone.bounds;
     let mut np = pos.0 + delta;
-    np.x = np.x.clamp(-bound, bound);
-    np.y = np.y.clamp(-bound, bound);
+    np.x = np.x.clamp(Fx32::from_f32(min_x), Fx32::from_f32(max_x));
+    np.y = np.y.clamp(Fx32::from_f32(min_z), Fx32::from_f32(max_z));
     let min = Fx32::from_f32(LANDMARK_COLLIDE);
     for &c in &landmarks.0 {
         let sep = np - c;

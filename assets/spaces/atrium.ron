@@ -14,6 +14,12 @@ Space(
     // Soft 3/4 follow (the Spike-C CAM_* defaults).
     camera: Follow(height: 1.7, dist: 2.0, pitch: -0.7),
 
+    // This zone's spot in the shared global map frame, and its local walkable
+    // rect. The atrium is the origin of the map; the corridor is placed to its
+    // east (corridor.ron) so the two abut and the baker derives the connection.
+    place: (0.0, 0.0),
+    bounds: (min: (-2.0, -2.0), max: (2.0, 2.0)),
+
     instances: [
         // The player avatar (teapot is Z-up, so stand it on the ground with Rx -90°).
         Instance(
@@ -52,10 +58,8 @@ Space(
             material: Some((diffuse: (120, 120, 138), ambient: (34, 34, 44))),
         ),
     ],
-
-    // Arena → traversal corridor (the rest beat after this tension peak). The
-    // corridor is a real authored neighbour now (corridor.ron).
-    exits: [
-        Exit(to: "corridor", at: (0.0, 0.0, 2.5)),
-    ],
+    // No `exits`: the connection to the corridor is **derived** by the baker
+    // from the two zones' placement (the corridor's west edge abuts this zone's
+    // east edge), so walking off the east edge streams the corridor in with the
+    // avatar's position carried across.
 )

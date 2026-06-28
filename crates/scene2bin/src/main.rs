@@ -50,16 +50,14 @@ fn run() -> Result<(), String> {
 
     let mesh_exists = |name: &str| assets.join(format!("{name}.obj")).is_file();
     scene2bin::validate(&space, mesh_exists).map_err(|e| format!("{}: {e}", input.display()))?;
-    for w in scene2bin::validate_warnings(&space, |_| true) {
-        eprintln!("scene2bin: warning: {}: {w}", input.display());
-    }
 
     if check_only {
         eprintln!(
-            "scene2bin: {} ok ({} instances, {} exits)",
+            "scene2bin: {} ok ({} instances, bounds {:?}..{:?})",
             input.display(),
             space.instances.len(),
-            space.exits.len()
+            space.bounds.min,
+            space.bounds.max
         );
         return Ok(());
     }
@@ -69,7 +67,10 @@ fn run() -> Result<(), String> {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("could not create {}: {e}", parent.display()))?;
     }
-    let blob = scene2bin::encode(&space);
+    // Single-file mode can't derive connections (they need the whole map's
+    // layout); bake with none. The directory bake (`build_dir`, used by
+    // `build.rs`) is the authoritative path that derives connections.
+    let blob = scene2bin::encode(&space, &[]);
     std::fs::write(&output, &blob)
         .map_err(|e| format!("could not write {}: {e}", output.display()))?;
     eprintln!(

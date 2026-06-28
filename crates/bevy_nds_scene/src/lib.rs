@@ -28,7 +28,7 @@ extern crate alloc;
 
 mod asset;
 
-pub use asset::{CameraMode, SceneData, SceneExitData, SceneInstanceData};
+pub use asset::{CameraMode, SceneConnData, SceneData, SceneInstanceData, parse};
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -118,12 +118,35 @@ fn load_mesh(name: &str) -> Option<DsMesh> {
     DsMesh::load(&path)
 }
 
+/// Build the NUL-terminated NitroFS path for a space from its bare name:
+/// `"corridor"` → `b"nitro:/spaces/corridor.scene\0"`. The inverse of the name
+/// stored in [`SceneExitData::target`], so a graph transition can turn an exit's
+/// target into a path for [`load`] / [`LoadSpace`]. Mirrors `scene2bin`'s
+/// `NITROFS_SUBDIR` (`spaces`) + `ASSET_EXT` (`scene`) — keep the two in sync.
+pub fn space_path(name: &str) -> Vec<u8> {
+    const PREFIX: &[u8] = b"nitro:/spaces/";
+    const SUFFIX: &[u8] = b".scene\0";
+    let mut path = Vec::with_capacity(PREFIX.len() + name.len() + SUFFIX.len());
+    path.extend_from_slice(PREFIX);
+    path.extend_from_slice(name.as_bytes());
+    path.extend_from_slice(SUFFIX);
+    path
+}
+
 /// Sent to request loading a space at runtime (a graph transition). For the
 /// startup case, call [`load`] + [`spawn`] directly. `path` is a NUL-terminated
-/// `nitro:/` path.
+/// `nitro:/` path (see [`space_path`]).
 #[derive(Event, Clone)]
 pub struct LoadSpace {
     pub path: Vec<u8>,
+}
+
+impl LoadSpace {
+    /// Request the neighbour space named by an exit's `target`
+    /// (see [`space_path`]).
+    pub fn by_name(name: &str) -> Self {
+        Self { path: space_path(name) }
+    }
 }
 
 /// Drains [`LoadSpace`] events: loads + spawns each requested space. The game is
@@ -151,7 +174,19 @@ impl Plugin for ScenePlugin {
 
 pub mod prelude {
     pub use crate::{
-        CameraMode, LoadSpace, LoadedScene, ScenePath, ScenePlugin, SceneData,
-        SceneExitData, SceneInstance, SceneInstanceData,
+        CameraMode, LoadSpace, LoadedScene, ScenePath, ScenePlugin, SceneConnData,
+        SceneData, SceneInstance, SceneInstanceData, space_path,
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::space_path;
+
+    #[test]
+    fn space_path_builds_nul_terminated_nitro_path() {
+        assert_eq!(space_path("corridor"), b"nitro:/spaces/corridor.scene\0");
+        assert_eq!(space_path("atrium"), b"nitro:/spaces/atrium.scene\0");
+        assert_eq!(space_path("corridor").last(), Some(&0));
+    }
 }

@@ -62,7 +62,9 @@ pub use bevy_nds_runtime::run;
 pub use bevy_nds_save::{SavePlugin, SaveStorage, StorageStatus};
 pub use bevy_nds_text::{DsText, Glyph, TextRenderPlugin, TilePos};
 pub use bevy_nds_time::TimePlugin;
-pub use bevy_nds_video::{ConsoleHandle, Consoles, DsScreen, PrintConsole, VideoPlugin};
+pub use bevy_nds_video::{
+    ConsoleHandle, Consoles, DsScreen, MasterBright, PrintConsole, VideoPlugin,
+};
 
 /// Bundles every DS platform plugin. Add this to your [`App`] to wire up the
 /// screens, input, time, text rendering and the ROM filesystem, then call
@@ -89,8 +91,8 @@ impl PluginGroup for DsPlugins {
 pub mod prelude {
     pub use crate::{
         Backgrounds, Cluster, DsButton, DsPlugins, DsScreen, DsText, Fps, Fx32, FxVec2, FxVec3,
-        Gesture, GestureEvent, Gestures, Glyph, Handedness, NitroFs, SaveStorage, Shoulder,
-        StorageStatus, SwipeDir, Task, Tasks, TilePos, WallClock, run,
+        Gesture, GestureEvent, Gestures, Glyph, Handedness, MasterBright, NitroFs, SaveStorage,
+        Shoulder, StorageStatus, SwipeDir, Task, Tasks, TilePos, WallClock, run,
     };
     pub use bevy_input::ButtonInput;
     pub use bevy_input::touch::{TouchInput, TouchPhase, Touches};

@@ -13,7 +13,7 @@
 
 use eframe::egui;
 use egui::{Align2, Color32, FontId, Pos2, Rect, Sense, Shape, Stroke, Vec2};
-use scene2bin::{Camera, Exit, Instance, Material, Space};
+use scene2bin::{Camera, Instance, Material, Space};
 
 const ARENA_HALF: f32 = 2.0;
 /// Common roles offered in the role picker (free text still allowed).
@@ -121,14 +121,10 @@ impl EditorApp {
         match scene2bin::to_ron(&self.space) {
             Ok(text) => match std::fs::write(&self.path, text) {
                 Ok(()) => {
-                    let warns = scene2bin::validate_warnings(&self.space, |n| {
-                        self.spaces.iter().any(|s| s == n)
-                    });
-                    self.status = if warns.is_empty() {
-                        format!("saved {}", self.path)
-                    } else {
-                        format!("saved {} ({})", self.path, warns.join("; "))
-                    };
+                    // Connections are derived across the whole map at bake time
+                    // (`build_dir`), not per-file, so there's nothing to warn
+                    // about on a single-zone save.
+                    self.status = format!("saved {}", self.path);
                     self.rescan();
                 }
                 Err(e) => self.status = format!("write failed: {e}"),
@@ -201,7 +197,7 @@ impl EditorApp {
             ui.separator();
             self.selected_instance_ui(ui);
             ui.separator();
-            self.exits_ui(ui);
+            self.zone_ui(ui);
         });
     }
 
@@ -348,42 +344,28 @@ impl EditorApp {
         });
     }
 
-    fn exits_ui(&mut self, ui: &mut egui::Ui) {
+    /// Zone placement + walkable bounds. Connections to neighbours are **derived**
+    /// at bake time from these (which zones abut in the shared global frame), so
+    /// there's no exit list to author. (A full global map-layout canvas — drag
+    /// whole zones, see seams — is the planned follow-up; #27.)
+    fn zone_ui(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Zone");
         ui.horizontal(|ui| {
-            ui.heading("Exits");
-            if ui.button("+ add").clicked() {
-                self.space.exits.push(Exit {
-                    to: scene2bin::UNRESOLVED.to_string(),
-                    at: [0.0, 0.0, 0.0],
-                    gate: 0,
-                });
-            }
+            ui.label("place (global x,z)");
+            ui.add(egui::DragValue::new(&mut self.space.place[0]).speed(0.05).prefix("x "));
+            ui.add(egui::DragValue::new(&mut self.space.place[1]).speed(0.05).prefix("z "));
         });
-        let mut to_delete = None;
-        for i in 0..self.space.exits.len() {
-            ui.horizontal(|ui| {
-                let cur = self.space.exits[i].to.clone();
-                egui::ComboBox::from_id_salt(("exit", i))
-                    .selected_text(&cur)
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(
-                            &mut self.space.exits[i].to,
-                            scene2bin::UNRESOLVED.to_string(),
-                            scene2bin::UNRESOLVED,
-                        );
-                        for s in &self.spaces {
-                            ui.selectable_value(&mut self.space.exits[i].to, s.clone(), s);
-                        }
-                    });
-                if ui.small_button("✕").clicked() {
-                    to_delete = Some(i);
-                }
-            });
-            vec3_row(ui, &format!("at##{i}"), &mut self.space.exits[i].at, 0.01);
-        }
-        if let Some(i) = to_delete {
-            self.space.exits.remove(i);
-        }
+        ui.horizontal(|ui| {
+            ui.label("bounds min");
+            ui.add(egui::DragValue::new(&mut self.space.bounds.min[0]).speed(0.05).prefix("x "));
+            ui.add(egui::DragValue::new(&mut self.space.bounds.min[1]).speed(0.05).prefix("z "));
+        });
+        ui.horizontal(|ui| {
+            ui.label("bounds max");
+            ui.add(egui::DragValue::new(&mut self.space.bounds.max[0]).speed(0.05).prefix("x "));
+            ui.add(egui::DragValue::new(&mut self.space.bounds.max[1]).speed(0.05).prefix("z "));
+        });
+        ui.label("Connections derive from placement at bake.");
     }
 
     fn canvas(&mut self, ui: &mut egui::Ui) {
@@ -410,7 +392,7 @@ impl EditorApp {
         );
 
         self.draw_paths(&painter, rect);
-        self.draw_exits(&painter, rect);
+        self.draw_bounds(&painter, rect);
         self.draw_instances(&painter, rect);
         self.handle_pointer(&resp, rect);
     }
@@ -457,19 +439,19 @@ impl EditorApp {
         }
     }
 
-    fn draw_exits(&self, painter: &egui::Painter, rect: Rect) {
-        for exit in &self.space.exits {
-            let p = self.world_to_screen(rect, Vec2::new(exit.at[0], exit.at[2]));
-            let col = Color32::from_rgb(110, 200, 140);
-            painter.circle_stroke(p, 7.0, Stroke::new(1.5_f32, col));
-            painter.text(
-                p + Vec2::new(9.0, -9.0),
-                Align2::LEFT_BOTTOM,
-                format!("→{}", exit.to),
-                FontId::proportional(11.0),
-                col,
-            );
-        }
+    /// Draw the zone's walkable bounds — connections are derived where these
+    /// rectangles abut across zones (the canvas shows one zone, but the bounds
+    /// edges are where neighbours attach).
+    fn draw_bounds(&self, painter: &egui::Painter, rect: Rect) {
+        let b = &self.space.bounds;
+        let min = self.world_to_screen(rect, Vec2::new(b.min[0], b.min[1]));
+        let max = self.world_to_screen(rect, Vec2::new(b.max[0], b.max[1]));
+        painter.rect_stroke(
+            Rect::from_two_pos(min, max),
+            0.0,
+            Stroke::new(1.5_f32, Color32::from_rgb(90, 110, 150)),
+            egui::StrokeKind::Inside,
+        );
     }
 
     fn draw_instances(&self, painter: &egui::Painter, rect: Rect) {
@@ -592,8 +574,9 @@ impl EditorApp {
 fn empty_space() -> Space {
     Space {
         camera: Camera::default(),
+        place: [0.0, 0.0],
+        bounds: scene2bin::Bounds::default(),
         instances: Vec::new(),
-        exits: Vec::new(),
     }
 }
 

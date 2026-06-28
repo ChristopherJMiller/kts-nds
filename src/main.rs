@@ -47,8 +47,10 @@ use bevy_nds_sprite::prelude::*;
 
 mod control;
 mod player;
+mod transition;
 
 use player::{Height, Locomotion, Motion, PlayerState, Shadow, StickState};
+use transition::{Transition, Zone};
 
 mod sprites {
     #![allow(dead_code)]
@@ -161,6 +163,77 @@ fn flat_quad_xz(half_w: f32, half_d: f32, color: [u8; 3]) -> DsMesh {
 /// [`world_to_map`]), placed on the XZ ground plane (`y = 0`).
 fn map_to_world(sx: f32, sy: f32) -> Vec3 {
     Vec3::new((sx - MAP_CX) / MAP_SCALE, 0.0, (MAP_CY - sy) / MAP_SCALE)
+}
+
+/// Marker for a space's ground plane. Tagged so it's swapped with its space — a
+/// transition despawns it and spawns a fresh one sized to the new space's
+/// camera. Not a `SceneInstance` (it's procedural chrome, not authored geometry),
+/// so the transition handles it explicitly.
+#[derive(Component)]
+struct SpaceFloor;
+
+/// Spawn the ground plane for a space, sized to its authored camera: a square
+/// pad for open arenas, a long shallow strip for a 2.5D corridor rail (so the
+/// floor reads as a corridor, not a stray square under a side-on camera).
+fn spawn_space_floor(commands: &mut Commands, camera: CameraMode) {
+    let (half_x, half_z) = match camera {
+        CameraMode::Rail2_5D { .. } => (3.0, 1.0), // long rail, shallow depth
+        _ => (4.0, 4.0),                            // square arena pad
+    };
+    commands.spawn((
+        SpaceFloor,
+        flat_quad_xz(half_x, half_z, [50, 56, 78]),
+        Transform3d {
+            translation: Vec3::new(0.0, GROUND_Y, 0.0),
+            rotation: Vec3::ZERO,
+            scale: Vec3::ONE,
+        },
+    ));
+}
+
+/// Marker for a connection gatepost — the glowing posts that frame each zone
+/// boundary's opening so the player can *see* where to cross. Despawned +
+/// respawned with the zone (like [`SpaceFloor`]).
+#[derive(Component)]
+struct ConnMarker;
+
+// Gatepost dims (cube.obj is unit half-extent 1.0): a thin, ~0.7-tall pillar
+// resting on the floor, glowing teal (high ambient) to read as a doorway.
+const POST_HALF_W: f32 = 0.07;
+const POST_HALF_H: f32 = 0.35;
+const POST_DIFFUSE: [u8; 3] = [90, 230, 220];
+const POST_AMBIENT: [u8; 3] = [46, 124, 116];
+
+/// Spawn a pair of gateposts at the ends of every connected boundary opening in
+/// `scene`, so the (otherwise invisible) doorway is visible. The baker hands us
+/// the opening as a `side` + `[lo, hi]` span along that edge; we plant a post at
+/// each end on the zone's `bounds` edge.
+fn spawn_connection_markers(commands: &mut Commands, scene: &bevy_nds_scene::SceneData) {
+    let cube = include_obj!("assets/cube.obj", center);
+    let [min_x, min_z, max_x, max_z] = scene.bounds;
+    for c in &scene.connections {
+        // The two ends of the opening, as (x, z). East/west edges run along Z
+        // (so `lo`/`hi` are z); north/south run along X.
+        let ends: [(f32, f32); 2] = match c.side {
+            0 => [(min_x, c.lo), (min_x, c.hi)], // west −X
+            1 => [(max_x, c.lo), (max_x, c.hi)], // east +X
+            2 => [(c.lo, min_z), (c.hi, min_z)], // south −Z
+            3 => [(c.lo, max_z), (c.hi, max_z)], // north +Z
+            _ => continue,
+        };
+        for (x, z) in ends {
+            commands.spawn((
+                ConnMarker,
+                cube.clone(),
+                DsMaterial { diffuse: POST_DIFFUSE, ambient: POST_AMBIENT },
+                Transform3d {
+                    translation: Vec3::new(x, GROUND_Y + POST_HALF_H, z),
+                    rotation: Vec3::ZERO,
+                    scale: Vec3::new(POST_HALF_W, POST_HALF_H, POST_HALF_W),
+                },
+            ));
+        }
+    }
 }
 
 // --- Resources ---------------------------------------------------------------
@@ -289,11 +362,16 @@ impl Plugin for SpikePlugin {
         .init_resource::<EnemyFire>()
         .init_resource::<Stroke>()
         .init_resource::<Landmarks>()
+        .init_resource::<Transition>()
+        .init_resource::<Zone>()
         .add_systems(Startup, setup)
         .add_systems(
             Update,
             (
+                // Specialise freshly spawned scene instances, then run the
+                // (instant) space transition before gameplay reads the avatar.
                 specialize_scene,
+                transition::transition_spaces,
                 player::transition_state,
                 player::toggle_tuning,
                 reset_enemy,
@@ -319,29 +397,24 @@ impl Plugin for SpikePlugin {
 
 // --- Setup -------------------------------------------------------------------
 
-fn setup(mut commands: Commands, mut camera: ResMut<Camera3d>) {
+fn setup(mut commands: Commands, mut camera: ResMut<Camera3d>, mut zone: ResMut<Zone>) {
     let cube = include_obj!("assets/cube.obj", center);
-
-    // Floor plane — a subdued slate quad on the XZ ground so the play area reads
-    // as ground (and the jump shadow has something to sit on). Just below Y=0.
-    commands.spawn((
-        flat_quad_xz(4.0, 4.0, [50, 56, 78]),
-        Transform3d {
-            translation: Vec3::new(0.0, GROUND_Y, 0.0),
-            rotation: Vec3::ZERO,
-            scale: Vec3::ONE,
-        },
-    ));
 
     // Level content — avatar, enemy, landmarks — is authored data (issue #27).
     // Load the baked space and spawn its instances; `specialize_scene` attaches
-    // the gameplay components (Avatar / Enemy / Landmark) by role. Floor (above),
-    // shadow, cursor, projectile, trail-dot pool and HUD (below) stay runtime
+    // the gameplay components (Avatar / Enemy / Landmark) by role. The ground
+    // plane is part of the space (sized to its camera; swapped on a transition);
+    // the shadow, cursor, projectile, trail-dot pool and HUD (below) stay runtime
     // chrome — pools and systems, not level geometry.
     // Default 3/4 follow framing — the fallback if the space fails to load (the
     // authored camera below overrides it, and `drive_camera` takes over per-frame).
     camera.position = Vec3::new(0.0, CAM_HEIGHT, CAM_DIST);
     camera.pitch = CAM_PITCH;
+    let mut floor_cam = CameraMode::Follow {
+        height: CAM_HEIGHT,
+        dist: CAM_DIST,
+        pitch: CAM_PITCH,
+    };
     if let Some(scene) = bevy_nds_scene::load(spaces::ATRIUM) {
         // Seed the initial framing from the space's authored camera (avatar at
         // origin) so boot lands on the right view instead of gliding in from the
@@ -350,8 +423,13 @@ fn setup(mut commands: Commands, mut camera: ResMut<Camera3d>) {
         camera.position = pos;
         camera.pitch = pitch;
         camera.yaw = yaw;
+        floor_cam = scene.camera;
+        zone.set(&scene); // boot zone's bounds + connections
+        spawn_connection_markers(&mut commands, &scene); // doorway gateposts
         bevy_nds_scene::spawn(&mut commands, scene);
     }
+    // The space's ground plane (sized to its camera; a transition swaps it).
+    spawn_space_floor(&mut commands, floor_cam);
 
     // Ground shadow — a flat dark quad (no `Height`) that stays at the avatar's
     // ground position, so a jump's screen-Y lift opens a visible gap above it.

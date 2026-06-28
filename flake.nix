@@ -55,6 +55,21 @@
         desmumeWithGdbStub = pkgs.desmume.overrideAttrs (old: {
           mesonFlags = (old.mesonFlags or [ ]) ++ [ "-Dgdb-stub=true" ];
         });
+
+        # Runtime libraries the desktop scene-editor (eframe/winit/glow) loads
+        # via dlopen at runtime — they don't show up in `ldd`, so winit fails
+        # with `NoWaylandLib` / no X11 connection unless they're on
+        # LD_LIBRARY_PATH. The DS build/rom/run tasks don't need these; only
+        # `just edit` (and `just check-editor` run) does.
+        editorRuntimeLibs = [
+          pkgs.wayland
+          pkgs.libxkbcommon
+          pkgs.libGL
+          pkgs.libx11
+          pkgs.libxcursor
+          pkgs.libxi
+          pkgs.libxrandr
+        ];
       in
       {
         devShells.default = pkgs.mkShell {
@@ -84,6 +99,10 @@
             # Put the BlocksDS-bundled arm-none-eabi toolchain (the exact one
             # libnds was compiled with) on PATH for linking the ROM.
             export PATH="$WONDERFUL_TOOLCHAIN/toolchain/gcc-arm-none-eabi/bin:$PATH"
+            # The desktop scene-editor (eframe/winit) dlopens Wayland/X11/GL at
+            # runtime; surface them here plus the system GL driver (mesa) so
+            # `just edit` opens a window instead of failing with NoWaylandLib.
+            export LD_LIBRARY_PATH="${pkgs.lib.makeLibraryPath editorRuntimeLibs}:/run/opengl-driver/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
             echo "kts-nds dev shell"
             echo "  BLOCKSDS = $BLOCKSDS"
             echo "  rustc    = $(rustc --version 2>/dev/null)"

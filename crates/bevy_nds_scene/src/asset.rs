@@ -14,8 +14,9 @@
 //! | 8      | f32 × 4     | camera params (mode-specific)                  |
 //! | 24     | u32         | instance count N                               |
 //! |        | Instance ×N |                                                |
-//! |        | u32         | exit count M                                   |
-//! |        | Exit ×M     |                                                |
+//! |        | f32×4       | zone bounds (min_x, min_z, max_x, max_z)       |
+//! |        | u32         | connection count M                             |
+//! |        | Conn ×M     |                                                |
 //!
 //! Instance:
 //!   str   mesh       (u16 len + UTF-8 bytes; len 0 ⇒ no mesh)
@@ -26,13 +27,15 @@
 //!   u32   flags
 //!   u16   path_len   then f32×2 (x,z) × path_len  (ground-plane waypoints)
 //!
-//! Exit:
-//!   str   target     (u16 len + UTF-8 bytes)  — name of the neighbour space
-//!   f32×3 at         (spawn/transition point)
+//! Conn (derived host-side from the global layout; never hand-authored):
+//!   str   neighbour  (u16 len + UTF-8 bytes)  — stem of the neighbour zone
+//!   u8    side       (0 W −X / 1 E +X / 2 S −Z / 3 N +Z)
+//!   f32×2 lo, hi     (boundary segment along the edge, local coords)
+//!   f32×2 delta      (added to the avatar's local pos on crossing)
 //!   u32   gate       (objective/gate id; 0 = always open)
 //! ```
 //!
-//! A space carries more than it currently *uses* on purpose (issue #27's
+//! A zone carries more than it currently *uses* on purpose (issue #27's
 //! holistic guard): `flags`/`gate`/`path`/the camera variants leave room for
 //! objective types, enemy vuln-state, and gating without a format bump.
 
@@ -44,8 +47,9 @@ use alloc::vec::Vec;
 /// ASCII `"BSC1"` — magic prefix of a baked `.scene` file. Matches
 /// `scene2bin::ASSET_MAGIC`.
 pub const MAGIC: u32 = u32::from_le_bytes(*b"BSC1");
-/// Current `.scene` format version.
-pub const VERSION: u16 = 1;
+/// Current `.scene` format version. v2 replaced hand-authored `exits` with a
+/// zone `bounds` + baker-derived `connections` (the Euclidean map rework, #27).
+pub const VERSION: u16 = 2;
 
 /// Per-space authored camera (issue #23 / #27). No free player-driven camera;
 /// the framing is chosen per space and the game's director reads this.
@@ -95,22 +99,37 @@ pub struct SceneInstanceData {
     pub path: Vec<[f32; 2]>,
 }
 
-/// A connection from this space to a neighbour in the level graph (#27).
+/// A **derived** connection across a shared boundary to a neighbouring zone
+/// (#27, Euclidean map). Computed host-side by `scene2bin` from the global
+/// layout — never hand-authored. The runtime fires it when the avatar reaches
+/// the `side` edge within `[lo, hi]`, then adds `delta` to the avatar's local
+/// position so its global position is continuous in the neighbour's frame.
 #[derive(Clone, Debug, PartialEq)]
-pub struct SceneExitData {
-    /// Name of the neighbouring space (`scene2bin` validates it resolves).
-    pub target: String,
-    pub at: [f32; 3],
-    /// Gate/objective id that must be satisfied to use the exit (0 = open).
+pub struct SceneConnData {
+    /// Stem of the neighbouring zone (resolve with `space_path`).
+    pub neighbour: String,
+    /// Which edge of this zone the boundary lies on: 0 = west (−X), 1 = east
+    /// (+X), 2 = south (−Z), 3 = north (+Z).
+    pub side: u8,
+    /// Boundary segment along the edge, in this zone's local coords (on the axis
+    /// parallel to the edge).
+    pub lo: f32,
+    pub hi: f32,
+    /// Added to the avatar's local position when it crosses (carries it into the
+    /// neighbour's frame; global position unchanged).
+    pub delta: [f32; 2],
+    /// Gate/objective id that must be satisfied to cross (0 = open).
     pub gate: u32,
 }
 
-/// A fully parsed space.
+/// A fully parsed zone.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SceneData {
     pub camera: CameraMode,
     pub instances: Vec<SceneInstanceData>,
-    pub exits: Vec<SceneExitData>,
+    /// Walkable extent in local coords: `[min_x, min_z, max_x, max_z]`.
+    pub bounds: [f32; 4],
+    pub connections: Vec<SceneConnData>,
 }
 
 /// Parse a `.scene` blob. Returns `None` on bad magic, an unknown version, a
@@ -150,16 +169,21 @@ pub fn parse(bytes: &[u8]) -> Option<SceneData> {
         });
     }
 
+    let bounds = [r.f32()?, r.f32()?, r.f32()?, r.f32()?];
+
     let m = r.u32()? as usize;
-    let mut exits = Vec::with_capacity(m.min(MAX_PREALLOC));
+    let mut connections = Vec::with_capacity(m.min(MAX_PREALLOC));
     for _ in 0..m {
-        let target = r.string()?;
-        let at = [r.f32()?, r.f32()?, r.f32()?];
+        let neighbour = r.string()?;
+        let side = r.u8()?;
+        let lo = r.f32()?;
+        let hi = r.f32()?;
+        let delta = [r.f32()?, r.f32()?];
         let gate = r.u32()?;
-        exits.push(SceneExitData { target, at, gate });
+        connections.push(SceneConnData { neighbour, side, lo, hi, delta, gate });
     }
 
-    Some(SceneData { camera, instances, exits })
+    Some(SceneData { camera, instances, bounds, connections })
 }
 
 /// Cap on count-driven `with_capacity` so a corrupt length can't request a
@@ -255,9 +279,13 @@ mod tests {
                     path: alloc::vec![[1.2, 0.6], [1.2, -0.6]],
                 },
             ],
-            exits: alloc::vec![SceneExitData {
-                target: String::from("corridor_b"),
-                at: [2.0, 0.0, 0.0],
+            bounds: [-2.0, -2.0, 2.0, 2.0],
+            connections: alloc::vec![SceneConnData {
+                neighbour: String::from("corridor_b"),
+                side: 1,
+                lo: -0.5,
+                hi: 0.5,
+                delta: [-4.0, 0.0],
                 gate: 0,
             }],
         }
@@ -303,11 +331,16 @@ mod tests {
             w.u16(inst.path.len() as u16);
             for p in &inst.path { w.f32(p[0]); w.f32(p[1]); }
         }
-        w.u32(s.exits.len() as u32);
-        for e in &s.exits {
-            w.string(&e.target);
-            for v in e.at { w.f32(v); }
-            w.u32(e.gate);
+        for v in s.bounds { w.f32(v); }
+        w.u32(s.connections.len() as u32);
+        for c in &s.connections {
+            w.string(&c.neighbour);
+            w.u8(c.side);
+            w.f32(c.lo);
+            w.f32(c.hi);
+            w.f32(c.delta[0]);
+            w.f32(c.delta[1]);
+            w.u32(c.gate);
         }
         w.0
     }
@@ -355,7 +388,8 @@ mod tests {
                 flags: 0,
                 path: alloc::vec![],
             }],
-            exits: alloc::vec![],
+            bounds: [-1.0, -1.0, 1.0, 1.0],
+            connections: alloc::vec![],
         };
         let parsed = parse(&encode(&scene)).unwrap();
         assert_eq!(parsed.instances[0].mesh, None);

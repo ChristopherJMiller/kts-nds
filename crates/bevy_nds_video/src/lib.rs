@@ -42,6 +42,13 @@ const MODE_0_2D: u32 = 1 << 16; // DISPLAY_VIDEO_MODE(0) | DISPLAY_MODE_NORMAL
 const VRAM_ENABLE: u8 = 1 << 7;
 const VRAM_A_MAIN_BG: u8 = 1; // map VRAM bank A to main-engine BG memory
 
+// Master-brightness registers (`<nds/arm9/video.h>`): a final per-engine fade
+// applied to the *composited* output (including the 3D layer on the main
+// engine), so a single write fades the whole screen to black/white. The main
+// engine's lives at 0x0400_006C, the sub engine's 0x1000 above it.
+const REG_MASTER_BRIGHT: *mut u16 = 0x0400_006C as *mut u16;
+const REG_MASTER_BRIGHT_SUB: *mut u16 = 0x0400_106C as *mut u16;
+
 #[allow(non_snake_case)]
 unsafe extern "C" {
     /// Initialise a simple text console on the sub (bottom) screen and select
@@ -142,11 +149,56 @@ fn init_screens(mut commands: Commands) {
     });
 }
 
+/// Per-screen master-brightness fade. Each field is a level in `-16..=16`:
+/// `0` = normal, **negative** fades toward black, **positive** toward white;
+/// magnitude `16` is fully black / white. Set it from a system (e.g. a scene
+/// transition) and [`apply_brightness`] writes the hardware registers each
+/// frame. The main engine drives the top (3D) screen, the sub engine the bottom.
+#[derive(Resource, Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct MasterBright {
+    pub top: i8,
+    pub bottom: i8,
+}
+
+/// Encode a fade level (`-16..=16`) into a `MASTER_BRIGHT` register value:
+/// bits 0..4 = factor (`0..16`), bits 14..15 = mode (`1` = fade up/white,
+/// `2` = fade down/black; `0` = disabled). Pure, so it host-tests directly.
+pub fn master_bright_bits(level: i8) -> u16 {
+    let level = level.clamp(-16, 16);
+    match level {
+        0 => 0,
+        _ if level < 0 => (2u16 << 14) | (-(level as i16)) as u16,
+        _ => (1u16 << 14) | level as u16,
+    }
+}
+
+/// Push [`MasterBright`] to the hardware `MASTER_BRIGHT` registers (main + sub).
+/// Runs in [`Last`] so it reflects whatever a transition wrote during `Update`,
+/// and only when the resource changed (the registers latch, so re-writing an
+/// unchanged value is wasted MMIO).
+fn apply_brightness(bright: Res<MasterBright>) {
+    if !bright.is_changed() {
+        return;
+    }
+    let (top, bottom) = (master_bright_bits(bright.top), master_bright_bits(bright.bottom));
+    // SAFETY: fixed MMIO addresses for the two 2D engines' brightness latches;
+    // the DS is single-core and these are plain register writes.
+    #[cfg(target_vendor = "nintendo")]
+    unsafe {
+        core::ptr::write_volatile(REG_MASTER_BRIGHT, top);
+        core::ptr::write_volatile(REG_MASTER_BRIGHT_SUB, bottom);
+    }
+    #[cfg(not(target_vendor = "nintendo"))]
+    let _ = (top, bottom);
+}
+
 /// Initialises the DS video hardware and exposes the screens to the ECS.
 pub struct VideoPlugin;
 
 impl Plugin for VideoPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(PreStartup, init_screens);
+        app.init_resource::<MasterBright>()
+            .add_systems(PreStartup, init_screens)
+            .add_systems(Last, apply_brightness);
     }
 }
