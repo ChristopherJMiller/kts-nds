@@ -2,7 +2,7 @@
 name = "scene-editor"
 version = "0.1.0"
 edition = "2024"
-description = "Desktop editor for Kill the Serpent space sidecars (issue #27): edit assets/spaces/*.ron visually."
+description = "Desktop editor for Kill the Serpent levels (issue #27): edit assets/levels/<name>/ visually."
 
 [[bin]]
 name = "scene-editor"

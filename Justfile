@@ -22,13 +22,13 @@ build-release:
 check:
     cargo check
 
-# Launch the desktop space editor (issue #27). Optionally pass a .ron path:
-#   just edit                       # opens assets/spaces/atrium.ron
-#   just edit assets/spaces/foo.ron
+# Launch the desktop level editor (issue #27). Optionally pass a level directory:
+#   just edit                          # opens assets/levels/facility
+#   just edit assets/levels/foo
 # The editor is a standalone host crate (its own workspace), so this cd's into
 # it; a relative path argument is rewritten to stay valid from there.
-edit *file:
-    cd tools/scene-editor && cargo run --release -- {{ if file == "" { "" } else { "../../" + file } }}
+edit *dir:
+    cd tools/scene-editor && cargo run --release -- {{ if dir == "" { "" } else { "../../" + dir } }}
 
 # Type-check the desktop editor (host build; heavier — builds std from source).
 check-editor:

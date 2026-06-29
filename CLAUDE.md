@@ -213,19 +213,29 @@ they don't need (e.g. drop `bevy_nds_text` for a sprite-only game).
   a `LoadSpace` event. No new FFI: it composes `bevy_nds_nitrofs` (bytes) +
   `bevy_nds_3d` (meshes). Pure `asset::parse` host-tested. Depended on directly
   (not in `DsPlugins`).
-- **`crates/scene2bin`** — host CLI + library: bakes `assets/spaces/*.ron`
-  space sidecars into `build/nitrofs/spaces/*.scene` (+ a `spaces.rs` constants
-  module the game `include!`s). Parse + validate (referenced meshes/neighbours)
-  + encode; the authoritative writer for the `.scene` format (`bevy_nds_scene`
-  is the reader — keep the two in sync). Also `to_ron` for the editor. RON is
-  **host-only**; it never reaches the DS.
+- **`crates/scene2bin`** — host CLI + library: bakes a **level** directory
+  (`assets/levels/<name>/` = a `level.ron` manifest of the zone-graph layout +
+  one `<zone>.ron` content file per zone) into `build/nitrofs/levels/<name>/
+  *.scene` (+ a nested `levels.rs` constants module the game `include!`s, e.g.
+  `levels::facility::ATRIUM`). Resolves reusable **prefabs** (`assets/prefabs/
+  *.ron`, instance templates) into flat instances host-side at bake — the
+  `.scene` blob never learns what a prefab is. Parse + validate (referenced
+  meshes/prefabs) + derive connections from zone abutment + encode; the
+  authoritative writer for the `.scene` format (`bevy_nds_scene` is the reader —
+  keep the two in sync). Also `to_{level,zone,prefab}_ron` for the editor. RON is
+  **host-only**; it never reaches the DS. *A level is the authoring/distribution
+  unit; a zone is the runtime streaming unit — only the current zone is
+  resident.*
 - **`tools/scene-editor`** — standalone desktop GUI (eframe/egui) for authoring
-  spaces: a top-down ground-plane canvas (drag instances/waypoints) + a
-  properties panel, reading/writing the same RON via `scene2bin`. **Detached
-  from this workspace** (its own `[workspace]` + `.cargo/config.toml` re-target
-  the host with a full-`std` build-std, since the repo root forces
-  `build-std=[core,alloc]`). Run with `just edit [file.ron]`. `preview-rom`
-  stays the DS-faithful check; the editor is for fast spatial layout.
+  a whole **level**: one shared top-down canvas drawing every zone at its global
+  `place` (drag whole zones / instances / waypoints) + a side panel for the
+  manifest (name/entry/zone list), per-zone camera/bounds, and a prefab-`Use`
+  picker, reading/writing the same RON via `scene2bin`. Split into modules
+  (`app`/`canvas`/`panel`/`widgets`). **Detached from this workspace** (its own
+  `[workspace]` + `.cargo/config.toml` re-target the host with a full-`std`
+  build-std, since the repo root forces `build-std=[core,alloc]`). Run with
+  `just edit [level-dir]`. `preview-rom` stays the DS-faithful check; the editor
+  is for fast spatial layout.
 - **`kts`** (root, `src/main.rs`) — *Kill the Serpent*, the game. A *pure-Bevy
   consumer*: only components and systems, **no FFI / allocator / panic handler**.
 

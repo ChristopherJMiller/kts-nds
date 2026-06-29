@@ -1,0 +1,27 @@
+// facility — the first level: the manifest owns the whole zone-graph *layout*
+// (each zone's place in the shared global frame, its local walkable bounds, and
+// its camera framing), so the layout reads in one file and the desktop editor's
+// global canvas draws from it. Per-zone *content* (the placed objects) lives in
+// the sibling `<zone>.ron` files; prefab `Use`s resolve against `assets/prefabs`.
+//
+// The Euclidean layout (#27): the atrium sits at the origin (±2 arena pad); the
+// corridor is placed east at x = 4.2 so its west edge (4.2 - 2.2 = 2.0) abuts the
+// atrium's east edge (0 + 2.0 = 2.0). The baker derives the atrium<->corridor
+// connection from that abutment — no exits are authored. Pacing: the atrium is a
+// tension peak (Follow arena), the corridor a rest beat (Rail2.5D traversal).
+Level(
+    name: "Facility",
+    entry: "atrium",
+    zones: {
+        "atrium": (
+            place: (0.0, 0.0),
+            bounds: (min: (-2.0, -2.0), max: (2.0, 2.0)),
+            camera: Follow(height: 1.7, dist: 2.0, pitch: -0.7),
+        ),
+        "corridor": (
+            place: (4.2, 0.0),
+            bounds: (min: (-2.2, -0.55), max: (2.2, 0.55)),
+            camera: Rail2_5D(height: 1.4, dist: 2.4, pitch: -0.35),
+        ),
+    },
+)

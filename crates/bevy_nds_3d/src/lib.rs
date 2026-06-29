@@ -537,6 +537,24 @@ impl Default for Display3d {
     }
 }
 
+/// Maximum distance (world units) from the camera at which a bounded mesh still
+/// renders. Beyond it, [`render_3d`] skips the draw — a per-object range cull
+/// that holds the polygon budget when neighbour zones are resident (#27 seamless
+/// streaming), instead of "only the current zone renders". Pairs with the depth
+/// fog, which is tuned to be opaque by roughly this distance, so culled geometry
+/// fades into the rear plane rather than popping. Hand-authored meshes without a
+/// baked AABB are never range-culled (same as frustum culling).
+#[derive(Resource, Clone, Copy)]
+pub struct RenderRange(pub f32);
+
+impl Default for RenderRange {
+    fn default() -> Self {
+        // Generous default: the facility's neighbour zone sits ~4–8 units out, so
+        // it renders; the fog does the visible fade. Lower it for tighter culls.
+        Self(12.0)
+    }
+}
+
 /// A single hardware directional light: a direction and a colour. The DS has up
 /// to four, applied per vertex in hardware.
 #[derive(Clone, Copy)]
@@ -595,18 +613,45 @@ fn apply_display(display: Res<Display3d>) {
     }
 }
 
+/// Rear-plane (clear) colour, 0-31 per channel — a near-black cyber blue. Fog
+/// fades geometry toward this, so things dissolve into the background.
+const CLEAR_RGB: (u8, u8, u8) = (2, 2, 6);
+/// Fog-shift: each density-table entry spans `0x400 >> FOG_SHIFT` depth units.
+/// 6 → 16 units/entry, a ~0x200-wide band over the 32 entries.
+const FOG_SHIFT: u16 = 6;
+/// Depth at which fog begins (0-0x7FFF). With `near`/`far` = 0.1/40 perspective
+/// compresses all scene geometry into the top of the depth buffer (~0x7B00 near
+/// the avatar … ~0x7F00 for a resident neighbour ~8u out), so fog starts high so
+/// the active zone stays clear and only the neighbour fades. Tuned via preview.
+const FOG_OFFSET: u32 = 0x7E00;
+
 /// Bring up the DS 3D engine: power it on, switch the main engine to a 3D video
-/// mode, and set the rear-plane colour / depth. Runs in [`Startup`] so it lands
-/// after `bevy_nds`'s `PreStartup` 2D video setup.
+/// mode, set the rear-plane colour / depth, and configure depth fog. Runs in
+/// [`Startup`] so it lands after `bevy_nds`'s `PreStartup` 2D video setup.
 fn init_3d() {
     unsafe {
         gl::enable_3d_video();
         ffi::glInit();
-        ffi::glClearColor(2, 2, 6, 31);
+        let (r, g, b) = CLEAR_RGB;
+        ffi::glClearColor(r, g, b, 31); // alpha 31 is required for the rear plane to fog
         gl::clear_depth(ffi::GL_MAX_DEPTH);
         gl::viewport(0, 0, 255, 191);
         // Smooth polygon silhouettes — a near-free win on the 256×192 LCD.
         gl::enable_antialias();
+
+        // Depth fog (#27 seamless streaming): fades resident-neighbour geometry
+        // into the rear plane as it recedes, masking the range cull / zone seam.
+        // A linear density ramp to opaque; colour = the clear colour so geometry
+        // dissolves into the background rather than greying out. Tuned via
+        // preview-rom (FOG_OFFSET/SHIFT) so the active zone stays clear.
+        let mut density = [0u8; 32];
+        let mut i = 0;
+        while i < density.len() {
+            density[i] = ((i * 127) / (density.len() - 1)) as u8;
+            i += 1;
+        }
+        gl::setup_fog((r, g, b, 31), FOG_SHIFT, FOG_OFFSET, &density);
+        gl::enable(ffi::GL_FOG);
     }
 }
 
@@ -619,6 +664,16 @@ fn aabb_visible(frustum: &Frustum, draw: &MeshDraw) -> bool {
     // current camera position + orientation), so the cached world AABB is tested
     // directly — no per-object shift, and it handles a rotated camera.
     frustum.contains_aabb(draw.world_min, draw.world_max)
+}
+
+/// True if a mesh's cached world-AABB centre is within `range` units of the
+/// camera — the per-object range cull for resident-neighbour streaming (#27).
+/// Squared compare, so no `sqrt` on the per-frame path.
+fn within_range(draw: &MeshDraw, cam: Vec3, range: f32) -> bool {
+    let cx = (draw.world_min[0] + draw.world_max[0]) * 0.5 - cam.x;
+    let cy = (draw.world_min[1] + draw.world_max[1]) * 0.5 - cam.y;
+    let cz = (draw.world_min[2] + draw.world_max[2]) * 0.5 - cam.z;
+    cx * cx + cy * cy + cz * cz <= range * range
 }
 
 /// Recompute each mesh's cached [`MeshDraw`] (model matrix + world AABB) — but
@@ -682,6 +737,7 @@ fn recompute_mesh_draw(mut meshes: Query<(Ref<Transform3d>, Ref<DsMesh>, &mut Me
 /// Runs in [`Last`], after game systems have updated transforms.
 fn render_3d(
     camera: Res<Camera3d>,
+    range: Res<RenderRange>,
     lights: Res<DsLights>,
     meshes: Query<(&MeshDraw, &DsMesh, Option<&DsMaterial>), Without<Hidden>>,
 ) {
@@ -746,9 +802,13 @@ fn render_3d(
         }
 
         for (draw, mesh, mat) in &meshes {
-            // Cull meshes with known bounds (the baked / loaded models) that are
-            // fully off-screen. Hand-authored meshes without an AABB always draw.
-            if draw.has_bounds && !aabb_visible(&frustum, draw) {
+            // Cull bounded meshes (baked / loaded models) that are off-screen or
+            // beyond the render range (resident-neighbour streaming, #27).
+            // Hand-authored meshes without an AABB always draw.
+            if draw.has_bounds
+                && (!aabb_visible(&frustum, draw)
+                    || !within_range(draw, camera.position, range.0))
+            {
                 continue;
             }
 
@@ -762,7 +822,7 @@ fn render_3d(
                     ffi::rgb15(m.ambient[0], m.ambient[1], m.ambient[2]),
                     true,
                 );
-                gl::poly_fmt(ffi::poly_alpha(31) | ffi::POLY_CULL_BACK | light_mask);
+                gl::poly_fmt(ffi::poly_alpha(31) | ffi::POLY_CULL_BACK | ffi::POLY_FOG | light_mask);
 
                 if let Some(baked) = &mesh.baked {
                     // Fast path: hand the whole display list to the GPU via DMA
@@ -782,7 +842,7 @@ fn render_3d(
                     gl::end();
                 }
             } else {
-                gl::poly_fmt(ffi::poly_alpha(31) | ffi::POLY_CULL_NONE);
+                gl::poly_fmt(ffi::poly_alpha(31) | ffi::POLY_CULL_NONE | ffi::POLY_FOG);
 
                 gl::begin(ffi::GL_TRIANGLES);
                 for tri in mesh.tris.iter() {
@@ -960,6 +1020,7 @@ impl Plugin for Ds3dPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<Camera3d>()
             .init_resource::<Display3d>()
+            .init_resource::<RenderRange>()
             .init_resource::<DsLights>()
             .init_resource::<TouchPick>()
             .add_systems(Startup, init_3d)

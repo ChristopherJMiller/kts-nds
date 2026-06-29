@@ -23,8 +23,10 @@ const AUDIO_DIR: &str = "audio";
 const SPRITE_DIR: &str = "assets/sprites";
 /// Source directory of uncompiled background PNGs (`tiled/` and `bitmap/`).
 const BG_DIR: &str = "assets/backgrounds";
-/// Source directory of authored space sidecars (`*.ron`).
-const SPACE_DIR: &str = "assets/spaces";
+/// Source root of authored level directories (`<name>/level.ron` + `<zone>.ron`).
+const LEVELS_DIR: &str = "assets/levels";
+/// Source directory of the shared prefab library (`*.ron`).
+const PREFAB_DIR: &str = "assets/prefabs";
 /// Output directory for compiled NitroFS assets (gitignored; packed by `just rom`).
 const NITROFS_DIR: &str = "build/nitrofs";
 
@@ -33,26 +35,29 @@ fn main() {
     compile_audio();
     compile_sprites();
     compile_backgrounds();
-    compile_spaces();
+    compile_levels();
     emit_link_args();
 }
 
-/// Bake every `assets/spaces/*.ron` into `build/nitrofs/spaces/*.scene` via the
-/// `scene2bin` library (issue #27), and always emit `$OUT_DIR/spaces.rs` — the
-/// constants module of NitroFS paths the game `include!`s. Unlike the sprite /
-/// audio bakers, `scene2bin` is pure Rust (no external tool), so it runs
-/// identically inside or outside `nix develop`; only RON / validation errors
-/// fall back to *predicted* constants so the game still compiles.
-fn compile_spaces() {
+/// Bake every `assets/levels/<name>/` into `build/nitrofs/levels/<name>/*.scene`
+/// via the `scene2bin` library (issue #27), and always emit `$OUT_DIR/levels.rs`
+/// — the (per-level) constants module of NitroFS paths the game `include!`s.
+/// Unlike the sprite / audio bakers, `scene2bin` is pure Rust (no external
+/// tool), so it runs identically inside or outside `nix develop`; only RON /
+/// validation errors fall back to *predicted* constants so the game still
+/// compiles.
+fn compile_levels() {
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
-    let src = manifest.join(SPACE_DIR);
+    let src = manifest.join(LEVELS_DIR);
     let dst = manifest.join(NITROFS_DIR).join(scene2bin::NITROFS_SUBDIR);
     let assets = manifest.join(ASSET_DIR);
-    let out_rs = PathBuf::from(env::var("OUT_DIR").unwrap()).join("spaces.rs");
+    let prefabs = manifest.join(PREFAB_DIR);
+    let out_rs = PathBuf::from(env::var("OUT_DIR").unwrap()).join("levels.rs");
 
     println!("cargo:rerun-if-changed={}", src.display());
+    println!("cargo:rerun-if-changed={}", prefabs.display());
     // Mesh validation reads the geometry source dir, so a new `.obj` can flip a
-    // space from invalid to valid.
+    // zone from invalid to valid.
     println!("cargo:rerun-if-changed={}", assets.display());
 
     if !src.is_dir() {
@@ -60,7 +65,7 @@ fn compile_spaces() {
         return;
     }
 
-    match scene2bin::build_dir(&src, &dst, &assets) {
+    match scene2bin::build_levels_dir(&src, &dst, &assets, &prefabs) {
         Ok(built) => {
             for b in &built {
                 println!("cargo:rerun-if-changed={}", b.input.display());
@@ -73,7 +78,7 @@ fn compile_spaces() {
             }
         }
         Err(e) => {
-            println!("cargo:warning=space baking failed: {e}");
+            println!("cargo:warning=level baking failed: {e}");
             std::fs::write(&out_rs, scene2bin::predict_consts(&src)).ok();
         }
     }

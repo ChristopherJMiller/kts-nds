@@ -1,0 +1,15 @@
+// corridor content — the placed objects of the 2.5D rail traverse (its place/
+// bounds/camera live in the level manifest). The corridor runs along world X
+// (the rail axis); the rail centreline is world Z = 0. Walls/props are spaced
+// along X to give the side-on framing depth cues + parallax as the avatar walks.
+// The avatar is a single persistent entity seeded by the level's entry zone
+// (atrium), not authored per zone (#27 seamless streaming) — so the corridor
+// authors no avatar; the player carries in from the atrium.
+Zone(instances: [
+    // A lone patroller pacing the corridor along X (a light threat on the rest
+    // beat). path[0] == spawn.
+    Use(name: "patroller", pos: (1.6, 0.0, 0.0), path: [(1.6, 0.0), (0.4, 0.0)]),
+    // Walls / props lining the rail.
+    Use(name: "landmark_block", pos: (-0.8, 0.0, -0.5)),
+    Use(name: "landmark_block", pos: (0.6, 0.0, -0.5), rot: Some((0.0, 0.3, 0.0))),
+])

@@ -17,18 +17,28 @@
 use alloc::vec::Vec;
 
 use bevy_ecs::prelude::*;
+use alloc::string::String;
+
 use bevy_nds_3d::prelude::Camera3d;
-use bevy_nds_scene::{SceneConnData, SceneData, SceneInstance, space_path};
+use bevy_nds_scene::{SceneConnData, SceneData, SceneInstance, level_space_path};
+
+use bevy_nds_math::FxVec2;
 
 use crate::player::{Locomotion, PlayerState};
 use crate::{
-    Avatar, ConnMarker, Device, Landmarks, SpaceFloor, Stroke, WorldPos, frame_for,
-    spawn_connection_markers, spawn_space_floor,
+    Avatar, CamWarp, Device, Landmarks, NeighbourInstance, SpaceFloor, Stroke, WorldPos,
+    spawn_resident_neighbours, spawn_zone_floor,
 };
 
-/// How close (world units) to a connected edge counts as crossing it. The
-/// avatar is clamped to the edge, so this just needs to cover the clamp gap.
-const EDGE_EPS: f32 = 0.18;
+/// How close (world units) to a connected edge counts as crossing it. Kept
+/// **tight**: the avatar is clamped to its bounds, so it presses right up to the
+/// edge — and with the neighbour zone resident + visible (#27 seamless
+/// streaming), crossing only when essentially *at* the seam avoids the
+/// `EDGE_EPS`-sized teleport that a wider trigger caused (the avatar would re-base
+/// past the neighbour's edge and get clamped back the next frame — a visible
+/// snap once everything else is continuous). Small enough to be invisible, large
+/// enough to absorb fixed-point rounding on the bounds.
+const EDGE_EPS: f32 = 0.01;
 
 /// The current zone's walkable bounds + derived boundary connections. Drives the
 /// avatar clamp ([`crate::player::move_player`]) and boundary crossing
@@ -36,6 +46,11 @@ const EDGE_EPS: f32 = 0.18;
 /// every crossing.
 #[derive(Resource)]
 pub struct Zone {
+    /// The current level's directory stem. A connection's `neighbour` is a bare
+    /// zone stem within this same level, resolved with [`level_space_path`].
+    /// Set once at boot (intra-level streaming keeps it constant; a level-exit
+    /// seam that changes it is deferred — see #27).
+    pub level: String,
     /// `[min_x, min_z, max_x, max_z]` in local coords.
     pub bounds: [f32; 4],
     /// Derived connections to neighbouring zones.
@@ -47,6 +62,7 @@ impl Default for Zone {
         // Effectively unclamped until the first zone loads (so a missing zone
         // never traps the avatar at the origin).
         Self {
+            level: String::new(),
             bounds: [-1.0e6, -1.0e6, 1.0e6, 1.0e6],
             conns: Vec::new(),
         }
@@ -54,7 +70,8 @@ impl Default for Zone {
 }
 
 impl Zone {
-    /// Adopt a freshly loaded zone's bounds + connections.
+    /// Adopt a freshly loaded zone's bounds + connections (the level is constant
+    /// across an intra-level swap, so it's left untouched).
     pub fn set(&mut self, scene: &SceneData) {
         self.bounds = scene.bounds;
         self.conns = scene.connections.clone();
@@ -96,10 +113,11 @@ fn at_edge(px: f32, pz: f32, bounds: &[f32; 4], c: &SceneConnData) -> bool {
 #[allow(clippy::too_many_arguments)]
 pub fn transition_spaces(
     state: Res<PlayerState>,
-    avatar: Query<&WorldPos, With<Avatar>>,
+    mut avatar: Query<&mut WorldPos, With<Avatar>>,
     mut tr: ResMut<Transition>,
     mut zone: ResMut<Zone>,
     mut commands: Commands,
+    mut warp: ResMut<CamWarp>,
     mut camera: ResMut<Camera3d>,
     mut device: ResMut<Device>,
     mut stroke: ResMut<Stroke>,
@@ -107,15 +125,14 @@ pub fn transition_spaces(
     mut landmarks: ResMut<Landmarks>,
     instances: Query<Entity, With<SceneInstance>>,
     floors: Query<Entity, With<SpaceFloor>>,
-    markers: Query<Entity, With<ConnMarker>>,
+    neighbours: Query<Entity, With<NeighbourInstance>>,
 ) {
     if state.is_deployed() {
         return;
     }
-    let Some(a) = avatar.iter().next() else {
+    let Some((px, pz)) = avatar.iter().next().map(|a| (a.0.x.to_f32(), a.0.y.to_f32())) else {
         return;
     };
-    let (px, pz) = (a.0.x.to_f32(), a.0.y.to_f32());
     let bounds = zone.bounds;
 
     // The first open connected edge in range; `clear` tracks whether the avatar
@@ -142,43 +159,72 @@ pub fn transition_spaces(
     };
     tr.armed = false;
 
-    // Continuous position: the avatar's new local pos = current + the baked delta
-    // into the neighbour's frame.
-    let new_pos = [px + c.delta[0], pz + c.delta[1]];
+    // Continuous position: the avatar's new local pos = the crossing point + the
+    // baked delta into the neighbour's frame. **Snap the crossing axis to the
+    // exact edge** first (the avatar is within `EDGE_EPS` of it): adding `delta`
+    // then lands the avatar precisely on the neighbour's abutting edge, so it
+    // never overshoots the neighbour's bounds and gets clamped back — no teleport.
+    let [min_x, min_z, max_x, max_z] = bounds;
+    let (cx, cz) = match c.side {
+        0 => (min_x, pz), // west −X
+        1 => (max_x, pz), // east +X
+        2 => (px, min_z), // south −Z
+        3 => (px, max_z), // north +Z
+        _ => (px, pz),
+    };
+    let new_pos = [cx + c.delta[0], cz + c.delta[1]];
+    let path = level_space_path(&zone.level, &c.neighbour);
     swap_zone(
-        &space_path(&c.neighbour),
-        new_pos,
+        &path,
         &mut zone,
         &mut commands,
-        &mut camera,
         &mut device,
         &mut stroke,
         &mut loco,
         &mut landmarks,
         &instances,
         &floors,
-        &markers,
+        &neighbours,
     );
+
+    // The avatar is the single persistent entity — carry it across by the delta
+    // (it isn't respawned with the new zone).
+    if let Some(mut a) = avatar.iter_mut().next() {
+        a.0 = FxVec2::from_f32(new_pos[0], new_pos[1]);
+    }
+
+    // Re-base the camera by the same delta so it keeps tracking the avatar across
+    // the seam (everything co-shifts → the view is unchanged at the crossing
+    // instant, and the follow lag is preserved rather than snapped away).
+    camera.position.x += c.delta[0];
+    camera.position.z += c.delta[1];
+
+    // Capture that exact (re-based) pose as the warp start, so `drive_camera`
+    // eases the framing change *from where the camera actually is* — no snap.
+    warp.from_pos = camera.position;
+    warp.from_pitch = camera.pitch;
+    warp.from_yaw = camera.yaw;
+    warp.t = 0.0;
 }
 
-/// Instant swap to the neighbour zone, placing the avatar at `new_pos` (the
-/// crossing point in the neighbour's frame). Runtime chrome (shadow, cursor,
-/// projectile, trail-dot pool, HUD) carries no [`SceneInstance`]/[`SpaceFloor`],
-/// so it survives.
+/// Make the crossed-into neighbour the new active zone: despawn the old active
+/// zone + the previous resident neighbours, spawn the new active zone (minus the
+/// avatar) + *its* neighbours, and adopt its bounds + movement preset. The
+/// camera is re-based + eased by the caller; the persistent avatar + runtime
+/// chrome (shadow, cursor, projectile, trail-dot pool, HUD) carry no
+/// [`SceneInstance`]/[`SpaceFloor`]/[`NeighbourInstance`], so they survive.
 #[allow(clippy::too_many_arguments)]
 fn swap_zone(
     path: &[u8],
-    new_pos: [f32; 2],
     zone: &mut Zone,
     commands: &mut Commands,
-    camera: &mut Camera3d,
     device: &mut Device,
     stroke: &mut Stroke,
     loco: &mut Locomotion,
     landmarks: &mut Landmarks,
     instances: &Query<Entity, With<SceneInstance>>,
     floors: &Query<Entity, With<SpaceFloor>>,
-    markers: &Query<Entity, With<ConnMarker>>,
+    neighbours: &Query<Entity, With<NeighbourInstance>>,
 ) {
     // Load the neighbour first — if it fails, bail without tearing down the zone
     // we're standing in (no blank screen).
@@ -186,25 +232,18 @@ fn swap_zone(
         return;
     };
 
-    // Place the avatar at the crossing point (continuous global position),
-    // overriding the neighbour's authored avatar spawn.
-    if let Some(av) = scene.instances.iter_mut().find(|i| i.role == "avatar") {
-        av.pos[0] = new_pos[0];
-        av.pos[2] = new_pos[1];
-    }
+    // The avatar is the single persistent entity, carried across by the caller —
+    // never re-spawned. Strip the new active zone's avatar instance (only the
+    // entry zone authors one, but it would otherwise re-specialize a duplicate).
+    scene.instances.retain(|i| i.role != "avatar");
 
-    // Despawn the old zone's instances + floor + doorway markers.
-    for e in instances.iter() {
+    // Despawn the old active zone's instances, the previous resident neighbours,
+    // and all floors (the persistent avatar + chrome carry none of these markers,
+    // so they survive).
+    for e in instances.iter().chain(neighbours.iter()).chain(floors.iter()) {
         commands.entity(e).despawn();
     }
-    for e in floors.iter() {
-        commands.entity(e).despawn();
-    }
-    for e in markers.iter() {
-        commands.entity(e).despawn();
-    }
-    spawn_space_floor(commands, scene.camera);
-    spawn_connection_markers(commands, &scene); // new zone's doorway gateposts
+    spawn_zone_floor(commands, scene.bounds, (0.0, 0.0)); // active floor (sized to bounds)
 
     // Per-zone state that mustn't carry over.
     landmarks.0.clear(); // `specialize_scene` re-harvests the new zone's set
@@ -216,11 +255,7 @@ fn swap_zone(
     *loco = Locomotion::for_camera(scene.camera);
     zone.set(&scene);
 
-    // Seed the camera on the crossing point so we land on the right framing.
-    let (cpos, pitch, yaw) = frame_for(scene.camera, new_pos[0], new_pos[1], 0.0);
-    camera.position = cpos;
-    camera.pitch = pitch;
-    camera.yaw = yaw;
-
-    bevy_nds_scene::spawn(commands, scene);
+    bevy_nds_scene::spawn(commands, scene); // new active zone (minus the avatar)
+    // …and its neighbours become resident (render-only, fogged) in turn.
+    spawn_resident_neighbours(commands, zone);
 }

@@ -1,0 +1,10 @@
+// landmark_block — a static grey cube prop: a sightline / wayfinding landmark
+// and (via `specialize_scene`) an avatar-collision obstacle. The most-reused
+// instance in the game, so it lives as a prefab: a `Use` supplies only the
+// position (and a `rot` override when an instance is turned for variety).
+Prefab(
+    mesh: Some("cube"),
+    role: "landmark",
+    scale: (0.16, 0.16, 0.16),
+    material: Some((diffuse: (120, 120, 138), ambient: (34, 34, 44))),
+)

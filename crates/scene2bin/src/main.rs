@@ -1,10 +1,16 @@
 //! `scene2bin` CLI — a thin wrapper over the [`scene2bin`](../scene2bin/index.html)
-//! library for one-off conversions and validation:
+//! library for one-off bakes and validation of a level tree:
 //!
 //! ```text
-//! scene2bin --input assets/spaces/atrium.ron --output build/nitrofs/spaces/atrium.scene [--assets assets]
-//! scene2bin --check  assets/spaces/atrium.ron [--assets assets]
+//! scene2bin --levels assets/levels --out build/nitrofs/levels [--assets assets] [--prefabs assets/prefabs]
+//! scene2bin --check  assets/levels [--assets assets] [--prefabs assets/prefabs]
 //! ```
+//!
+//! A *level* is a directory under `--levels` holding a `level.ron` manifest plus
+//! one `<zone>.ron` content file per zone; `--prefabs` is the shared prefab
+//! library. The directory bake here is the same path `build.rs` drives via
+//! [`scene2bin::build_levels_dir`] (the authoritative path that derives
+//! connections from the whole level's layout).
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -20,20 +26,22 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<(), String> {
-    let mut input: Option<PathBuf> = None;
-    let mut output: Option<PathBuf> = None;
+    let mut levels: Option<PathBuf> = None;
+    let mut out: Option<PathBuf> = None;
     let mut assets: PathBuf = PathBuf::from("assets");
+    let mut prefabs: PathBuf = PathBuf::from("assets/prefabs");
     let mut check_only = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--input" | "-i" => input = Some(args.next().ok_or("--input needs a path")?.into()),
-            "--output" | "-o" => output = Some(args.next().ok_or("--output needs a path")?.into()),
+            "--levels" | "-l" => levels = Some(args.next().ok_or("--levels needs a path")?.into()),
+            "--out" | "-o" => out = Some(args.next().ok_or("--out needs a path")?.into()),
             "--assets" => assets = args.next().ok_or("--assets needs a path")?.into(),
+            "--prefabs" => prefabs = args.next().ok_or("--prefabs needs a path")?.into(),
             "--check" => {
                 check_only = true;
-                input = Some(args.next().ok_or("--check needs a path")?.into());
+                levels = Some(args.next().ok_or("--check needs a path")?.into());
             }
             "--help" | "-h" => {
                 print_usage();
@@ -43,56 +51,49 @@ fn run() -> Result<(), String> {
         }
     }
 
-    let input = input.ok_or("missing --input <file.ron>")?;
-    let src = std::fs::read_to_string(&input)
-        .map_err(|e| format!("could not read {}: {e}", input.display()))?;
-    let space = scene2bin::parse_ron(&src).map_err(|e| format!("{}: {e}", input.display()))?;
+    let levels = levels.ok_or("missing --levels <dir> (or --check <dir>)")?;
 
-    let mesh_exists = |name: &str| assets.join(format!("{name}.obj")).is_file();
-    scene2bin::validate(&space, mesh_exists).map_err(|e| format!("{}: {e}", input.display()))?;
+    // `--check` bakes into a throwaway temp dir so parse/validate/derive all run
+    // without touching the build tree.
+    let dst = if check_only {
+        std::env::temp_dir().join("scene2bin-check")
+    } else {
+        out.ok_or("missing --out <dir>")?
+    };
+
+    let built = scene2bin::build_levels_dir(&levels, &dst, &assets, &prefabs)?;
+    for b in &built {
+        for w in &b.warnings {
+            eprintln!("scene2bin: warning: {w}");
+        }
+    }
 
     if check_only {
+        let _ = std::fs::remove_dir_all(&dst);
+        eprintln!("scene2bin: {} ok ({} zones)", levels.display(), built.len());
+    } else {
         eprintln!(
-            "scene2bin: {} ok ({} instances, bounds {:?}..{:?})",
-            input.display(),
-            space.instances.len(),
-            space.bounds.min,
-            space.bounds.max
+            "scene2bin: baked {} zones from {} -> {}",
+            built.len(),
+            levels.display(),
+            dst.display()
         );
-        return Ok(());
     }
-
-    let output = output.ok_or("missing --output <file.scene>")?;
-    if let Some(parent) = output.parent().filter(|p| !p.as_os_str().is_empty()) {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("could not create {}: {e}", parent.display()))?;
-    }
-    // Single-file mode can't derive connections (they need the whole map's
-    // layout); bake with none. The directory bake (`build_dir`, used by
-    // `build.rs`) is the authoritative path that derives connections.
-    let blob = scene2bin::encode(&space, &[]);
-    std::fs::write(&output, &blob)
-        .map_err(|e| format!("could not write {}: {e}", output.display()))?;
-    eprintln!(
-        "scene2bin: {} -> {} ({} bytes)",
-        input.display(),
-        output.display(),
-        blob.len()
-    );
     Ok(())
 }
 
 fn print_usage() {
     eprintln!(
         "Usage:\n  \
-         scene2bin --input <file.ron> --output <file.scene> [--assets <dir>]\n  \
-         scene2bin --check <file.ron> [--assets <dir>]\n\n\
-         Bakes a RON space sidecar into a .scene NitroFS blob (issue #27).\n\n\
+         scene2bin --levels <dir> --out <dir> [--assets <dir>] [--prefabs <dir>]\n  \
+         scene2bin --check <dir> [--assets <dir>] [--prefabs <dir>]\n\n\
+         Bakes a tree of RON level directories into .scene NitroFS blobs (issue #27).\n\n\
          Options:\n  \
-         -i, --input <path>    Source .ron space file\n  \
-         -o, --output <path>   Destination .scene file (parent dirs are created)\n      \
+         -l, --levels <path>   Source levels root (dirs of level.ron + <zone>.ron)\n  \
+         -o, --out <path>      Destination root (baked to <out>/<level>/<zone>.scene)\n      \
          --assets <dir>        Geometry root for mesh validation (default: assets)\n      \
-         --check <path>        Parse + validate only, write nothing\n  \
+         --prefabs <dir>       Prefab library (default: assets/prefabs)\n      \
+         --check <path>        Parse + validate + derive only, write nothing\n  \
          -h, --help            Show this help"
     );
 }

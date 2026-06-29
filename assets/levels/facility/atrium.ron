@@ -1,0 +1,20 @@
+// atrium content — the placed objects of the origin arena (its place/bounds/
+// camera live in the level manifest). Positions are world (x, height, z); the
+// ground is the XZ plane (Y-up). `role` is opaque to the engine; `src/main.rs`'s
+// `specialize_scene` maps it to gameplay components.
+Zone(instances: [
+    // The player avatar — a unique instance, so authored literally.
+    Lit(Instance(
+        mesh: Some("teapot"),
+        role: "avatar",
+        pos: (0.0, 0.0, 0.0),
+        rot: (-1.5708, 0.0, 0.0),
+        scale: (0.11, 0.11, 0.11),
+        material: Some((diffuse: (110, 180, 235), ambient: (26, 40, 58))),
+    )),
+    // A patroller pacing a diamond around the arena (path[0] == spawn).
+    Use(name: "patroller", pos: (-1.4, 0.0, 0.0), path: [(-1.4, 0.0), (0.0, 1.4), (1.4, 0.0), (0.0, -1.4)]),
+    // Two grey landmarks for sightlines / cover; the second is turned a touch.
+    Use(name: "landmark_block", pos: (-1.25, 0.0, 0.95)),
+    Use(name: "landmark_block", pos: (1.25, 0.0, -0.95), rot: Some((0.0, 0.3, 0.0))),
+])

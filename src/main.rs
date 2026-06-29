@@ -57,10 +57,15 @@ mod sprites {
     include!(concat!(env!("OUT_DIR"), "/sprites.rs"));
 }
 
-mod spaces {
+mod levels {
     #![allow(dead_code)]
-    include!(concat!(env!("OUT_DIR"), "/spaces.rs"));
+    include!(concat!(env!("OUT_DIR"), "/levels.rs"));
 }
+
+/// The level the game boots into. Single-level for now (a level-select menu —
+/// and a level `exit` seam — are deferred; see #27). Matches the
+/// `assets/levels/<BOOT_LEVEL>/` directory, so neighbour zones resolve within it.
+const BOOT_LEVEL: &str = "facility";
 
 // --- Arena / camera ----------------------------------------------------------
 
@@ -81,8 +86,18 @@ const CAM_PITCH: f32 = -0.7; // ≈ -40°, looking down at the ground
 /// Top-down toggle (cluster ▲): straight above, looking down — correlates with
 /// the tactical map.
 const CAM_TD_HEIGHT: f32 = 3.2;
-/// Position low-pass factor (0 = locked, 1 = instant).
+/// Position low-pass factor (0 = locked, 1 = instant). Drives the soft
+/// avatar-follow, so it stays snappy.
 const CAM_SMOOTH: f32 = 0.18;
+/// Pitch low-pass factor — slower than [`CAM_SMOOTH`] so a zone transition's
+/// framing tilt (e.g. Follow → Rail2.5D) eases as a gentle morph. Pitch only
+/// changes on a transition or the top-down toggle, never during following, so
+/// slowing it leaves the avatar-follow untouched. Tune for transition speed.
+const CAM_TURN_SMOOTH: f32 = 0.07;
+/// Progress per frame of the zone-transition camera **warp** (`CamWarp`): the
+/// timed ease-in-out + slerp blend between the old and new zone framings. At 60
+/// fps, `0.02` ≈ a 50-frame (~0.8 s) morph. Tune for transition duration.
+const CAM_WARP_STEP: f32 = 0.02;
 
 const CURSOR_SCALE: f32 = 0.12;
 
@@ -172,66 +187,73 @@ fn map_to_world(sx: f32, sy: f32) -> Vec3 {
 #[derive(Component)]
 struct SpaceFloor;
 
-/// Spawn the ground plane for a space, sized to its authored camera: a square
-/// pad for open arenas, a long shallow strip for a 2.5D corridor rail (so the
-/// floor reads as a corridor, not a stray square under a side-on camera).
-fn spawn_space_floor(commands: &mut Commands, camera: CameraMode) {
-    let (half_x, half_z) = match camera {
-        CameraMode::Rail2_5D { .. } => (3.0, 1.0), // long rail, shallow depth
-        _ => (4.0, 4.0),                            // square arena pad
-    };
+/// Spawn the ground plane for a zone, sized to its **walkable bounds** and
+/// placed at `offset` in the active frame. Sizing to bounds (rather than a fixed
+/// camera pad) makes adjacent zones' floors *abut* at their shared edge — with
+/// neighbours resident (#27 seamless streaming) the atrium's floor (x∈[-2,2])
+/// meets the corridor's (x∈[2,6.4]) exactly at the seam, so the ground reads as
+/// one continuous surface. The arena-square / rail-strip shapes fall out of the
+/// bounds themselves (the corridor authors a long, shallow rect).
+fn spawn_zone_floor(commands: &mut Commands, bounds: [f32; 4], offset: (f32, f32)) {
+    let [min_x, min_z, max_x, max_z] = bounds;
+    let half_x = (max_x - min_x) * 0.5;
+    let half_z = (max_z - min_z) * 0.5;
+    let cx = (min_x + max_x) * 0.5 + offset.0;
+    let cz = (min_z + max_z) * 0.5 + offset.1;
     commands.spawn((
         SpaceFloor,
         flat_quad_xz(half_x, half_z, [50, 56, 78]),
         Transform3d {
-            translation: Vec3::new(0.0, GROUND_Y, 0.0),
+            translation: Vec3::new(cx, GROUND_Y, cz),
             rotation: Vec3::ZERO,
             scale: Vec3::ONE,
         },
     ));
 }
 
-/// Marker for a connection gatepost — the glowing posts that frame each zone
-/// boundary's opening so the player can *see* where to cross. Despawned +
-/// respawned with the zone (like [`SpaceFloor`]).
-#[derive(Component)]
-struct ConnMarker;
 
-// Gatepost dims (cube.obj is unit half-extent 1.0): a thin, ~0.7-tall pillar
-// resting on the floor, glowing teal (high ambient) to read as a doorway.
-const POST_HALF_W: f32 = 0.07;
-const POST_HALF_H: f32 = 0.35;
-const POST_DIFFUSE: [u8; 3] = [90, 230, 220];
-const POST_AMBIENT: [u8; 3] = [46, 124, 116];
-
-/// Spawn a pair of gateposts at the ends of every connected boundary opening in
-/// `scene`, so the (otherwise invisible) doorway is visible. The baker hands us
-/// the opening as a `side` + `[lo, hi]` span along that edge; we plant a post at
-/// each end on the zone's `bounds` edge.
-fn spawn_connection_markers(commands: &mut Commands, scene: &bevy_nds_scene::SceneData) {
-    let cube = include_obj!("assets/cube.obj", center);
-    let [min_x, min_z, max_x, max_z] = scene.bounds;
-    for c in &scene.connections {
-        // The two ends of the opening, as (x, z). East/west edges run along Z
-        // (so `lo`/`hi` are z); north/south run along X.
-        let ends: [(f32, f32); 2] = match c.side {
-            0 => [(min_x, c.lo), (min_x, c.hi)], // west −X
-            1 => [(max_x, c.lo), (max_x, c.hi)], // east +X
-            2 => [(c.lo, min_z), (c.hi, min_z)], // south −Z
-            3 => [(c.lo, max_z), (c.hi, max_z)], // north +Z
-            _ => continue,
+/// Spawn the **resident neighbour** zones' geometry (#27 seamless streaming):
+/// render-only, fogged entities placed at each neighbour's offset in the active
+/// frame, so the player sees into adjacent zones. A connection's `delta` is
+/// `place_active − place_neighbour`, so the neighbour's geometry sits at `−delta`
+/// in the active frame. Reuses the current zone's already-derived `conns`.
+fn spawn_resident_neighbours(commands: &mut Commands, zone: &Zone) {
+    for c in &zone.conns {
+        let path = bevy_nds_scene::level_space_path(&zone.level, &c.neighbour);
+        let Some(scene) = bevy_nds_scene::load(&path) else {
+            continue;
         };
-        for (x, z) in ends {
-            commands.spawn((
-                ConnMarker,
-                cube.clone(),
-                DsMaterial { diffuse: POST_DIFFUSE, ambient: POST_AMBIENT },
-                Transform3d {
-                    translation: Vec3::new(x, GROUND_Y + POST_HALF_H, z),
-                    rotation: Vec3::ZERO,
-                    scale: Vec3::new(POST_HALF_W, POST_HALF_H, POST_HALF_W),
-                },
-            ));
+        let offset = (-c.delta[0], -c.delta[1]);
+        spawn_zone_floor(commands, scene.bounds, offset); // neighbour's ground, abutting ours
+        spawn_neighbour(commands, &scene, offset);
+    }
+}
+
+/// Spawn one neighbour zone's instances as render-only entities, offset into the
+/// active frame. No `SceneInstance` (so `specialize_scene` skips them — no
+/// duplicate gameplay entity) and no map sprite; just mesh + transform +
+/// material, tagged `NeighbourInstance` so the next crossing can clear them. The
+/// avatar instance is skipped — the avatar is the single persistent entity.
+fn spawn_neighbour(commands: &mut Commands, scene: &bevy_nds_scene::SceneData, offset: (f32, f32)) {
+    for inst in &scene.instances {
+        if inst.role == "avatar" {
+            continue;
+        }
+        let mut e = commands.spawn((
+            NeighbourInstance,
+            Transform3d {
+                translation: Vec3::new(inst.pos[0] + offset.0, inst.pos[1], inst.pos[2] + offset.1),
+                rotation: Vec3::from_array(inst.rot),
+                scale: Vec3::from_array(inst.scale),
+            },
+        ));
+        if let Some(name) = &inst.mesh {
+            if let Some(mesh) = bevy_nds_scene::load_mesh(name) {
+                e.insert(mesh);
+            }
+        }
+        if let Some((diffuse, ambient)) = inst.material {
+            e.insert(DsMaterial { diffuse, ambient });
         }
     }
 }
@@ -291,6 +313,20 @@ struct Orbit {
 
 #[derive(Component)]
 struct Avatar;
+
+/// Marks runtime entities that **survive a zone crossing** — the single
+/// persistent avatar (#27 seamless streaming). The transition despawns the old
+/// zone's `SceneInstance` + `NeighbourInstance` entities but never a
+/// `Persistent` one, so the avatar carries across levels-worth of zones.
+#[derive(Component)]
+struct Persistent;
+
+/// A **render-only** entity from a *resident neighbour* zone — mesh + transform
+/// + material at the neighbour's offset in the active frame, carrying no
+/// gameplay (no `SceneInstance`, no map sprite). Tagged so a crossing can clear
+/// the old resident set before spawning the new one (#27 seamless streaming).
+#[derive(Component)]
+struct NeighbourInstance;
 
 /// A static landmark obstacle, attached by `specialize_scene` to every scene
 /// instance with `role: "landmark"`.
@@ -359,6 +395,7 @@ impl Plugin for SpikePlugin {
         .init_resource::<Motion>()
         .init_resource::<TopDownToggle>()
         .init_resource::<Orbit>()
+        .init_resource::<CamWarp>()
         .init_resource::<EnemyFire>()
         .init_resource::<Stroke>()
         .init_resource::<Landmarks>()
@@ -410,12 +447,9 @@ fn setup(mut commands: Commands, mut camera: ResMut<Camera3d>, mut zone: ResMut<
     // authored camera below overrides it, and `drive_camera` takes over per-frame).
     camera.position = Vec3::new(0.0, CAM_HEIGHT, CAM_DIST);
     camera.pitch = CAM_PITCH;
-    let mut floor_cam = CameraMode::Follow {
-        height: CAM_HEIGHT,
-        dist: CAM_DIST,
-        pitch: CAM_PITCH,
-    };
-    if let Some(scene) = bevy_nds_scene::load(spaces::ATRIUM) {
+    zone.level.clear();
+    zone.level.push_str(BOOT_LEVEL); // neighbour zones resolve within this level
+    if let Some(scene) = bevy_nds_scene::load(levels::facility::ATRIUM) {
         // Seed the initial framing from the space's authored camera (avatar at
         // origin) so boot lands on the right view instead of gliding in from the
         // default. The per-frame `drive_camera` director then takes over.
@@ -423,13 +457,14 @@ fn setup(mut commands: Commands, mut camera: ResMut<Camera3d>, mut zone: ResMut<
         camera.position = pos;
         camera.pitch = pitch;
         camera.yaw = yaw;
-        floor_cam = scene.camera;
         zone.set(&scene); // boot zone's bounds + connections
-        spawn_connection_markers(&mut commands, &scene); // doorway gateposts
-        bevy_nds_scene::spawn(&mut commands, scene);
+        spawn_zone_floor(&mut commands, scene.bounds, (0.0, 0.0)); // active floor (sized to bounds)
+        bevy_nds_scene::spawn(&mut commands, scene); // active zone (incl. the avatar)
     }
-    // The space's ground plane (sized to its camera; a transition swaps it).
-    spawn_space_floor(&mut commands, floor_cam);
+    // Resident neighbours (#27 seamless streaming): render-only, fogged, each
+    // with its own floor at its offset, so you see into the next zone over
+    // continuous ground. Read from the just-set `zone.conns`.
+    spawn_resident_neighbours(&mut commands, &zone);
 
     // Ground shadow — a flat dark quad (no `Height`) that stays at the avatar's
     // ground position, so a jump's screen-Y lift opens a visible gap above it.
@@ -510,12 +545,21 @@ fn specialize_scene(
         let pos = WorldPos(FxVec2::from_f32(tf.translation.x, tf.translation.z));
         match inst.role.as_str() {
             "avatar" => {
-                commands.entity(e).insert((
-                    Avatar,
-                    pos,
-                    Height::default(),
-                    Sprite::new(sprites::PLAYER).at(0, PARK_Y),
-                ));
+                // The avatar is the single persistent entity (#27 seamless
+                // streaming): consumed once from the entry zone at boot, it drops
+                // its `SceneInstance` and gains `Persistent` so no crossing ever
+                // despawns it (later zone spawns strip their avatar instance, so
+                // this arm fires exactly once).
+                commands
+                    .entity(e)
+                    .remove::<SceneInstance>()
+                    .insert((
+                        Avatar,
+                        Persistent,
+                        pos,
+                        Height::default(),
+                        Sprite::new(sprites::PLAYER).at(0, PARK_Y),
+                    ));
             }
             "enemy" => {
                 commands.entity(e).insert((
@@ -761,6 +805,60 @@ fn knock_device_offline(state: &mut PlayerState, stroke: &mut Stroke) {
 /// along -Y (degenerate orientation); pushes the look-at just off the avatar.
 const TD_EPS: f32 = 0.001;
 
+/// An in-flight **camera warp**: a timed ease-in-out + slerp blend from the
+/// camera's pose at the crossing to the new zone's framing (#27 seamless
+/// streaming). `t` runs 0→1 (≥1 = idle); `from_*` is the camera's **actual**
+/// pose captured at the crossing (after the re-base), *including* its follow
+/// lag — so `s = 0` reproduces exactly where the camera already is (no snap),
+/// and the blend eases (smoothstep) + slerps the offset around the avatar (it
+/// arcs) toward the live target framing.
+#[derive(Resource, Clone, Copy)]
+struct CamWarp {
+    t: f32,
+    from_pos: Vec3,
+    from_pitch: f32,
+    from_yaw: f32,
+}
+
+impl Default for CamWarp {
+    fn default() -> Self {
+        // Idle (t ≥ 1); `from_*` is unused until a crossing captures it.
+        Self {
+            t: 1.0,
+            from_pos: Vec3::ZERO,
+            from_pitch: 0.0,
+            from_yaw: 0.0,
+        }
+    }
+}
+
+/// Cubic ease-in-out (smoothstep): 0→0, 1→1, flat slope at both ends.
+fn smoothstep(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// Spherical interpolation of `a`→`b`: **rotates** the direction along the
+/// shorter arc while interpolating the magnitude linearly, so a camera offset
+/// swings around the avatar instead of sliding through it. Falls back to a plain
+/// `lerp` when the two are near-parallel or degenerate (where slerp is unstable
+/// and visually identical anyway).
+fn slerp_vec3(a: Vec3, b: Vec3, t: f32) -> Vec3 {
+    let (la, lb) = (a.length(), b.length());
+    if la < 1e-4 || lb < 1e-4 {
+        return a.lerp(b, t);
+    }
+    let mag = la + (lb - la) * t;
+    let (na, nb) = (a / la, b / lb);
+    let dot = na.dot(nb).clamp(-1.0, 1.0);
+    if dot > 0.9995 {
+        return a.lerp(b, t);
+    }
+    let theta = libm::acosf(dot) * t;
+    let rel = (nb - na * dot).normalize_or_zero();
+    (na * libm::cosf(theta) + rel * libm::sinf(theta)) * mag
+}
+
 /// Drive the top-screen camera from the **space's authored base mode**
 /// ([`LoadedScene`] — Follow / TopDown / Rail2.5D / CaptureFraming), with the
 /// player's cluster-▲ top-down toggle layered on top (#17 control model) and a
@@ -773,6 +871,7 @@ fn drive_camera(
     scene: Option<Res<LoadedScene>>,
     mut topdown: ResMut<TopDownToggle>,
     orbit: Res<Orbit>,
+    mut warp: ResMut<CamWarp>,
     mut camera: ResMut<Camera3d>,
     avatar: Query<&WorldPos, With<Avatar>>,
 ) {
@@ -809,9 +908,28 @@ fn drive_camera(
     } else {
         frame_for(base, ax, az, orbit_yaw)
     };
-    camera.position = camera.position.lerp(target, CAM_SMOOTH);
-    camera.pitch = pitch;
-    camera.yaw = yaw;
+
+    if !topdown.0 && warp.t < 1.0 {
+        // Zone-transition warp: ease-in-out + slerp from the camera's **captured
+        // crossing pose** to the new zone's framing. `from_*` is the actual pose
+        // at the crossing (re-based, lag included), so at `s = 0` this reproduces
+        // exactly where the camera is — no snap, no lag discarded. The offset
+        // around the avatar is slerped (it arcs) and `s` is smoothstepped (no
+        // abrupt start/stop); the target is the live framing, so the camera tracks
+        // the avatar increasingly as the warp completes.
+        let ground = Vec3::new(ax, 0.0, az);
+        let s = smoothstep(warp.t);
+        camera.position = ground + slerp_vec3(warp.from_pos - ground, target - ground, s);
+        camera.pitch = warp.from_pitch + (pitch - warp.from_pitch) * s;
+        camera.yaw = warp.from_yaw + (yaw - warp.from_yaw) * s;
+        warp.t += CAM_WARP_STEP;
+    } else {
+        // Steady state: soft-follow the position; ease pitch (yaw stays instant so
+        // OrbitSet drag is responsive). Also smooths the top-down toggle's tilt.
+        camera.position = camera.position.lerp(target, CAM_SMOOTH);
+        camera.pitch += (pitch - camera.pitch) * CAM_TURN_SMOOTH;
+        camera.yaw = yaw;
+    }
 }
 
 /// Resolve an authored [`CameraMode`] + the avatar's ground position `(ax, az)`

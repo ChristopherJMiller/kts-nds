@@ -1,0 +1,12 @@
+// patroller — a roaming cube enemy (a light threat / arena encounter). Used as
+// a prefab so every level places the same body + material and only authors the
+// per-instance position and patrol `path`. `role` is opaque to the engine;
+// `src/main.rs`'s `specialize_scene` maps it to gameplay components. The default
+// `rot` is the shared facing; a `Use` overrides it when a spawn needs a twist.
+Prefab(
+    mesh: Some("cube"),
+    role: "enemy",
+    rot: (0.0, 0.4, 0.0),
+    scale: (0.16, 0.16, 0.16),
+    material: Some((diffuse: (225, 80, 70), ambient: (56, 20, 18))),
+)

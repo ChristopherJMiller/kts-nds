@@ -106,7 +106,7 @@ pub struct SceneInstanceData {
 /// position so its global position is continuous in the neighbour's frame.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SceneConnData {
-    /// Stem of the neighbouring zone (resolve with `space_path`).
+    /// Stem of the neighbouring zone (resolve with `level_space_path`).
     pub neighbour: String,
     /// Which edge of this zone the boundary lies on: 0 = west (−X), 1 = east
     /// (+X), 2 = south (−Z), 3 = north (+Z).

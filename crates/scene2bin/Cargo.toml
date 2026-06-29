@@ -2,16 +2,19 @@
 name = "scene2bin"
 version = "0.1.0"
 edition = "2024"
-description = "Host baker: assets/spaces/*.ron -> build/nitrofs/spaces/*.scene + a spaces.rs constants module."
+description = "Host baker: assets/levels/<name>/ -> build/nitrofs/levels/<name>/*.scene + a levels.rs constants module."
 
-# The host half of the space pipeline (issue #27), a sibling to `obj2dl` /
-# `wav2bank` / `png2sprite`. A `build.rs` calls `build_dir` over
-# `assets/spaces/*.ron`; each space is parsed, validated (referenced meshes /
-# neighbours), and packed into a `.scene` blob under `build/nitrofs/spaces/`
-# that `just rom` packs into the ROM. `bevy_nds_scene::asset::parse` is the
-# inverse reader — keep the on-disk format in sync with it. Also emits a
-# `spaces.rs` module of NitroFS-path constants the game `include!`s (mirrors
-# `wav2bank`'s `sounds.rs`). The desktop scene editor reads/writes the same RON.
+# The host half of the level pipeline (issue #27), a sibling to `obj2dl` /
+# `wav2bank` / `png2sprite`. A `build.rs` calls `build_levels_dir` over
+# `assets/levels/`; each level is a directory (a `level.ron` manifest + per-zone
+# content files), its prefab uses are resolved against `assets/prefabs/`, its
+# zones validated (referenced meshes/prefabs) + connections derived from
+# abutment, and each zone packed into a `.scene` blob under
+# `build/nitrofs/levels/<name>/` that `just rom` packs into the ROM.
+# `bevy_nds_scene::asset::parse` is the inverse reader — keep the on-disk format
+# in sync with it. Also emits a nested `levels.rs` module of NitroFS-path
+# constants the game `include!`s (mirrors `wav2bank`'s `sounds.rs`). The desktop
+# level editor reads/writes the same RON.
 
 [lib]
 

@@ -52,6 +52,15 @@ const GFX_END: *mut u32 = 0x0400_0504 as *mut u32;
 const GFX_FLUSH: *mut u32 = 0x0400_0540 as *mut u32;
 const GFX_VIEWPORT: *mut u32 = 0x0400_0580 as *mut u32;
 
+// Fog registers (see <nds/arm9/video.h>). Depth fog fades polygons toward
+// `GFX_FOG_COLOR` as their depth crosses `GFX_FOG_OFFSET` + the density table.
+const GFX_FOG_COLOR: *mut u32 = 0x0400_0358 as *mut u32;
+const GFX_FOG_OFFSET: *mut u32 = 0x0400_035C as *mut u32;
+/// 32-entry fog density table (one byte each, 0-127).
+const GFX_FOG_TABLE: *mut u8 = 0x0400_0360 as *mut u8;
+/// `GFX_CONTROL` (DISP3DCNT) fog-shift field mask (bits 8-11).
+const GFX_FOG_SHIFT_MASK: u16 = 0xF0FF;
+
 // Geometry test / status registers used for hardware picking (see
 // <nds/arm9/video.h>, <nds/arm9/postest.h>).
 /// 3D engine status; bit 0 is "position/box/vertex test busy", bit 27 is the
@@ -98,6 +107,11 @@ pub const GL_MODELVIEW: u32 = 2;
 pub const POLY_CULL_NONE: u32 = 3 << 6;
 /// Cull back-facing polygons (`POLY_CULL_BACK = 2 << 6`).
 pub const POLY_CULL_BACK: u32 = 2 << 6;
+/// `POLY_FOG = BIT(15)`: apply fog to polygons drawn with this format.
+pub const POLY_FOG: u32 = 1 << 15;
+/// `GL_FOG = BIT(7)` of `GFX_CONTROL` (DISP3DCNT): the fog master enable, passed
+/// to [`gl::enable`].
+pub const GL_FOG: u16 = 1 << 7;
 
 /// `POLY_ALPHA(n) = n << 16`: polygon alpha (0-31) for `glPolyFmt`.
 pub const fn poly_alpha(n: u32) -> u32 {
@@ -187,6 +201,9 @@ unsafe extern "C" {
     pub fn sinLerp(angle: i16) -> i16;
     pub fn cosLerp(angle: i16) -> i16;
 
+    /// Enable/disable fog on the rear (clear) plane. A real libnds symbol (not
+    /// inline), unlike the other `glFog*` setters. See `<nds/arm9/videoGL.h>`.
+    pub fn glClearFogEnable(enable: bool);
 }
 
 /// Safe-to-call (still `unsafe`: they touch MMIO) reimplementations of the
@@ -219,6 +236,43 @@ pub mod gl {
         unsafe {
             let c = read_volatile(GFX_CONTROL);
             write_volatile(GFX_CONTROL, c | GFX_ANTIALIAS);
+        }
+    }
+
+    /// OR `bits` into `GFX_CONTROL` (DISP3DCNT) — libnds `glEnable`. Used here to
+    /// flip the fog master enable ([`GL_FOG`]). Read-modify-write, so it preserves
+    /// the render-mode bits `glInit` / [`enable_antialias`] set.
+    ///
+    /// # Safety
+    /// Call after `glInit`, on the DS with the 3D engine initialised.
+    pub unsafe fn enable(bits: u16) {
+        unsafe {
+            let c = read_volatile(GFX_CONTROL);
+            write_volatile(GFX_CONTROL, c | bits);
+        }
+    }
+
+    /// Configure depth fog: rear-plane fog on, fog `colour` (RGB + alpha, each
+    /// 0-31), `shift` (each density-table entry spans `0x400 >> shift` depth
+    /// units), `offset` (depth where fog begins, 0-0x7FFF), and a 32-entry
+    /// `density` table (each 0-127). Mirrors the libnds `glFog*` inline setters
+    /// (`GFX_CONTROL` fog-shift field + `GFX_FOG_COLOR/OFFSET/TABLE`), plus the
+    /// real `glClearFogEnable`. Enable [`GL_FOG`] separately via [`enable`].
+    ///
+    /// # Safety
+    /// Call after `glInit`, on the DS with the 3D engine initialised.
+    pub unsafe fn setup_fog(colour: (u8, u8, u8, u8), shift: u16, offset: u32, density: &[u8; 32]) {
+        unsafe {
+            glClearFogEnable(true);
+            let (r, g, b, a) = colour;
+            write_volatile(GFX_FOG_COLOR, rgb15(r << 3, g << 3, b << 3) | ((a as u32) << 16));
+            write_volatile(GFX_FOG_OFFSET, offset);
+            // Fog-shift lives in bits 8-11 of GFX_CONTROL (read-modify-write).
+            let c = read_volatile(GFX_CONTROL) & GFX_FOG_SHIFT_MASK;
+            write_volatile(GFX_CONTROL, c | ((shift & 0xF) << 8));
+            for (i, &d) in density.iter().enumerate() {
+                write_volatile(GFX_FOG_TABLE.add(i), d);
+            }
         }
     }
 
