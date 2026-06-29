@@ -100,6 +100,53 @@ pub fn model_to_le_bytes(model: &Model) -> Vec<u8> {
     out
 }
 
+/// One triangle for host-side **preview** rendering: the three corner positions
+/// plus the triangle's flat (geometric) normal. See [`obj_preview_mesh`].
+#[derive(Clone, Copy, Debug)]
+pub struct PreviewTri {
+    /// Corner positions in the OBJ's local space (no origin adjustment applied).
+    pub pos: [[f32; 3]; 3],
+    /// Flat normal, normalised (zero if degenerate).
+    pub normal: [f32; 3],
+}
+
+/// A parsed OBJ ready to *draw*: its triangles plus the local-space axis-aligned
+/// bounding box (`[min, max]`).
+#[derive(Clone, Debug)]
+pub struct PreviewMesh {
+    pub tris: Vec<PreviewTri>,
+    pub aabb: [[f32; 3]; 2],
+}
+
+/// Parse a Wavefront OBJ into raw triangles for **preview** rendering (e.g. the
+/// scene editor's 3D viewport).
+///
+/// Unlike [`obj_to_display_list`], this exposes the geometry instead of packing
+/// it into a Geometry-Engine command block — a tool that *renders* the mesh needs
+/// vertices, not GE commands. Parsing reuses the same [`parse_obj`] reader as the
+/// baker, so OBJ support stays defined in one place (no origin adjustment is
+/// applied; previews draw the geometry as authored).
+pub fn obj_preview_mesh(source: &str) -> Result<PreviewMesh, String> {
+    let tris = parse_obj(source)?;
+    if tris.is_empty() {
+        return Err("no triangles found".into());
+    }
+    let mut min = [f32::INFINITY; 3];
+    let mut max = [f32::NEG_INFINITY; 3];
+    let mut out = Vec::with_capacity(tris.len());
+    for t in &tris {
+        let pos = [t.verts[0].0, t.verts[1].0, t.verts[2].0];
+        for p in &pos {
+            for k in 0..3 {
+                min[k] = min[k].min(p[k]);
+                max[k] = max[k].max(p[k]);
+            }
+        }
+        out.push(PreviewTri { pos, normal: flat_normal(pos[0], pos[1], pos[2]) });
+    }
+    Ok(PreviewMesh { tris: out, aabb: [min, max] })
+}
+
 /// One triangle's worth of baked vertex data: position + normal per corner.
 struct Tri {
     verts: [([f32; 3], [f32; 3]); 3],

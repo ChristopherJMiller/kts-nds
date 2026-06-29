@@ -12,6 +12,9 @@ path = "src/main.rs"
 # Same authoring types + RON read/write the `build.rs` baker uses, so the editor
 # is a pure front-end over the format (no schema drift, no second RON version).
 scene2bin = { version = "0.1.0", path = "../../crates/scene2bin" }
+# OBJ → raw triangles for the 3D viewport (#40). Reuses the baker's OBJ reader
+# (`obj_preview_mesh`) so the editor parses geometry the same way the ROM does.
+bevy_nds_3d_obj = { version = "0.1.0", path = "../../crates/bevy_nds_3d_obj" }
 # Immediate-mode GUI. `glow` (OpenGL) backend avoids the heavier wgpu stack;
 # `x11` + `wayland` are the Linux windowing backends (winit fails to build with
 # neither). Drop wgpu/accesskit to keep the tree smaller.
