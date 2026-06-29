@@ -5,7 +5,7 @@
 use eframe::egui;
 use scene2bin::{Camera, Instance, Material, Placement};
 
-use crate::app::{EditorApp, Sel, View};
+use crate::app::{EditorApp, Sel, View, ViewMode};
 use crate::widgets::{
     camera_tag, default_camera, drag_row, new_instance, opt_flags_row, opt_vec3_row,
     placement_label, vec3_row,
@@ -27,11 +27,24 @@ impl EditorApp {
                 self.save();
             }
             ui.separator();
-            if ui.button("Reset view").clicked() {
-                self.view = View { center: egui::Vec2::ZERO, scale: 90.0 };
-            }
-            if ui.button("Frame all").clicked() {
-                self.frame_all();
+            ui.selectable_value(&mut self.view_mode, ViewMode::TopDown, "2D");
+            ui.selectable_value(&mut self.view_mode, ViewMode::Perspective, "3D");
+            match self.view_mode {
+                ViewMode::TopDown => {
+                    if ui.button("Reset view").clicked() {
+                        self.view = View {
+                            center: egui::Vec2::ZERO,
+                            scale: 90.0,
+                        };
+                    }
+                    if ui.button("Frame all").clicked() {
+                        self.frame_all();
+                    }
+                    ui.checkbox(&mut self.show_connections, "connections");
+                }
+                ViewMode::Perspective => {
+                    ui.checkbox(&mut self.wireframe, "wireframe");
+                }
             }
         });
         if !self.status.is_empty() {
@@ -75,7 +88,11 @@ impl EditorApp {
         ui.label("zones:");
         for s in &stems {
             let is_active = self.active.as_deref() == Some(s.as_str());
-            let tag = if self.level.entry == *s { format!("{s}  ★") } else { s.clone() };
+            let tag = if self.level.entry == *s {
+                format!("{s}  ★")
+            } else {
+                s.clone()
+            };
             ui.horizontal(|ui| {
                 if ui.selectable_label(is_active, tag).clicked() {
                     self.active = Some(s.clone());
@@ -127,7 +144,16 @@ impl EditorApp {
             entry.camera = default_camera(tag);
         }
         match &mut entry.camera {
-            Camera::Follow { height, dist, pitch } | Camera::Rail2_5D { height, dist, pitch } => {
+            Camera::Follow {
+                height,
+                dist,
+                pitch,
+            }
+            | Camera::Rail2_5D {
+                height,
+                dist,
+                pitch,
+            } => {
                 drag_row(ui, "height", height, 0.01);
                 drag_row(ui, "dist", dist, 0.01);
                 drag_row(ui, "pitch", pitch, 0.01);
@@ -138,18 +164,42 @@ impl EditorApp {
 
         ui.horizontal(|ui| {
             ui.label("place (global x,z)");
-            ui.add(egui::DragValue::new(&mut entry.place[0]).speed(0.05).prefix("x "));
-            ui.add(egui::DragValue::new(&mut entry.place[1]).speed(0.05).prefix("z "));
+            ui.add(
+                egui::DragValue::new(&mut entry.place[0])
+                    .speed(0.05)
+                    .prefix("x "),
+            );
+            ui.add(
+                egui::DragValue::new(&mut entry.place[1])
+                    .speed(0.05)
+                    .prefix("z "),
+            );
         });
         ui.horizontal(|ui| {
             ui.label("bounds min");
-            ui.add(egui::DragValue::new(&mut entry.bounds.min[0]).speed(0.05).prefix("x "));
-            ui.add(egui::DragValue::new(&mut entry.bounds.min[1]).speed(0.05).prefix("z "));
+            ui.add(
+                egui::DragValue::new(&mut entry.bounds.min[0])
+                    .speed(0.05)
+                    .prefix("x "),
+            );
+            ui.add(
+                egui::DragValue::new(&mut entry.bounds.min[1])
+                    .speed(0.05)
+                    .prefix("z "),
+            );
         });
         ui.horizontal(|ui| {
             ui.label("bounds max");
-            ui.add(egui::DragValue::new(&mut entry.bounds.max[0]).speed(0.05).prefix("x "));
-            ui.add(egui::DragValue::new(&mut entry.bounds.max[1]).speed(0.05).prefix("z "));
+            ui.add(
+                egui::DragValue::new(&mut entry.bounds.max[0])
+                    .speed(0.05)
+                    .prefix("x "),
+            );
+            ui.add(
+                egui::DragValue::new(&mut entry.bounds.max[1])
+                    .speed(0.05)
+                    .prefix("z "),
+            );
         });
         ui.label(egui::RichText::new("Connections derive from placement at bake.").weak());
     }
@@ -163,7 +213,8 @@ impl EditorApp {
             if ui.button("+ literal").clicked() {
                 if let Some(zone) = self.contents.get_mut(&stem) {
                     let idx = zone.instances.len();
-                    zone.instances.push(Placement::Lit(new_instance(self.view.center)));
+                    zone.instances
+                        .push(Placement::Lit(new_instance(self.view.center)));
                     self.sel = Sel::Instance(idx);
                 }
             }
@@ -239,9 +290,20 @@ impl EditorApp {
 
         match &mut zone.instances[i] {
             Placement::Lit(inst) => literal_instance_ui(ui, inst, meshes),
-            Placement::Use { name, pos, rot, scale, material, flags, path } => {
+            Placement::Use {
+                name,
+                pos,
+                rot,
+                scale,
+                material,
+                flags,
+                path,
+            } => {
                 ui.heading("Selected · use");
-                let role = prefabs.get(name).map(|p| p.role.clone()).unwrap_or_else(|| "?".into());
+                let role = prefabs
+                    .get(name)
+                    .map(|p| p.role.clone())
+                    .unwrap_or_else(|| "?".into());
                 ui.label(format!("prefab: {name}  (role {role})"));
                 ui.label("position (x, y, z)");
                 vec3_row(ui, "pos", pos, 0.01);
@@ -260,8 +322,10 @@ impl EditorApp {
                 });
                 let mut has_mat = material.is_some();
                 if ui.checkbox(&mut has_mat, "material override").changed() {
-                    *material =
-                        has_mat.then_some(Material { diffuse: [200, 200, 210], ambient: [40, 40, 55] });
+                    *material = has_mat.then_some(Material {
+                        diffuse: [200, 200, 210],
+                        ambient: [40, 40, 55],
+                    });
                 }
                 if let Some(m) = material {
                     ui.horizontal(|ui| {
@@ -318,7 +382,10 @@ fn literal_instance_ui(ui: &mut egui::Ui, inst: &mut Instance, meshes: &[String]
 
     let mut has_mat = inst.material.is_some();
     if ui.checkbox(&mut has_mat, "lit material").changed() {
-        inst.material = has_mat.then_some(Material { diffuse: [200, 200, 210], ambient: [40, 40, 55] });
+        inst.material = has_mat.then_some(Material {
+            diffuse: [200, 200, 210],
+            ambient: [40, 40, 55],
+        });
     }
     if let Some(m) = &mut inst.material {
         ui.horizontal(|ui| {
@@ -334,7 +401,11 @@ fn literal_instance_ui(ui: &mut egui::Ui, inst: &mut Instance, meshes: &[String]
     ui.horizontal(|ui| {
         ui.label(format!("path ({} pts)", inst.path.len()));
         if ui.button("+ wp").clicked() {
-            let last = inst.path.last().copied().unwrap_or([inst.pos[0], inst.pos[2]]);
+            let last = inst
+                .path
+                .last()
+                .copied()
+                .unwrap_or([inst.pos[0], inst.pos[2]]);
             inst.path.push(last);
         }
         if ui.button("− wp").clicked() {

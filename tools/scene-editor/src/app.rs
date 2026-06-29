@@ -4,11 +4,21 @@
 
 use std::collections::BTreeMap;
 
+use bevy_nds_3d_obj::PreviewMesh;
 use eframe::egui;
 use egui::{Pos2, Rect, Vec2};
 use scene2bin::{Camera, Level, PrefabLib, Zone, ZoneEntry};
 
+use crate::viewport::OrbitCam;
 use crate::widgets::{empty_level, stems};
+
+/// Which view fills the central panel: the top-down layout canvas or the 3D
+/// preview viewport (#40).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ViewMode {
+    TopDown,
+    Perspective,
+}
 
 /// What the pointer is currently dragging (decided on drag-start so the grab
 /// stays stable for the whole gesture).
@@ -58,6 +68,17 @@ pub(crate) struct EditorApp {
     pub(crate) drag: Drag,
     pub(crate) view: View,
     pub(crate) status: String,
+    /// Central-panel view: top-down layout vs 3D preview (#40).
+    pub(crate) view_mode: ViewMode,
+    /// Orbit camera for the 3D viewport.
+    pub(crate) cam3: OrbitCam,
+    /// Wireframe vs solid in the 3D viewport.
+    pub(crate) wireframe: bool,
+    /// Show the derived-connection / isolation overlay on the top-down canvas (#41).
+    pub(crate) show_connections: bool,
+    /// Lazily parsed OBJ preview meshes, keyed by mesh stem. `None` = a load that
+    /// failed (missing/unparseable `.obj`); cached so we don't retry every frame.
+    pub(crate) mesh_cache: BTreeMap<String, Option<PreviewMesh>>,
 }
 
 impl EditorApp {
@@ -77,8 +98,16 @@ impl EditorApp {
             new_zone: String::new(),
             sel: Sel::None,
             drag: Drag::None,
-            view: View { center: Vec2::ZERO, scale: 90.0 },
+            view: View {
+                center: Vec2::ZERO,
+                scale: 90.0,
+            },
             status: String::new(),
+            view_mode: ViewMode::TopDown,
+            cam3: OrbitCam::default(),
+            wireframe: false,
+            show_connections: true,
+            mesh_cache: BTreeMap::new(),
         };
         app.rescan();
         app.load();
@@ -88,12 +117,28 @@ impl EditorApp {
     /// Refresh the mesh + prefab libraries from disk (for the pickers).
     pub(crate) fn rescan(&mut self) {
         self.meshes = stems(&self.assets_dir, "obj");
-        self.prefabs = scene2bin::load_prefab_lib(std::path::Path::new(&self.prefabs_dir))
-            .unwrap_or_default();
+        self.prefabs =
+            scene2bin::load_prefab_lib(std::path::Path::new(&self.prefabs_dir)).unwrap_or_default();
+        // Drop cached previews so edited `.obj` files re-parse on next draw.
+        self.mesh_cache.clear();
     }
 
     pub(crate) fn prefab_names(&self) -> Vec<String> {
         self.prefabs.keys().cloned().collect()
+    }
+
+    /// Lazily parse + cache the preview mesh for `name` (from `<assets>/<name>.obj`)
+    /// for the 3D viewport. Returns `None` for a missing/unparseable `.obj` — the
+    /// failure is cached so it isn't retried every frame (cleared by [`Self::rescan`]).
+    pub(crate) fn mesh_preview(&mut self, name: &str) -> Option<&PreviewMesh> {
+        if !self.mesh_cache.contains_key(name) {
+            let path = std::path::Path::new(&self.assets_dir).join(format!("{name}.obj"));
+            let parsed = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|src| bevy_nds_3d_obj::obj_preview_mesh(&src).ok());
+            self.mesh_cache.insert(name.to_string(), parsed);
+        }
+        self.mesh_cache.get(name).and_then(|m| m.as_ref())
     }
 
     pub(crate) fn load(&mut self) {
@@ -138,7 +183,11 @@ impl EditorApp {
         self.level = level;
         self.contents = contents;
         self.sel = Sel::None;
-        self.status = format!("loaded {} ({} zones)", self.level_dir, self.level.zones.len());
+        self.status = format!(
+            "loaded {} ({} zones)",
+            self.level_dir,
+            self.level.zones.len()
+        );
     }
 
     pub(crate) fn save(&mut self) {
@@ -189,7 +238,11 @@ impl EditorApp {
                 }
             }
         }
-        self.status = format!("saved {} ({} zones)", self.level_dir, self.level.zones.len());
+        self.status = format!(
+            "saved {} ({} zones)",
+            self.level_dir,
+            self.level.zones.len()
+        );
         self.rescan();
     }
 
@@ -234,7 +287,12 @@ impl EditorApp {
                 camera: Camera::default(),
             },
         );
-        self.contents.insert(stem.clone(), Zone { instances: Vec::new() });
+        self.contents.insert(
+            stem.clone(),
+            Zone {
+                instances: Vec::new(),
+            },
+        );
         self.active = Some(stem);
         self.new_zone.clear();
         self.sel = Sel::None;
@@ -266,6 +324,9 @@ impl eframe::App for EditorApp {
             .resizable(true)
             .default_size(340.0)
             .show_inside(ui, |ui| self.side_panel(ui));
-        egui::CentralPanel::default().show_inside(ui, |ui| self.canvas(ui));
+        egui::CentralPanel::default().show_inside(ui, |ui| match self.view_mode {
+            ViewMode::TopDown => self.canvas(ui),
+            ViewMode::Perspective => self.viewport(ui),
+        });
     }
 }

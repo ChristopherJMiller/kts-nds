@@ -22,6 +22,7 @@
 mod app;
 mod canvas;
 mod panel;
+mod viewport;
 mod widgets;
 
 use app::EditorApp;

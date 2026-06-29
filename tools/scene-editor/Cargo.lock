@@ -106,6 +106,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9d297deb1925b89f2ccc13d7635fa0714f12c87adce1c75356b39ca9b7178567"
 
 [[package]]
+name = "bevy_nds_3d_obj"
+version = "0.1.0"
+
+[[package]]
 name = "bit-set"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1976,6 +1980,7 @@ dependencies = [
 name = "scene-editor"
 version = "0.1.0"
 dependencies = [
+ "bevy_nds_3d_obj",
  "eframe",
  "egui",
  "scene2bin",

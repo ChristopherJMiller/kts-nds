@@ -22,7 +22,10 @@ pub(crate) fn new_instance(at: Vec2) -> Instance {
         pos: [at.x, 0.0, at.y],
         rot: [0.0, 0.0, 0.0],
         scale: [0.16, 0.16, 0.16],
-        material: Some(Material { diffuse: [120, 120, 138], ambient: [34, 34, 44] }),
+        material: Some(Material {
+            diffuse: [120, 120, 138],
+            ambient: [34, 34, 44],
+        }),
         flags: 0,
         path: Vec::new(),
     }
@@ -40,9 +43,17 @@ pub(crate) fn camera_tag(c: &Camera) -> &'static str {
 pub(crate) fn default_camera(tag: &str) -> Camera {
     match tag {
         "TopDown" => Camera::TopDown { height: 3.2 },
-        "Rail2_5D" => Camera::Rail2_5D { height: 1.7, dist: 2.0, pitch: -0.7 },
+        "Rail2_5D" => Camera::Rail2_5D {
+            height: 1.7,
+            dist: 2.0,
+            pitch: -0.7,
+        },
         "CaptureFraming" => Camera::CaptureFraming,
-        _ => Camera::Follow { height: 1.7, dist: 2.0, pitch: -0.7 },
+        _ => Camera::Follow {
+            height: 1.7,
+            dist: 2.0,
+            pitch: -0.7,
+        },
     }
 }
 
@@ -67,7 +78,12 @@ pub(crate) fn diamond(c: Pos2, r: f32) -> Vec<Pos2> {
     ]
 }
 
-pub(crate) fn drag_row<N: egui::emath::Numeric>(ui: &mut egui::Ui, label: &str, v: &mut N, speed: f64) {
+pub(crate) fn drag_row<N: egui::emath::Numeric>(
+    ui: &mut egui::Ui,
+    label: &str,
+    v: &mut N,
+    speed: f64,
+) {
     ui.horizontal(|ui| {
         ui.label(label);
         ui.add(egui::DragValue::new(v).speed(speed));
@@ -116,9 +132,10 @@ pub(crate) fn opt_flags_row(ui: &mut egui::Ui, label: &str, v: &mut Option<u32>)
 pub(crate) fn placement_role(p: &Placement, prefabs: &PrefabLib) -> String {
     match p {
         Placement::Lit(i) => i.role.clone(),
-        Placement::Use { name, .. } => {
-            prefabs.get(name).map(|pf| pf.role.clone()).unwrap_or_else(|| format!("?{name}"))
-        }
+        Placement::Use { name, .. } => prefabs
+            .get(name)
+            .map(|pf| pf.role.clone())
+            .unwrap_or_else(|| format!("?{name}")),
     }
 }
 
