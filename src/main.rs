@@ -52,6 +52,7 @@ mod capture;
 mod control;
 mod menu;
 mod player;
+mod radial;
 mod transition;
 
 use player::{Health, Height, Locomotion, Motion, PlayerState, Shadow, StickState};
@@ -140,6 +141,12 @@ const MAP_SCALE: f32 = 42.8;
 const MAP_CX: f32 = 128.0;
 const MAP_CY: f32 = 96.0;
 const PARK_Y: i16 = 200; // off-screen park for hidden sprites
+
+// --- Radial wheel overlay (#25) ----------------------------------------------
+
+const RADIAL_RADIUS: f32 = 44.0; // px from the wheel centre to each spoke icon
+const RADIAL_LINE_DOTS: usize = 10; // dots along the centre→stylus pointer line
+const RADIAL_HOVER_POP: f32 = 8.0; // extra px the hovered spoke pops outward
 
 // --- Loop draw (Spike B) -----------------------------------------------------
 
@@ -369,6 +376,15 @@ struct WorldPos(FxVec2);
 #[derive(Component)]
 struct PathDot;
 
+/// A radial-wheel spoke icon (index 0 = device/up). A placeholder OAM sprite,
+/// laid out around the wheel origin while the wheel is open (#25).
+#[derive(Component)]
+struct RadialSpoke(u8);
+
+/// A dot on the pointer line drawn from the wheel centre to the stylus (#25).
+#[derive(Component)]
+struct RadialLine;
+
 #[derive(Component)]
 struct InfoHud;
 
@@ -408,6 +424,7 @@ impl Plugin for SpikePlugin {
         .init_resource::<Transition>()
         .init_resource::<Zone>()
         .init_resource::<capture::CaptureTally>()
+        .init_resource::<radial::Radial>()
         .init_resource::<Health>()
         .add_event::<capture::CaptureResolved>()
         .add_systems(Startup, setup)
@@ -420,7 +437,7 @@ impl Plugin for SpikePlugin {
                 (
                     specialize_scene,
                     transition::transition_spaces,
-                    player::transition_state,
+                    radial::drive_radial,
                     player::toggle_tuning,
                     reset_enemy,
                     player::move_player,
@@ -446,6 +463,7 @@ impl Plugin for SpikePlugin {
                     update_cursor,
                     sync_map_markers,
                     update_trail,
+                    update_radial_overlay,
                     update_hud,
                 )
                     .chain(),
@@ -548,13 +566,23 @@ fn setup(mut commands: Commands, mut camera: ResMut<Camera3d>, mut zone: ResMut<
         commands.spawn((PathDot, Sprite::new(sprites::DOT).at(0, PARK_Y)));
     }
 
+    // Radial-wheel overlay (#25): 5 spoke icons + a pointer line of dots, parked
+    // off-screen until the wheel opens. Placeholder art — OBSTACLE for the spokes,
+    // DOT for the pointer (both already loaded, so no extra palette bank).
+    for i in 0..bevy_nds_math::radial::SPOKES {
+        commands.spawn((RadialSpoke(i), Sprite::new(sprites::OBSTACLE).at(0, PARK_Y)));
+    }
+    for _ in 0..RADIAL_LINE_DOTS {
+        commands.spawn((RadialLine, Sprite::new(sprites::DOT).at(0, PARK_Y)));
+    }
+
     let b = DsScreen::Bottom;
     commands.spawn((b, TilePos::new(1, 0), InfoHud, DsText::new("")));
     commands.spawn((b, TilePos::new(1, 1), TallyHud, DsText::new("")));
     commands.spawn((
         b,
         TilePos::new(1, 22),
-        DsText::new("L deploy   stylus move/draw"),
+        DsText::new("L: hold+flick=deploy tap=stow"),
     ));
     commands.spawn((
         b,
@@ -1133,10 +1161,68 @@ fn update_trail(
     }
 }
 
+/// Draw the radial-wheel placeholder overlay while it's open (#25): the 5 spoke
+/// icons laid out around the wheel origin (a point-up pentagon), plus a pointer
+/// line of dots from the wheel centre to the live stylus position. Everything
+/// parks off-screen when the wheel is closed. The spoke layout comes from the
+/// same `bevy_nds_math::radial` geometry the picker uses, so the drawn wheel and
+/// the selected spoke can't disagree.
+fn update_radial_overlay(
+    radial: Res<radial::Radial>,
+    touches: Res<Touches>,
+    mut spokes: Query<(&RadialSpoke, &mut Sprite), (With<RadialSpoke>, Without<RadialLine>)>,
+    mut line: Query<&mut Sprite, (With<RadialLine>, Without<RadialSpoke>)>,
+) {
+    let origin = if radial.open { radial.origin } else { None };
+    // The spoke currently under the pen — pops out + swaps to a highlight icon so
+    // you can see what a release would confirm before letting go (#25).
+    let hovered = radial.preview.map(|s| s.index());
+
+    // Spoke icons around the wheel origin (16×16, so centre with a -8 offset).
+    for (spoke, mut s) in &mut spokes {
+        if let Some(o) = origin {
+            let dir = bevy_nds_math::radial::spoke_dir(spoke.0);
+            let is_hovered = hovered == Some(spoke.0);
+            let radius = if is_hovered {
+                RADIAL_RADIUS + RADIAL_HOVER_POP
+            } else {
+                RADIAL_RADIUS
+            };
+            s.image = if is_hovered {
+                sprites::BLIP_HIT
+            } else {
+                sprites::OBSTACLE
+            };
+            s.x = (o.x.to_f32() + dir.x.to_f32() * radius) as i16 - 8;
+            s.y = (o.y.to_f32() + dir.y.to_f32() * radius) as i16 - 8;
+        } else {
+            s.y = PARK_Y;
+        }
+    }
+
+    // Pointer line: dots evenly spaced from the wheel centre toward the stylus
+    // (8×8, -4 offset). Parks when the wheel is closed or the pen is up.
+    let cur = touches
+        .iter()
+        .next()
+        .map(|t| (t.position().x, t.position().y));
+    for (i, mut s) in line.iter_mut().enumerate() {
+        match (origin, cur) {
+            (Some(o), Some((tx, ty))) => {
+                let f = (i as f32 + 1.0) / (RADIAL_LINE_DOTS as f32 + 1.0);
+                s.x = (o.x.to_f32() + (tx - o.x.to_f32()) * f) as i16 - 4;
+                s.y = (o.y.to_f32() + (ty - o.y.to_f32()) * f) as i16 - 4;
+            }
+            _ => s.y = PARK_Y,
+        }
+    }
+}
+
 fn update_hud(
     pstate: Res<PlayerState>,
     health: Res<Health>,
     tally: Res<capture::CaptureTally>,
+    radial: Res<radial::Radial>,
     caps: Query<&capture::Capture>,
     mut hud: Query<(&mut DsText, Has<InfoHud>), Or<(With<InfoHud>, With<TallyHud>)>>,
 ) {
@@ -1151,6 +1237,20 @@ fn update_hud(
                 "hp {}/{}  lib {}  des {}",
                 health.hp, health.max, tally.liberated, tally.destroyed
             );
+            continue;
+        }
+        // While the wheel is open, the status line previews the spoke under the
+        // pen (#25) — a text stand-in until the graphical overlay lands (the
+        // "which screen" feel question is still open on #25).
+        if radial.open {
+            match radial.preview {
+                Some(spoke) => {
+                    let _ = write!(text.0, "RADIAL  {}", spoke.label());
+                }
+                None => {
+                    let _ = write!(text.0, "RADIAL  cancel");
+                }
+            }
             continue;
         }
         if health.is_downed() {
