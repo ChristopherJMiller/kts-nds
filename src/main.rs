@@ -50,6 +50,7 @@ use bevy_nds_sprite::prelude::*;
 
 mod capture;
 mod control;
+mod menu;
 mod player;
 mod transition;
 
@@ -381,6 +382,7 @@ pub extern "C" fn main() -> core::ffi::c_int {
     app.add_plugins(DsPlugins)
         .add_plugins(Ds3dPlugin)
         .add_plugins(SpritePlugin)
+        .add_plugins(menu::MenuPlugin)
         .add_plugins(SpikePlugin);
     bevy_nds::run(app)
 }
@@ -433,7 +435,11 @@ impl Plugin for SpikePlugin {
                     capture::enemy_contact,
                     capture::tally_captures,
                 )
-                    .chain(),
+                    .chain()
+                    // Paused while the options menu is open (Select). Rendering
+                    // keeps running below, so the frozen world stays on screen
+                    // and render-style toggles are visible live.
+                    .run_if(menu::playing),
                 // Rendering: mirror world state onto the two screens.
                 (
                     sync_3d,
@@ -502,6 +508,7 @@ fn setup(mut commands: Commands, mut camera: ResMut<Camera3d>, mut zone: ResMut<
     // renderer) until deployed + drawing.
     commands.spawn((
         Cursor,
+        Stylized,
         cube.clone(),
         DsMaterial {
             diffuse: [245, 240, 180],
@@ -522,6 +529,7 @@ fn setup(mut commands: Commands, mut camera: ResMut<Camera3d>, mut zone: ResMut<
             vel: FxVec2::ZERO,
         },
         WorldPos(FxVec2::ZERO),
+        Stylized,
         cube.clone(),
         DsMaterial {
             diffuse: [255, 150, 40],
@@ -551,7 +559,7 @@ fn setup(mut commands: Commands, mut camera: ResMut<Camera3d>, mut zone: ResMut<
     commands.spawn((
         b,
         TilePos::new(1, 23),
-        DsText::new("up=topdown  START reset"),
+        DsText::new("up=cam START=reset SELECT=menu"),
     ));
 }
 
@@ -590,6 +598,9 @@ fn specialize_scene(
                     capture::Capture::default(),
                     capture::VulnerabilityShape::circle(),
                     pos,
+                    // Outlined + cel-shaded so the threat reads at a glance;
+                    // terrain stays smooth (see `Stylized`).
+                    Stylized,
                     Sprite::new(sprites::BLIP).at(0, PARK_Y),
                 ));
             }
@@ -613,13 +624,17 @@ fn specialize_scene(
 /// start), so the capture loop is replayable.
 fn reset_enemy(
     input: Res<ButtonInput<DsButton>>,
+    mut pending: ResMut<menu::PendingReset>,
     mut tally: ResMut<capture::CaptureTally>,
     mut health: ResMut<Health>,
     mut q: Query<(&mut Enemy, &mut capture::Capture, &mut WorldPos, &ScenePath)>,
 ) {
-    if !input.just_pressed(DsButton::Start) {
+    // START, or the options-menu Reset item (which closes the menu and latches
+    // this so the reset runs here, in the Playing-gated chain).
+    if !input.just_pressed(DsButton::Start) && !pending.0 {
         return;
     }
+    pending.0 = false;
     *tally = capture::CaptureTally::default();
     *health = Health::default();
     for (mut enemy, mut cap, mut pos, path) in &mut q {

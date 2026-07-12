@@ -598,10 +598,78 @@ pub struct DsMaterial {
 
 impl Default for DsMaterial {
     fn default() -> Self {
+        // Higher-contrast than a flat mid-grey: a bright cool diffuse over a
+        // *dark* cool ambient so lit and shadowed faces separate hard
+        // (readability = the top-screen threat read).
         Self {
-            diffuse: [200, 200, 210],
-            ambient: [40, 40, 55],
+            diffuse: [225, 230, 240],
+            ambient: [20, 22, 34],
         }
+    }
+}
+
+/// Selectable 3D render style — the DS "look" knobs, toggleable at runtime so
+/// the art direction can be judged and re-judged as it firms up (rather than
+/// baked into the pipeline). Mutating this resource re-applies the hardware
+/// state via [`apply_render_style`].
+///
+/// - **`edge_marking`** — hardware polygon outlines (silhouette separation), on
+///   [`Stylized`] meshes only. Mutually exclusive with antialiasing (they fight
+///   over edge pixels), so this toggles between outlined and antialiased
+///   silhouettes.
+#[derive(Resource, Clone, Copy)]
+pub struct DsRenderStyle {
+    /// Outline [`Stylized`] silhouettes via hardware edge marking. When off,
+    /// hardware antialiasing smooths the same edges instead.
+    pub edge_marking: bool,
+    /// The outline colour (RGB, 0-255). A dark value reads as an ink line.
+    pub outline_color: [u8; 3],
+}
+
+impl Default for DsRenderStyle {
+    fn default() -> Self {
+        Self {
+            edge_marking: true,
+            outline_color: [0, 0, 0],
+        }
+    }
+}
+
+/// Opt a mesh into the hardware edge outline (gated by [`DsRenderStyle`]).
+/// Meshes *without* this stay un-outlined and smoothly Gouraud-shaded,
+/// preserving the luminance gradient that reads as depth/curvature. Tag the
+/// things that need to pop and be read at a glance (enemies, pickups, the
+/// cursor); leave world geometry (terrain, platforms) unmarked so its form
+/// stays legible for platforming.
+///
+/// Mechanism: unmarked meshes share the rear plane's polygon ID (0), so no edge
+/// is marked between them or the background; stylized meshes each get a distinct
+/// nonzero ID, so their silhouettes outline against everything.
+#[derive(Component, Default, Clone, Copy)]
+pub struct Stylized;
+
+/// How many distinct polygon IDs stylized meshes cycle through (`1..=MAX`).
+/// The rear plane and all unmarked meshes hold ID 0. The DS polygon ID is 6-bit
+/// (0-63); we keep one clear of it.
+const MAX_STYLIZED_ID: u32 = 63;
+
+/// Re-apply the hardware render state whenever [`DsRenderStyle`] changes (and
+/// once at startup, since `Added` resources count as changed). The edge-marking
+/// registers (outline enable + edge table, the rear-plane polygon ID, and the
+/// antialiasing it trades off against) are latched here; [`render_3d`] only
+/// issues the matching per-polygon IDs.
+fn apply_render_style(style: Res<DsRenderStyle>) {
+    if !style.is_changed() {
+        return;
+    }
+    let [r, g, b] = style.outline_color;
+    unsafe {
+        // Edge marking and antialiasing interfere, so run exactly one.
+        ffi::gl::set_outline(style.edge_marking, ffi::rgb15(r, g, b));
+        ffi::gl::set_antialias(!style.edge_marking);
+        // The rear plane holds ID 0, shared with unmarked meshes so only
+        // stylized meshes (distinct IDs) get outlined against the background.
+        ffi::gl::set_clear_poly_id(0);
     }
 }
 
@@ -636,8 +704,8 @@ fn init_3d() {
         ffi::glClearColor(r, g, b, 31); // alpha 31 is required for the rear plane to fog
         gl::clear_depth(ffi::GL_MAX_DEPTH);
         gl::viewport(0, 0, 255, 191);
-        // Smooth polygon silhouettes — a near-free win on the 256×192 LCD.
-        gl::enable_antialias();
+        // Silhouette treatment (antialiasing vs. edge marking) is owned by
+        // `apply_render_style`, which runs before the first `render_3d`.
 
         // Depth fog (#27 seamless streaming): fades resident-neighbour geometry
         // into the rear plane as it recedes, masking the range cull / zone seam.
@@ -739,7 +807,8 @@ fn render_3d(
     camera: Res<Camera3d>,
     range: Res<RenderRange>,
     lights: Res<DsLights>,
-    meshes: Query<(&MeshDraw, &DsMesh, Option<&DsMaterial>), Without<Hidden>>,
+    style: Res<DsRenderStyle>,
+    meshes: Query<(&MeshDraw, &DsMesh, Option<&DsMaterial>, Has<Stylized>), Without<Hidden>>,
 ) {
     let aspect = to_fix(256.0 / 192.0);
     let fovy = rad_to_angle(camera.fov_degrees * (TAU / 360.0));
@@ -801,7 +870,12 @@ fn render_3d(
             }
         }
 
-        for (draw, mesh, mat) in &meshes {
+        // Running polygon ID for stylized meshes (1..=MAX_STYLIZED_ID); unmarked
+        // meshes and the rear plane keep ID 0, so only stylized silhouettes are
+        // outlined. Advances only when a stylized mesh is actually outlined.
+        let mut next_id: u32 = 0;
+
+        for (draw, mesh, mat, stylized) in meshes.iter() {
             // Cull bounded meshes (baked / loaded models) that are off-screen or
             // beyond the render range (resident-neighbour streaming, #27).
             // Hand-authored meshes without an AABB always draw.
@@ -810,6 +884,16 @@ fn render_3d(
             {
                 continue;
             }
+
+            // Stylized meshes get a distinct nonzero polygon ID (outlined when
+            // edge marking is on); everything else shares ID 0 with the rear
+            // plane and stays un-outlined, smoothly shaded for depth.
+            let id = if stylized && style.edge_marking {
+                next_id = next_id % MAX_STYLIZED_ID + 1;
+                ffi::poly_id(next_id)
+            } else {
+                0
+            };
 
             gl::push_matrix();
             gl::mult_matrix_4x4(&draw.model);
@@ -822,7 +906,7 @@ fn render_3d(
                     true,
                 );
                 gl::poly_fmt(
-                    ffi::poly_alpha(31) | ffi::POLY_CULL_BACK | ffi::POLY_FOG | light_mask,
+                    ffi::poly_alpha(31) | ffi::POLY_CULL_BACK | ffi::POLY_FOG | id | light_mask,
                 );
 
                 if let Some(baked) = &mesh.baked {
@@ -843,7 +927,7 @@ fn render_3d(
                     gl::end();
                 }
             } else {
-                gl::poly_fmt(ffi::poly_alpha(31) | ffi::POLY_CULL_NONE | ffi::POLY_FOG);
+                gl::poly_fmt(ffi::poly_alpha(31) | ffi::POLY_CULL_NONE | ffi::POLY_FOG | id);
 
                 gl::begin(ffi::GL_TRIANGLES);
                 for tri in mesh.tris.iter() {
@@ -1023,12 +1107,14 @@ impl Plugin for Ds3dPlugin {
             .init_resource::<Display3d>()
             .init_resource::<RenderRange>()
             .init_resource::<DsLights>()
+            .init_resource::<DsRenderStyle>()
             .init_resource::<TouchPick>()
             .add_systems(Startup, init_3d)
             .add_systems(
                 Last,
                 (
                     apply_display,
+                    apply_render_style,
                     recompute_mesh_draw,
                     render_3d,
                     pick_3d,
@@ -1043,7 +1129,7 @@ impl Plugin for Ds3dPlugin {
 pub mod prelude {
     pub use crate::{
         BakedMesh, Camera3d, DirectionalLight, Display3d, Ds3dPlugin, DsLights, DsMaterial, DsMesh,
-        Hidden, TouchPick, Transform3d, Vertex,
+        DsRenderStyle, Hidden, Stylized, TouchPick, Transform3d, Vertex,
     };
     pub use bevy_math::Vec3;
     pub use bevy_nds_3d_macros::include_obj;
