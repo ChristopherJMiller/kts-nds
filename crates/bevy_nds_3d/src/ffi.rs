@@ -61,6 +61,16 @@ const GFX_FOG_TABLE: *mut u8 = 0x0400_0360 as *mut u8;
 /// `GFX_CONTROL` (DISP3DCNT) fog-shift field mask (bits 8-11).
 const GFX_FOG_SHIFT_MASK: u16 = 0xF0FF;
 
+// Edge-marking registers. See <nds/arm9/video.h> / <nds/arm9/videoGL.h>. The
+// rear/clear-plane polygon ID (`GFX_CLEAR_COLOR` bits 24-29) is set through
+// libnds' `glClearPolyID` so it stays consistent with libnds' cached
+// clear-colour word.
+/// Edge-marking colour table: 8 RGB15 entries. The high 3 bits of a polygon's
+/// ID select which entry outlines it (`glSetOutlineColor`).
+const GFX_EDGE_TABLE: *mut u16 = 0x0400_0330 as *mut u16;
+/// `GL_OUTLINE = BIT(5)` of `GFX_CONTROL`: edge-marking (polygon outline) enable.
+const GFX_OUTLINE: u16 = 1 << 5;
+
 // Geometry test / status registers used for hardware picking (see
 // <nds/arm9/video.h>, <nds/arm9/postest.h>).
 /// 3D engine status; bit 0 is "position/box/vertex test busy", bit 27 is the
@@ -123,6 +133,15 @@ pub const fn poly_alpha(n: u32) -> u32 {
 pub const fn poly_light(id: u32) -> u32 {
     1 << id
 }
+
+/// `POLY_ID(n) = n << 24`: polygon ID (0-63) for the following polys. Edge
+/// marking outlines the boundary between differing IDs (and the differing rear
+/// plane), and antialiasing keys its blending off it. Give each mesh a distinct
+/// ID so object silhouettes separate.
+pub const fn poly_id(n: u32) -> u32 {
+    (n & 0x3F) << 24
+}
+
 
 /// Pack a 0-255-per-channel RGB colour into the DS 15-bit `RGB15` format (5 bits
 /// per channel), used by light and material colour registers.
@@ -204,6 +223,12 @@ unsafe extern "C" {
     /// Enable/disable fog on the rear (clear) plane. A real libnds symbol (not
     /// inline), unlike the other `glFog*` setters. See `<nds/arm9/videoGL.h>`.
     pub fn glClearFogEnable(enable: bool);
+
+    /// Set the rear/clear-plane polygon ID (0-63). A real libnds symbol that
+    /// updates libnds' cached clear-colour word, so it stays consistent with
+    /// [`glClearColor`] / [`glClearFogEnable`]. Edge marking outlines every
+    /// object whose polygon ID differs from this. See `<nds/arm9/videoGL.h>`.
+    pub fn glClearPolyID(id: u8);
 }
 
 /// Safe-to-call (still `unsafe`: they touch MMIO) reimplementations of the
@@ -224,24 +249,9 @@ pub mod gl {
         }
     }
 
-    /// Enable hardware **edge anti-aliasing** (`DISP3DCNT` bit 4). Smooths
-    /// polygon silhouettes — very visible at 256×192. Read-modify-write so it
-    /// preserves the render-mode bits `glInit` set. Anti-aliasing applies only
-    /// to opaque polygon edges against an opaque rear plane (our clear alpha is
-    /// 31), not to translucency, wireframe, or edge-marking.
-    ///
-    /// # Safety
-    /// Call once after `glInit`, on the DS with the 3D engine initialised.
-    pub unsafe fn enable_antialias() {
-        unsafe {
-            let c = read_volatile(GFX_CONTROL);
-            write_volatile(GFX_CONTROL, c | GFX_ANTIALIAS);
-        }
-    }
-
-    /// OR `bits` into `GFX_CONTROL` (DISP3DCNT) — libnds `glEnable`. Used here to
-    /// flip the fog master enable ([`GL_FOG`]). Read-modify-write, so it preserves
-    /// the render-mode bits `glInit` / [`enable_antialias`] set.
+    /// OR `bits` into `GFX_CONTROL` (DISP3DCNT) — libnds `glEnable`. Used to flip
+    /// the fog master enable ([`GL_FOG`]) and the render-style bits. Read-modify-
+    /// write, so it preserves the render-mode bits `glInit` set.
     ///
     /// # Safety
     /// Call after `glInit`, on the DS with the 3D engine initialised.
@@ -250,6 +260,65 @@ pub mod gl {
             let c = read_volatile(GFX_CONTROL);
             write_volatile(GFX_CONTROL, c | bits);
         }
+    }
+
+    /// AND `!bits` out of `GFX_CONTROL` (DISP3DCNT) — libnds `glDisable`.
+    /// Read-modify-write, so it preserves the other render-mode bits.
+    ///
+    /// # Safety
+    /// Call after `glInit`, on the DS with the 3D engine initialised.
+    pub unsafe fn disable(bits: u16) {
+        unsafe {
+            let c = read_volatile(GFX_CONTROL);
+            write_volatile(GFX_CONTROL, c & !bits);
+        }
+    }
+
+    /// Toggle hardware edge anti-aliasing ([`GFX_ANTIALIAS`]). AA and edge
+    /// marking interfere (they both touch silhouette pixels), so the render
+    /// style enables exactly one of the two.
+    ///
+    /// # Safety
+    /// Call after `glInit`, on the DS with the 3D engine initialised.
+    pub unsafe fn set_antialias(on: bool) {
+        unsafe {
+            if on {
+                enable(GFX_ANTIALIAS)
+            } else {
+                disable(GFX_ANTIALIAS)
+            }
+        }
+    }
+
+    /// Toggle edge marking ([`GFX_OUTLINE`]) and fill all 8 edge-table entries
+    /// with `colour` (RGB15) so a polygon of any ID is outlined in the same
+    /// colour. Objects are outlined wherever their polygon ID differs from a
+    /// neighbour's or the rear plane — set the rear plane to a reserved ID with
+    /// [`set_clear_poly_id`] and give meshes distinct IDs via [`poly_id`].
+    ///
+    /// # Safety
+    /// Call after `glInit`, on the DS with the 3D engine initialised.
+    pub unsafe fn set_outline(on: bool, colour: u32) {
+        unsafe {
+            if on {
+                for i in 0..8 {
+                    write_volatile(GFX_EDGE_TABLE.add(i), colour as u16);
+                }
+                enable(GFX_OUTLINE);
+            } else {
+                disable(GFX_OUTLINE);
+            }
+        }
+    }
+
+    /// Set the rear/clear-plane polygon ID (0-63) via libnds. Reserve one ID for
+    /// the rear plane so every object silhouette (which uses a different ID)
+    /// gets edge-marked against the background.
+    ///
+    /// # Safety
+    /// Call after `glInit`, on the DS with the 3D engine initialised.
+    pub unsafe fn set_clear_poly_id(id: u8) {
+        unsafe { glClearPolyID(id) }
     }
 
     /// Configure depth fog: rear-plane fog on, fog `colour` (RGB + alpha, each
