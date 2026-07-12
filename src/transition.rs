@@ -16,8 +16,8 @@
 
 use alloc::vec::Vec;
 
-use bevy_ecs::prelude::*;
 use alloc::string::String;
+use bevy_ecs::prelude::*;
 
 use bevy_nds_3d::prelude::Camera3d;
 use bevy_nds_scene::{SceneConnData, SceneData, SceneInstance, level_space_path};
@@ -130,7 +130,11 @@ pub fn transition_spaces(
     if state.is_deployed() {
         return;
     }
-    let Some((px, pz)) = avatar.iter().next().map(|a| (a.0.x.to_f32(), a.0.y.to_f32())) else {
+    let Some((px, pz)) = avatar
+        .iter()
+        .next()
+        .map(|a| (a.0.x.to_f32(), a.0.y.to_f32()))
+    else {
         return;
     };
     let bounds = zone.bounds;
@@ -240,15 +244,20 @@ fn swap_zone(
     // Despawn the old active zone's instances, the previous resident neighbours,
     // and all floors (the persistent avatar + chrome carry none of these markers,
     // so they survive).
-    for e in instances.iter().chain(neighbours.iter()).chain(floors.iter()) {
+    for e in instances
+        .iter()
+        .chain(neighbours.iter())
+        .chain(floors.iter())
+    {
         commands.entity(e).despawn();
     }
     spawn_zone_floor(commands, scene.bounds, (0.0, 0.0)); // active floor (sized to bounds)
 
-    // Per-zone state that mustn't carry over.
+    // Per-zone state that mustn't carry over. (Capture progress is per-enemy
+    // now — the old zone's enemies are despawned above, the new zone's spawn
+    // with a fresh `Capture` — so only the device cooldown needs clearing.)
     landmarks.0.clear(); // `specialize_scene` re-harvests the new zone's set
     stroke.0.clear();
-    device.progress = 0.0;
     device.hit_cd = 0;
 
     // Movement feel + walkable bounds follow the new zone.

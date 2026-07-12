@@ -111,6 +111,43 @@ impl Motion {
     pub fn invulnerable(&self) -> bool {
         self.burst > 0 && self.invuln
     }
+
+    /// True during a non-invulnerable evasive burst — the stowed dash (a
+    /// deployed burst is always the invuln roll). The lunge that finishes a
+    /// *breakable* enemy: retract + ram = the expedient destroy exit (#26).
+    pub fn is_dashing(&self) -> bool {
+        self.burst > 0 && !self.invuln
+    }
+}
+
+/// Avatar hit points. A hit while deployed **chips health** rather than forcing
+/// a retract (OQ-2 resolved dodge-while-draw as fair on its own — the knockout
+/// crutch was making a fresh deploy a coin-flip); only running *out* of health
+/// knocks the device offline. `START` restores it. (#26 feel pass, 2026-07-11.)
+#[derive(Resource)]
+pub struct Health {
+    pub hp: u8,
+    pub max: u8,
+}
+
+/// Starting / full hit points.
+pub const MAX_HP: u8 = 5;
+
+impl Default for Health {
+    fn default() -> Self {
+        Self {
+            hp: MAX_HP,
+            max: MAX_HP,
+        }
+    }
+}
+
+impl Health {
+    /// True once health is spent — the device gets knocked offline (the fail
+    /// beat), and the avatar stays down until `START` re-arms.
+    pub fn is_downed(&self) -> bool {
+        self.hp == 0
+    }
 }
 
 /// Which authored space the avatar is in — selects the movement feel. No space
@@ -246,7 +283,16 @@ pub fn move_player(
     } else if state.is_deployed() {
         deployed_step(&input, *handed, &mut motion, &loco, dt)
     } else {
-        stowed_step(&touches, &input, *handed, &mut stick, &mut motion, &mut height, &loco, dt)
+        stowed_step(
+            &touches,
+            &input,
+            *handed,
+            &mut stick,
+            &mut motion,
+            &mut height,
+            &loco,
+            dt,
+        )
     };
 
     if delta != FxVec2::ZERO {
@@ -318,7 +364,14 @@ fn stowed_step(
     if control::just_pressed(Action::Jump, handed, input) {
         if motion.jump_tap > 0 {
             motion.jump_tap = 0;
-            return arm_burst(motion, heading, loco.dash_speed, loco.roll_frames, false, dt);
+            return arm_burst(
+                motion,
+                heading,
+                loco.dash_speed,
+                loco.roll_frames,
+                false,
+                dt,
+            );
         }
         motion.jump_tap = DOUBLE_TAP_WINDOW;
         if height.grounded {
@@ -342,12 +395,16 @@ fn deployed_step(
     loco: &Locomotion,
     dt: Fx32,
 ) -> FxVec2 {
-    // Cluster direction → world heading.
+    // Cluster direction → world heading. `WorldPos.y` is the depth axis and
+    // world +Z points *toward* the camera, so "forward/away" is −y — matching
+    // the stowed stick (drag up-screen → away; see `stowed_locomotion`). Up =
+    // away, Down = toward the camera, so the dodge reads the same deployed as
+    // stowed.
     let dirs = [
         (Cluster::Left, FxVec2::new(Fx32::NEG_ONE, Fx32::ZERO)),
         (Cluster::Right, FxVec2::new(Fx32::ONE, Fx32::ZERO)),
-        (Cluster::Up, FxVec2::new(Fx32::ZERO, Fx32::ONE)),
-        (Cluster::Down, FxVec2::new(Fx32::ZERO, Fx32::NEG_ONE)),
+        (Cluster::Up, FxVec2::new(Fx32::ZERO, Fx32::NEG_ONE)),
+        (Cluster::Down, FxVec2::new(Fx32::ZERO, Fx32::ONE)),
     ];
 
     // Double-tap a direction → roll that way (i-frames).
@@ -388,7 +445,12 @@ fn arm_burst(
     dir * (speed * dt)
 }
 
-fn stowed_locomotion(touches: &Touches, stick: &mut StickState, loco: &Locomotion, dt: Fx32) -> FxVec2 {
+fn stowed_locomotion(
+    touches: &Touches,
+    stick: &mut StickState,
+    loco: &Locomotion,
+    dt: Fx32,
+) -> FxVec2 {
     let cfg = StickConfig {
         deadzone: Fx32::from_f32(STOW_DEADZONE),
         max_radius: Fx32::from_f32(STOW_MAX_RADIUS),

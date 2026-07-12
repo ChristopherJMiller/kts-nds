@@ -23,8 +23,11 @@
 //!   stylus draws a loop (Spike B) to enclose the enemy while the **d-pad
 //!   dodges** (B = roll).
 //!
-//! Capture: each loop that encloses the enemy on the map adds progress; two
-//! captures it (it vanishes). Enemy contact while deployed costs progress (the
+//! Capture (now the real model, #26 — see `capture`): each loop that fully
+//! encloses the enemy's footprint on the map adds progress. Past the destroy
+//! threshold it's *breakable* — retract and **dash into it to destroy** (the
+//! expedient exit); draw all the way to full to **liberate** it (the rewarded
+//! exit). Enemy contact while deployed costs that enemy's progress (the
 //! pressure) — unless you're mid-roll (i-frames). **START** re-arms the enemy.
 
 #![no_std]
@@ -40,16 +43,17 @@ use bevy_app::prelude::*;
 use bevy_ecs::prelude::*;
 use bevy_nds::prelude::*;
 use bevy_nds_3d::prelude::*;
-use bevy_nds_loop::{densify, enclosed, find_closed_loop_within, smooth as path_smooth};
+use bevy_nds_loop::{densify, smooth as path_smooth};
 use bevy_nds_math::{Fx32, FxVec2};
 use bevy_nds_scene::{CameraMode, LoadedScene, SceneInstance, ScenePath};
 use bevy_nds_sprite::prelude::*;
 
+mod capture;
 mod control;
 mod player;
 mod transition;
 
-use player::{Height, Locomotion, Motion, PlayerState, Shadow, StickState};
+use player::{Health, Height, Locomotion, Motion, PlayerState, Shadow, StickState};
 use transition::{Transition, Zone};
 
 mod sprites {
@@ -116,7 +120,6 @@ const ENEMY_SPEED: f32 = 0.8;
 /// The enemy pauses at each waypoint (stop-and-go), opening capture windows.
 const ENEMY_PAUSE: u8 = 45; // frames (~0.75 s)
 const CONTACT_DIST: f32 = 0.28;
-const CONTACT_LOSS: f32 = 0.34; // progress lost per body contact
 const CONTACT_COOLDOWN: u8 = 30; // frames between body hits
 /// The enemy lobs a projectile at the avatar while deployed — the real dodge
 /// threat. Roll (i-frames) or move out of the way.
@@ -124,12 +127,7 @@ const PROJ_SPEED: f32 = 1.7;
 const PROJ_SCALE: f32 = 0.07;
 const FIRE_INTERVAL: u8 = 80; // frames between shots
 const PROJ_HIT_DIST: f32 = 0.18;
-const PROJ_LOSS: f32 = 0.34; // progress lost per projectile hit
 const PROJ_DESPAWN: f32 = ARENA_HALF + 0.4; // out-of-bounds cutoff
-
-// --- Capture -----------------------------------------------------------------
-
-const CAPTURE_PER_LOOP: f32 = 0.5; // 2 enclosing loops -> captured
 
 // --- Tactical map ------------------------------------------------------------
 
@@ -150,10 +148,14 @@ const DOT_POOL: usize = 90;
 const TRAIL_STEP: f32 = 4.0;
 const CLOSE_TOL: f32 = 2.0;
 
-/// World XY → tactical-map screen pixels (y flipped: world +y is up).
+/// World XY → tactical-map screen pixels. The map matches the top screen's
+/// orientation 1:1 for the fixed capture framing (camera at +Z looking −Z):
+/// depth **+Z reads *down* the map** (near the camera), −Z up (into the
+/// distance) — same as the 3D view — so a dodge/draw direction never needs
+/// mental rotation between screens. `+X` is right on both.
 fn world_to_map(p: FxVec2) -> (i16, i16) {
     let x = MAP_CX + p.x.to_f32() * MAP_SCALE;
-    let y = MAP_CY - p.y.to_f32() * MAP_SCALE;
+    let y = MAP_CY + p.y.to_f32() * MAP_SCALE;
     (x as i16, y as i16)
 }
 
@@ -177,7 +179,7 @@ fn flat_quad_xz(half_w: f32, half_d: f32, color: [u8; 3]) -> DsMesh {
 /// Tactical-map screen pixels → world ground position (inverse of
 /// [`world_to_map`]), placed on the XZ ground plane (`y = 0`).
 fn map_to_world(sx: f32, sy: f32) -> Vec3 {
-    Vec3::new((sx - MAP_CX) / MAP_SCALE, 0.0, (MAP_CY - sy) / MAP_SCALE)
+    Vec3::new((sx - MAP_CX) / MAP_SCALE, 0.0, (sy - MAP_CY) / MAP_SCALE)
 }
 
 /// Marker for a space's ground plane. Tagged so it's swapped with its space — a
@@ -210,7 +212,6 @@ fn spawn_zone_floor(commands: &mut Commands, bounds: [f32; 4], offset: (f32, f32
         },
     ));
 }
-
 
 /// Spawn the **resident neighbour** zones' geometry (#27 seamless streaming):
 /// render-only, fogged entities placed at each neighbour's offset in the active
@@ -260,12 +261,11 @@ fn spawn_neighbour(commands: &mut Commands, scene: &bevy_nds_scene::SceneData, o
 
 // --- Resources ---------------------------------------------------------------
 
-/// The capture device: accrues capture progress while deployed; brief cooldown
-/// after a hit so contact doesn't drain every frame. Deploy state itself lives
-/// in [`PlayerState`] (the controller's state machine), not here.
+/// The capture device: a brief cooldown after a hit so contact doesn't drain
+/// progress every frame. Capture progress is now **per enemy**
+/// ([`capture::Capture`], #26), not here; deploy state lives in [`PlayerState`].
 #[derive(Resource, Default)]
 struct Device {
-    progress: f32,
     hit_cd: u8,
 }
 
@@ -339,13 +339,13 @@ struct Landmark;
 #[derive(Resource, Default)]
 struct Landmarks(alloc::vec::Vec<FxVec2>);
 
-/// The enemy: patrol waypoint index + whether it's been captured (hidden, inert,
-/// until START re-arms it). Captured state lives here, not on the device, so the
-/// player can still stow / move / re-deploy after a capture.
+/// The enemy's patrol AI: current waypoint index + dwell timer. Capture state
+/// (progress / resolution) is a **separate** [`capture::Capture`] component on
+/// the same entity (#26), so it persists across stow/deploy and scales to the
+/// shape matrix — the enemy identity and the capture model stay decoupled.
 #[derive(Component)]
 struct Enemy {
     wp: usize,
-    captured: bool,
     pause: u8,
 }
 
@@ -370,6 +370,10 @@ struct PathDot;
 
 #[derive(Component)]
 struct InfoHud;
+
+/// The capture-tally line (liberated / destroyed counts) under the status line.
+#[derive(Component)]
+struct TallyHud;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn main() -> core::ffi::c_int {
@@ -401,31 +405,44 @@ impl Plugin for SpikePlugin {
         .init_resource::<Landmarks>()
         .init_resource::<Transition>()
         .init_resource::<Zone>()
+        .init_resource::<capture::CaptureTally>()
+        .init_resource::<Health>()
+        .add_event::<capture::CaptureResolved>()
         .add_systems(Startup, setup)
         .add_systems(
             Update,
             (
-                // Specialise freshly spawned scene instances, then run the
-                // (instant) space transition before gameplay reads the avatar.
-                specialize_scene,
-                transition::transition_spaces,
-                player::transition_state,
-                player::toggle_tuning,
-                reset_enemy,
-                player::move_player,
-                player::sync_shadow,
-                orbit_camera,
-                drive_camera,
-                patrol_enemy,
-                fire_projectile,
-                move_projectile,
-                draw_capture,
-                enemy_contact,
-                sync_3d,
-                update_cursor,
-                sync_map_markers,
-                update_trail,
-                update_hud,
+                // Sim + gameplay: specialise freshly spawned scene instances,
+                // run the (instant) space transition before gameplay reads the
+                // avatar, then controller, cameras, enemies, and capture.
+                (
+                    specialize_scene,
+                    transition::transition_spaces,
+                    player::transition_state,
+                    player::toggle_tuning,
+                    reset_enemy,
+                    player::move_player,
+                    player::sync_shadow,
+                    orbit_camera,
+                    drive_camera,
+                    patrol_enemy,
+                    fire_projectile,
+                    move_projectile,
+                    capture::draw_capture,
+                    capture::dash_destroy,
+                    capture::enemy_contact,
+                    capture::tally_captures,
+                )
+                    .chain(),
+                // Rendering: mirror world state onto the two screens.
+                (
+                    sync_3d,
+                    update_cursor,
+                    sync_map_markers,
+                    update_trail,
+                    update_hud,
+                )
+                    .chain(),
             )
                 .chain(),
         );
@@ -525,8 +542,17 @@ fn setup(mut commands: Commands, mut camera: ResMut<Camera3d>, mut zone: ResMut<
 
     let b = DsScreen::Bottom;
     commands.spawn((b, TilePos::new(1, 0), InfoHud, DsText::new("")));
-    commands.spawn((b, TilePos::new(1, 22), DsText::new("L deploy   stylus move/draw")));
-    commands.spawn((b, TilePos::new(1, 23), DsText::new("up=topdown  START reset")));
+    commands.spawn((b, TilePos::new(1, 1), TallyHud, DsText::new("")));
+    commands.spawn((
+        b,
+        TilePos::new(1, 22),
+        DsText::new("L deploy   stylus move/draw"),
+    ));
+    commands.spawn((
+        b,
+        TilePos::new(1, 23),
+        DsText::new("up=topdown  START reset"),
+    ));
 }
 
 /// The game-specific half of the scene pipeline: turn freshly loaded, opaque
@@ -550,24 +576,19 @@ fn specialize_scene(
                 // its `SceneInstance` and gains `Persistent` so no crossing ever
                 // despawns it (later zone spawns strip their avatar instance, so
                 // this arm fires exactly once).
-                commands
-                    .entity(e)
-                    .remove::<SceneInstance>()
-                    .insert((
-                        Avatar,
-                        Persistent,
-                        pos,
-                        Height::default(),
-                        Sprite::new(sprites::PLAYER).at(0, PARK_Y),
-                    ));
+                commands.entity(e).remove::<SceneInstance>().insert((
+                    Avatar,
+                    Persistent,
+                    pos,
+                    Height::default(),
+                    Sprite::new(sprites::PLAYER).at(0, PARK_Y),
+                ));
             }
             "enemy" => {
                 commands.entity(e).insert((
-                    Enemy {
-                        wp: 1,
-                        captured: false,
-                        pause: 0,
-                    },
+                    Enemy { wp: 1, pause: 0 },
+                    capture::Capture::default(),
+                    capture::VulnerabilityShape::circle(),
                     pos,
                     Sprite::new(sprites::BLIP).at(0, PARK_Y),
                 ));
@@ -588,41 +609,53 @@ fn specialize_scene(
 
 // --- Enemy reset -------------------------------------------------------------
 
-/// START re-arms the enemy (un-capture, back to its patrol start) and resets
-/// capture progress, so the loop is replayable.
+/// START re-arms every enemy (clear resolution + progress, back to its patrol
+/// start), so the capture loop is replayable.
 fn reset_enemy(
     input: Res<ButtonInput<DsButton>>,
-    mut device: ResMut<Device>,
-    mut q: Query<(&mut Enemy, &mut WorldPos, &ScenePath)>,
+    mut tally: ResMut<capture::CaptureTally>,
+    mut health: ResMut<Health>,
+    mut q: Query<(&mut Enemy, &mut capture::Capture, &mut WorldPos, &ScenePath)>,
 ) {
     if !input.just_pressed(DsButton::Start) {
         return;
     }
-    for (mut enemy, mut pos, path) in &mut q {
-        enemy.captured = false;
+    *tally = capture::CaptureTally::default();
+    *health = Health::default();
+    for (mut enemy, mut cap, mut pos, path) in &mut q {
+        cap.progress = 0.0;
+        cap.resolved = None;
         enemy.wp = 1;
         enemy.pause = 0;
         if let Some(start) = path.0.first() {
             pos.0 = FxVec2::from_f32(start.x, start.y);
         }
     }
-    device.progress = 0.0;
 }
 
 /// The enemy lobs a projectile at the avatar while deployed (the dodge threat),
-/// reusing the pooled [`Projectile`] when it's free.
+/// reusing the pooled [`Projectile`] when it's free. Deploying resets the fire
+/// cadence to a full interval so the enemy can't fire the instant you pull the
+/// stylus — you get a beat to orient (#26 feel pass).
 fn fire_projectile(
     state: Res<PlayerState>,
     mut fire: ResMut<EnemyFire>,
+    mut was_deployed: Local<bool>,
     avatar: Query<&WorldPos, With<Avatar>>,
-    enemy: Query<(&WorldPos, &Enemy)>,
+    enemy: Query<(&WorldPos, &capture::Capture), With<Enemy>>,
     mut proj: Query<(&mut Projectile, &mut WorldPos), (Without<Avatar>, Without<Enemy>)>,
 ) {
     fire.cd = fire.cd.saturating_sub(1);
-    let (Some(a), Some((e, en))) = (avatar.iter().next(), enemy.iter().next()) else {
+    // Rising edge of deploy → grant the orient grace.
+    let deployed = state.is_deployed();
+    if deployed && !*was_deployed {
+        fire.cd = FIRE_INTERVAL;
+    }
+    *was_deployed = deployed;
+    let (Some(a), Some((e, cap))) = (avatar.iter().next(), enemy.iter().next()) else {
         return;
     };
-    if !state.is_deployed() || en.captured || fire.cd > 0 {
+    if !deployed || cap.is_resolved() || fire.cd > 0 {
         return;
     }
     let Some((mut p, mut ppos)) = proj.iter_mut().next() else {
@@ -641,14 +674,14 @@ fn fire_projectile(
     fire.cd = FIRE_INTERVAL;
 }
 
-/// Fly active projectiles; a hit costs progress (unless mid-roll i-frames);
+/// Fly active projectiles; a hit costs a hit point (unless mid-roll i-frames);
 /// out-of-bounds despawns. Inactive ones are Hidden (free).
 fn move_projectile(
     time: Res<Time>,
     motion: Res<Motion>,
     mut state: ResMut<PlayerState>,
-    mut device: ResMut<Device>,
     mut stroke: ResMut<Stroke>,
+    mut health: ResMut<Health>,
     mut commands: Commands,
     avatar: Query<&WorldPos, With<Avatar>>,
     mut proj: Query<(Entity, &mut Projectile, &mut WorldPos, Has<Hidden>), Without<Avatar>>,
@@ -675,19 +708,23 @@ fn move_projectile(
             && !motion.invulnerable()
             && (pos.0 - a).length() < Fx32::from_f32(PROJ_HIT_DIST)
         {
-            device.progress = (device.progress - PROJ_LOSS).max(0.0);
+            // A projectile hit chips health; capture progress is kept, and you
+            // stay deployed unless it downs you (#26 feel pass).
             p.active = false;
-            knock_device_offline(&mut state, &mut stroke);
+            capture::damage(&mut health, &mut state, &mut stroke);
         }
     }
 }
 
 /// Enemy walks its authored patrol loop (the `ScenePath` from the space; frozen
 /// once captured).
-fn patrol_enemy(time: Res<Time>, mut q: Query<(&mut Enemy, &mut WorldPos, &ScenePath)>) {
+fn patrol_enemy(
+    time: Res<Time>,
+    mut q: Query<(&mut Enemy, &capture::Capture, &mut WorldPos, &ScenePath)>,
+) {
     let step = Fx32::from_f32(ENEMY_SPEED * time.delta_secs());
-    for (mut enemy, mut pos, path) in &mut q {
-        if enemy.captured || path.0.is_empty() {
+    for (mut enemy, cap, mut pos, path) in &mut q {
+        if cap.is_resolved() || path.0.is_empty() {
             continue;
         }
         if enemy.pause > 0 {
@@ -708,89 +745,8 @@ fn patrol_enemy(time: Res<Time>, mut q: Query<(&mut Enemy, &mut WorldPos, &Scene
 }
 
 // --- Capture -----------------------------------------------------------------
-
-/// While deployed, capture the stylus path and, on closure, test whether it
-/// encloses the (live) enemy's map position; each enclosing loop accrues
-/// progress, and two captures it.
-fn draw_capture(
-    touches: Res<Touches>,
-    state: Res<PlayerState>,
-    mut device: ResMut<Device>,
-    mut stroke: ResMut<Stroke>,
-    mut enemy: Query<(&WorldPos, &mut Enemy)>,
-) {
-    let Some((epos, mut enemy)) = enemy.iter_mut().next() else {
-        return;
-    };
-    if !state.is_deployed() || enemy.captured {
-        stroke.0.clear();
-        return;
-    }
-    let Some(touch) = touches.iter().next() else {
-        stroke.0.clear();
-        return;
-    };
-
-    let p = touch.position();
-    let cur = FxVec2::from_f32(p.x, p.y);
-    let push = stroke
-        .0
-        .last()
-        .is_none_or(|&last| (cur - last).length() >= Fx32::from_f32(MIN_SPACING));
-    if push {
-        stroke.0.push(cur);
-        if stroke.0.len() > MAX_POINTS {
-            stroke.0.remove(0);
-        }
-    }
-    if stroke.0.len() < 4 {
-        return;
-    }
-
-    let path = path_smooth(&stroke.0);
-    let Some(poly) = find_closed_loop_within(&path, Fx32::from_f32(CLOSE_TOL)) else {
-        return;
-    };
-
-    let (ex, ey) = world_to_map(epos.0);
-    let enemy_px = [FxVec2::from_f32(ex as f32, ey as f32)];
-    if !enclosed(&poly, &enemy_px).is_empty() {
-        device.progress += CAPTURE_PER_LOOP;
-        if device.progress >= 1.0 {
-            // Stay deployed (don't silently stow) so the pen/cursor keeps
-            // working; the enemy just vanishes. START re-arms.
-            enemy.captured = true;
-        }
-    }
-    stroke.0.clear();
-}
-
-/// Enemy contact while deployed **knocks the capture device offline** — a forced
-/// retract (back to Stowed) plus progress loss — unless you're mid-roll
-/// (i-frames). The core pressure of capture-while-dodging.
-fn enemy_contact(
-    motion: Res<Motion>,
-    mut state: ResMut<PlayerState>,
-    mut device: ResMut<Device>,
-    mut stroke: ResMut<Stroke>,
-    avatar: Query<&WorldPos, With<Avatar>>,
-    enemy: Query<(&WorldPos, &Enemy)>,
-) {
-    if device.hit_cd > 0 {
-        device.hit_cd -= 1;
-    }
-    let (Some(a), Some((e, enemy))) = (avatar.iter().next(), enemy.iter().next()) else {
-        return;
-    };
-    if !state.is_deployed() || enemy.captured || motion.invulnerable() || device.hit_cd > 0 {
-        return;
-    }
-    if (a.0 - e.0).length() < Fx32::from_f32(CONTACT_DIST) {
-        device.progress = (device.progress - CONTACT_LOSS).max(0.0);
-        device.hit_cd = CONTACT_COOLDOWN;
-        knock_device_offline(&mut state, &mut stroke);
-    }
-}
+// The capture model itself (loop → progress → liberate, the dash-destroy exit,
+// and enemy-contact knockout) lives in `capture` (#26).
 
 /// The forced retract a hit causes: drop to Stowed and abandon the in-flight
 /// stroke. Shared by body contact and projectile hits.
@@ -876,13 +832,20 @@ fn drive_camera(
     avatar: Query<&WorldPos, With<Avatar>>,
 ) {
     // Player top-down override (only while stowed — deploying locks the frame).
-    if !state.is_deployed()
-        && control::just_pressed(control::Action::CamTopDown, *handed, &input)
-    {
+    if !state.is_deployed() && control::just_pressed(control::Action::CamTopDown, *handed, &input) {
         topdown.0 = !topdown.0;
     }
-    // CaptureFraming: hold the camera still while the device is deployed.
+    // While deployed, drive the canonical **CaptureFraming** (fixed at the world
+    // origin, yaw 0) regardless of the stowed framing (#26). The tactical map
+    // plots absolute world positions centred on the origin, so this fixed,
+    // origin-centred, yaw-0 view is exactly 1:1 with it — draw/dodge directions
+    // read the same on both screens, even if you orbit-set a yaw before
+    // deploying. Ease position + pitch so pulling the pen reframes smoothly.
     if state.is_deployed() {
+        let (target, pitch, yaw) = frame_for(CameraMode::CaptureFraming, 0.0, 0.0, 0.0);
+        camera.position = camera.position.lerp(target, CAM_SMOOTH);
+        camera.pitch += (pitch - camera.pitch) * CAM_TURN_SMOOTH;
+        camera.yaw = yaw;
         return;
     }
     let Some(a) = avatar.iter().next() else {
@@ -1058,13 +1021,13 @@ fn sync_3d(
         Entity,
         &WorldPos,
         &mut Transform3d,
-        Option<&Enemy>,
+        Option<&capture::Capture>,
         Option<&Height>,
         Has<Shadow>,
         Has<Hidden>,
     )>,
 ) {
-    for (e, pos, mut t, enemy, height, is_shadow, hidden) in &mut q {
+    for (e, pos, mut t, cap, height, is_shadow, hidden) in &mut q {
         // Y-up world: the 2D ground `WorldPos(x, y)` lands on the XZ plane. The
         // shadow rides the floor (`GROUND_Y`); other objects render centred at
         // Y=0 (mesh-centred, so they rest on the floor); the avatar lifts on +Y.
@@ -1075,8 +1038,8 @@ fn sync_3d(
             height.map_or(0.0, |h| h.z.to_f32())
         };
         t.translation.z = pos.0.y.to_f32();
-        if let Some(en) = enemy {
-            match (en.captured, hidden) {
+        if let Some(cap) = cap {
+            match (cap.is_resolved(), hidden) {
                 (true, false) => {
                     commands.entity(e).insert(Hidden);
                 }
@@ -1116,10 +1079,10 @@ fn update_cursor(
 /// parked while stowed.
 fn sync_map_markers(
     state: Res<PlayerState>,
-    mut q: Query<(&WorldPos, &mut Sprite, Option<&Enemy>)>,
+    mut q: Query<(&WorldPos, &mut Sprite, Option<&capture::Capture>)>,
 ) {
-    for (pos, mut sprite, enemy) in &mut q {
-        let hide = !state.is_deployed() || enemy.is_some_and(|e| e.captured);
+    for (pos, mut sprite, cap) in &mut q {
+        let hide = !state.is_deployed() || cap.is_some_and(|c| c.is_resolved());
         if hide {
             sprite.y = PARK_Y;
         } else {
@@ -1137,7 +1100,11 @@ fn update_trail(
     mut dots: Query<&mut Sprite, With<PathDot>>,
 ) {
     let line = if state.is_deployed() {
-        densify(&path_smooth(&stroke.0), Fx32::from_f32(TRAIL_STEP), DOT_POOL)
+        densify(
+            &path_smooth(&stroke.0),
+            Fx32::from_f32(TRAIL_STEP),
+            DOT_POOL,
+        )
     } else {
         Vec::new()
     };
@@ -1153,23 +1120,49 @@ fn update_trail(
 
 fn update_hud(
     pstate: Res<PlayerState>,
-    device: Res<Device>,
-    enemy: Query<&Enemy>,
-    mut hud: Query<&mut DsText, With<InfoHud>>,
+    health: Res<Health>,
+    tally: Res<capture::CaptureTally>,
+    caps: Query<&capture::Capture>,
+    mut hud: Query<(&mut DsText, Has<InfoHud>), Or<(With<InfoHud>, With<TallyHud>)>>,
 ) {
-    let captured = enemy.iter().next().is_some_and(|e| e.captured);
-    for mut text in &mut hud {
+    use capture::CaptureOutcome;
+    let cap = caps.iter().next();
+    for (mut text, is_status) in &mut hud {
         text.0.clear();
-        if captured {
-            let _ = write!(text.0, "CAPTURED!  START to re-arm");
-        } else {
-            let pct = (device.progress * 100.0) as i32;
-            let label = if pstate.is_deployed() {
-                "DEPLOYED"
-            } else {
-                "stowed "
-            };
-            let _ = write!(text.0, "{label}  capture {pct:>3}%");
+        if !is_status {
+            // The tally line: health + how the two exits have played out (#32).
+            let _ = write!(
+                text.0,
+                "hp {}/{}  lib {}  des {}",
+                health.hp, health.max, tally.liberated, tally.destroyed
+            );
+            continue;
+        }
+        if health.is_downed() {
+            let _ = write!(text.0, "DOWNED     START to reset");
+            continue;
+        }
+        match cap.and_then(|c| c.resolved) {
+            Some(CaptureOutcome::Liberated) => {
+                let _ = write!(text.0, "LIBERATED!  START to re-arm");
+            }
+            Some(CaptureOutcome::Destroyed) => {
+                let _ = write!(text.0, "DESTROYED.  START to re-arm");
+            }
+            None => {
+                let pct = (cap.map_or(0.0, |c| c.progress) * 100.0) as i32;
+                if cap.is_some_and(|c| c.is_breakable()) {
+                    // Past the threshold: advertise the expedient dash exit.
+                    let _ = write!(text.0, "BREAKABLE {pct:>3}%  dash=destroy");
+                } else {
+                    let label = if pstate.is_deployed() {
+                        "DEPLOYED"
+                    } else {
+                        "stowed "
+                    };
+                    let _ = write!(text.0, "{label}  capture {pct:>3}%");
+                }
+            }
         }
     }
 }

@@ -205,6 +205,47 @@ pub fn enclosed(poly: &[FxVec2], points: &[FxVec2]) -> Vec<usize> {
         .collect()
 }
 
+/// Shortest distance from point `p` to segment `a→b`. Projects `p` onto the
+/// segment, clamping the parameter to `[0, 1]` so it measures to the nearer
+/// endpoint when the foot of the perpendicular falls outside the span.
+/// Degenerate (`a == b`) segments reduce to the distance to `a`.
+fn dist_point_segment(p: FxVec2, a: FxVec2, b: FxVec2) -> Fx32 {
+    let ab = b - a;
+    let denom = ab.dot(ab);
+    if denom == Fx32::ZERO {
+        return (p - a).length();
+    }
+    let mut t = (p - a).dot(ab) / denom;
+    if t < Fx32::ZERO {
+        t = Fx32::ZERO;
+    } else if t > Fx32::ONE {
+        t = Fx32::ONE;
+    }
+    (p - (a + ab * t)).length()
+}
+
+/// Is the circle of radius `radius` centred at `center` *fully* inside `poly`?
+///
+/// The circle-vulnerable capture test (#26): a loop only captures an enemy when
+/// it encloses the enemy's whole footprint, not merely its centre. True iff the
+/// centre is inside **and** no polygon edge comes within `radius` of it (so the
+/// circle can't poke through a side). `radius <= 0` degrades to a plain
+/// point-in-polygon test.
+pub fn encloses_circle(poly: &[FxVec2], center: FxVec2, radius: Fx32) -> bool {
+    if !point_in_polygon(poly, center) {
+        return false;
+    }
+    let n = poly.len();
+    let mut j = n - 1;
+    for i in 0..n {
+        if dist_point_segment(center, poly[j], poly[i]) < radius {
+            return false;
+        }
+        j = i;
+    }
+    true
+}
+
 /// 3-point moving-average smoothing of a path, endpoints preserved. Tames the
 /// jitter of raw ~60 Hz touch samples before closure/enclosure tests.
 pub fn smooth(path: &[FxVec2]) -> Vec<FxVec2> {
@@ -372,7 +413,10 @@ impl Plugin for LoopPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<StrokePath>()
             .add_event::<StrokeCompleted>()
-            .add_systems(PreUpdate, accumulate_stroke.after(touch_screen_input_system));
+            .add_systems(
+                PreUpdate,
+                accumulate_stroke.after(touch_screen_input_system),
+            );
     }
 }
 
@@ -392,7 +436,11 @@ mod tests {
     fn segments_cross_at_expected_point() {
         // A "+" : horizontal vs vertical through (5, 5).
         let x = segment_intersection(v(0.0, 5.0), v(10.0, 5.0), v(5.0, 0.0), v(5.0, 10.0)).unwrap();
-        assert!(approx(x.x, 5.0) && approx(x.y, 5.0), "{:?}", (x.x.to_f32(), x.y.to_f32()));
+        assert!(
+            approx(x.x, 5.0) && approx(x.y, 5.0),
+            "{:?}",
+            (x.x.to_f32(), x.y.to_f32())
+        );
     }
 
     #[test]
@@ -558,7 +606,45 @@ mod tests {
         // Circle ≈ 1 (polygon approximation slightly under), square ≈ 0.785.
         assert!(rc > 0.95 && rc <= 1.05, "circle reg = {rc}");
         assert!((rs - 0.785).abs() < 0.02, "square reg = {rs}");
-        assert!(rl < rs, "sliver {rl} should be less regular than square {rs}");
+        assert!(
+            rl < rs,
+            "sliver {rl} should be less regular than square {rs}"
+        );
         assert_eq!(regularity(&[v(0.0, 0.0), v(1.0, 1.0)]), Fx32::ZERO);
+    }
+
+    #[test]
+    fn dist_point_segment_cases() {
+        let a = v(0.0, 0.0);
+        let b = v(10.0, 0.0);
+        // Perpendicular foot inside the span.
+        assert!(approx(dist_point_segment(v(5.0, 4.0), a, b), 4.0));
+        // On the segment.
+        assert!(approx(dist_point_segment(v(3.0, 0.0), a, b), 0.0));
+        // Past the end → distance to the nearer endpoint (5-12-13 triangle).
+        assert!(approx(dist_point_segment(v(13.0, 4.0), a, b), 5.0));
+        // Degenerate segment → distance to the point.
+        assert!(approx(dist_point_segment(v(3.0, 4.0), a, a), 5.0));
+    }
+
+    #[test]
+    fn circle_fully_inside_square() {
+        let sq = [v(0.0, 0.0), v(20.0, 0.0), v(20.0, 20.0), v(0.0, 20.0)];
+        // Centre + small radius clears every edge.
+        assert!(encloses_circle(&sq, v(10.0, 10.0), Fx32::from_f32(5.0)));
+        // Same centre, radius reaches the wall → pokes out.
+        assert!(!encloses_circle(&sq, v(10.0, 10.0), Fx32::from_f32(11.0)));
+        // Centre near a corner: fits as a point but the circle crosses the side.
+        assert!(encloses_circle(&sq, v(3.0, 3.0), Fx32::from_f32(2.0)));
+        assert!(!encloses_circle(&sq, v(3.0, 3.0), Fx32::from_f32(4.0)));
+        // Centre outside is never enclosed.
+        assert!(!encloses_circle(&sq, v(25.0, 10.0), Fx32::from_f32(1.0)));
+    }
+
+    #[test]
+    fn circle_zero_radius_is_point_test() {
+        let sq = [v(0.0, 0.0), v(10.0, 0.0), v(10.0, 10.0), v(0.0, 10.0)];
+        assert!(encloses_circle(&sq, v(5.0, 5.0), Fx32::ZERO));
+        assert!(!encloses_circle(&sq, v(15.0, 5.0), Fx32::ZERO));
     }
 }
