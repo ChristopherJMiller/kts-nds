@@ -31,8 +31,9 @@ use serde::{Deserialize, Serialize};
 pub const ASSET_MAGIC: u32 = u32::from_le_bytes(*b"BSC1");
 /// `.scene` format version. Matches `bevy_nds_scene::asset::VERSION`. v2 replaced
 /// hand-authored `exits` with a zone `bounds` + baker-**derived** `connections`
-/// (the Euclidean map rework, #27).
-pub const VERSION: u16 = 2;
+/// (the Euclidean map rework, #27). v3 added the zone `clear_flag` (the generalized
+/// gating model, #27) — a `u32` after `bounds`.
+pub const VERSION: u16 = 3;
 /// Extension of a baked space.
 pub const ASSET_EXT: &str = "scene";
 /// NitroFS subdirectory holding baked levels (mirrors the source `levels/`).
@@ -65,9 +66,34 @@ pub struct Space {
     /// clamp and the boundary derivation. Defaults to a ±2 arena pad.
     #[serde(default)]
     pub bounds: Bounds,
+    /// Nonzero ⇒ this zone is a **gating arena**: clearing its objective enemies
+    /// raises this flag (the runtime's `Flags`, #27). `0` ⇒ a **freeform** zone
+    /// that gates nothing. Baked into the `.scene` blob (v3).
+    #[serde(default)]
+    pub clear_flag: u32,
+    /// Directed gates on this zone's derived connections: a connection leaving
+    /// toward the named neighbour requires the given flag (#27). Consumed by
+    /// [`derive_connections`] into each [`Connection::gate`] — **not** baked as a
+    /// separate field (the `gate` already rides the connection).
+    #[serde(default)]
+    pub gates: Vec<Gate>,
     /// Placed objects (geometry + role), in local coordinates.
     #[serde(default)]
     pub instances: Vec<Instance>,
+}
+
+/// A directed gate on a derived connection (#27): crossing this zone's boundary
+/// **toward** `neighbour` requires `flag` to be raised at runtime. Authored on
+/// the source zone (manifest [`ZoneEntry`]); [`derive_connections`] copies `flag`
+/// onto the matching [`Connection::gate`]. A neighbour with no gate entry is
+/// always open (`gate == 0`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Gate {
+    /// Stem of the neighbour zone the gated connection leads to.
+    pub neighbour: String,
+    /// Flag id that must be raised to cross (matches the arena's `clear_flag`,
+    /// or a future switch/key/score source).
+    pub flag: u32,
 }
 
 /// A rectangle on the ground (XZ) plane, in a zone's **local** coordinates.
@@ -161,9 +187,11 @@ pub struct Level {
 }
 
 /// One zone's entry in a [`Level`] manifest: where it sits in the shared global
-/// frame (`place`), its local walkable rect (`bounds`), and its camera framing.
-/// The instances themselves live in the matching `<stem>.ron` ([`Zone`]).
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+/// frame (`place`), its local walkable rect (`bounds`), its camera framing, and
+/// its gating (`clear_flag` + `gates`, #27). The instances themselves live in the
+/// matching `<stem>.ron` ([`Zone`]). No longer `Copy` — `gates: Vec<Gate>` — but
+/// `PartialEq` so the editor can diff it for undo (#43).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ZoneEntry {
     #[serde(default)]
     pub place: [f32; 2],
@@ -171,6 +199,12 @@ pub struct ZoneEntry {
     pub bounds: Bounds,
     #[serde(default)]
     pub camera: Camera,
+    /// Nonzero ⇒ gating arena raising this flag on clear; `0` ⇒ freeform (#27).
+    #[serde(default)]
+    pub clear_flag: u32,
+    /// Directed gates on this zone's exits (#27). See [`Gate`].
+    #[serde(default)]
+    pub gates: Vec<Gate>,
 }
 
 /// A zone **content** file (`<zone>.ron`) — just the placed objects, as a single
@@ -322,6 +356,13 @@ pub fn derive_connections(
             let (bxmin, bxmax) = (b.place[0] + b.bounds.min[0], b.place[0] + b.bounds.max[0]);
             let (bzmin, bzmax) = (b.place[1] + b.bounds.min[1], b.place[1] + b.bounds.max[1]);
             let delta = [a.place[0] - b.place[0], a.place[1] - b.place[1]];
+            // A gate authored on A toward this neighbour locks the crossing until
+            // its `flag` is raised (#27); absent ⇒ always open (`gate == 0`).
+            let gate = a
+                .gates
+                .iter()
+                .find(|g| &g.neighbour == bn)
+                .map_or(0, |g| g.flag);
             // East/west edges share a vertical (Z) seam; north/south share a
             // horizontal (X) seam. `lo`/`hi` are the overlap along the seam,
             // expressed back in A's local coordinates.
@@ -333,7 +374,7 @@ pub fn derive_connections(
                         lo: lo_g - axis_origin,
                         hi: hi_g - axis_origin,
                         delta,
-                        gate: 0,
+                        gate,
                     });
                 }
             };
@@ -481,6 +522,8 @@ pub fn assemble(
                 camera: entry.camera,
                 place: entry.place,
                 bounds: entry.bounds,
+                clear_flag: entry.clear_flag,
+                gates: entry.gates.clone(),
                 instances,
             },
         ));
@@ -624,6 +667,10 @@ pub fn encode(space: &Space, conns: &[Connection]) -> Vec<u8> {
     w.f32(space.bounds.min[1]);
     w.f32(space.bounds.max[0]);
     w.f32(space.bounds.max[1]);
+    // Zone clear-flag (v3): the flag this arena raises when its objective enemies
+    // are resolved (0 = freeform). The gate authoring itself is already folded
+    // into each connection's `gate` by `derive_connections`.
+    w.u32(space.clear_flag);
     // Derived connections.
     w.u32(conns.len() as u32);
     for c in conns {
@@ -934,6 +981,8 @@ mod tests {
             camera: Camera::default(),
             place,
             bounds: Bounds { min, max },
+            clear_flag: 0,
+            gates: Vec::new(),
             instances: Vec::new(),
         }
     }
@@ -1068,6 +1117,8 @@ mod tests {
                         camera: e.camera,
                         place: e.place,
                         bounds: e.bounds,
+                        clear_flag: e.clear_flag,
+                        gates: e.gates.clone(),
                         instances: Vec::new(),
                     },
                 )
@@ -1092,6 +1143,26 @@ mod tests {
         assert_eq!(c.len(), 1);
         assert_eq!(c[0].side, SIDE_WEST);
         assert!((c[0].delta[0] - 4.2).abs() < 1e-4, "delta {:?}", c[0].delta);
+    }
+
+    #[test]
+    fn gate_authored_on_source_zone_lands_on_the_derived_connection() {
+        // Two abutting zones; `a` gates its exit toward `b` on flag 7. The
+        // derived a→b connection carries gate 7; the reverse b→a stays open.
+        let mut a = zone([0.0, 0.0], [-1.0, -1.0], [1.0, 1.0]);
+        a.gates = std::vec![Gate {
+            neighbour: "b".to_string(),
+            flag: 7,
+        }];
+        let b = zone([2.0, 0.0], [-1.0, -1.0], [1.0, 1.0]);
+        let conns = derive_connections(&std::vec![("a".to_string(), a), ("b".to_string(), b)]);
+        assert_eq!(conns["a"].len(), 1);
+        assert_eq!(conns["a"][0].neighbour, "b");
+        assert_eq!(
+            conns["a"][0].gate, 7,
+            "authored gate should ride the a→b conn"
+        );
+        assert_eq!(conns["b"][0].gate, 0, "reverse crossing stays open");
     }
 
     #[test]

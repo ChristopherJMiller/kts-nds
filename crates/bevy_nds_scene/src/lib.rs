@@ -35,7 +35,9 @@ use alloc::vec::Vec;
 
 use bevy_app::prelude::*;
 use bevy_ecs::prelude::*;
-use bevy_math::Vec2;
+// Re-exported: it appears in the public `ScenePath` field, so consumers building
+// one (e.g. the game spawning resident-neighbour patrol paths) need the name.
+pub use bevy_math::Vec2;
 use bevy_nds_3d::prelude::{DsMaterial, DsMesh, Transform3d, Vec3};
 
 /// Marker + metadata on every entity spawned from a scene instance. The game

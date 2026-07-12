@@ -443,6 +443,8 @@ impl EditorApp {
                 place: [0.0, 0.0],
                 bounds: scene2bin::Bounds::default(),
                 camera: Camera::default(),
+                clear_flag: 0,
+                gates: Vec::new(),
             },
         );
         self.level = Level {
@@ -606,6 +608,8 @@ impl EditorApp {
                 place: [self.view.center.x, self.view.center.y],
                 bounds: scene2bin::Bounds::default(),
                 camera: Camera::default(),
+                clear_flag: 0,
+                gates: Vec::new(),
             },
         );
         self.contents.insert(
@@ -763,7 +767,7 @@ impl EditorApp {
         let Some(stem) = self.active.clone() else {
             return;
         };
-        let Some(entry) = self.level.zones.get(&stem).copied() else {
+        let Some(entry) = self.level.zones.get(&stem).cloned() else {
             return;
         };
         let content = self.contents.get(&stem).cloned().unwrap_or(Zone {

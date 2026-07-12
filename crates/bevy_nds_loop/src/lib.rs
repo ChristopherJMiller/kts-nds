@@ -320,6 +320,311 @@ pub fn regularity(poly: &[FxVec2]) -> Fx32 {
     area(poly) / p / p * four_pi
 }
 
+// --- Stroke rasterization (the painted line, #35) ----------------------------
+
+/// Round a 20.12 fixed-point coordinate to the nearest integer pixel, staying in
+/// raw fixed-point arithmetic (no soft-float — this is on the per-frame stroke
+/// path). Adds a half (`1 << 11` = 0.5 in 20.12) then arithmetic-shifts down.
+#[inline]
+fn round_i32(x: Fx32) -> i32 {
+    (x.raw() + (1 << 11)) >> 12
+}
+
+/// Rasterize the segment `a → b` into integer pixels, invoking `plot(x, y)` once
+/// per pixel along the line (endpoints included), via integer Bresenham.
+///
+/// The replacement for the OAM dot-trail ([`densify`]): a true 1-px line instead
+/// of a resampled row of square sprites (issue #35). `plot` receives **raw**
+/// pixel coordinates that may fall outside any framebuffer — the caller bounds-
+/// checks before writing VRAM. No allocation and no floating point, so it runs
+/// per frame on the ARM9; the host tests pass a recording closure.
+pub fn rasterize_line(a: FxVec2, b: FxVec2, mut plot: impl FnMut(i32, i32)) {
+    let (x0, y0) = (round_i32(a.x), round_i32(a.y));
+    let (x1, y1) = (round_i32(b.x), round_i32(b.y));
+    let dx = (x1 - x0).abs();
+    let dy = -(y1 - y0).abs();
+    let sx = if x0 < x1 { 1 } else { -1 };
+    let sy = if y0 < y1 { 1 } else { -1 };
+    let mut err = dx + dy;
+    let (mut x, mut y) = (x0, y0);
+    loop {
+        plot(x, y);
+        if x == x1 && y == y1 {
+            break;
+        }
+        let e2 = 2 * err;
+        if e2 >= dy {
+            err += dy;
+            x += sx;
+        }
+        if e2 <= dx {
+            err += dx;
+            y += sy;
+        }
+    }
+}
+
+/// Rasterize a whole polyline by chaining [`rasterize_line`] over consecutive
+/// vertices. Shared joints are plotted by both adjoining segments — harmless for
+/// an idempotent framebuffer write (same colour), so no dedup is done.
+pub fn rasterize_polyline(points: &[FxVec2], mut plot: impl FnMut(i32, i32)) {
+    match points.len() {
+        0 => {}
+        1 => plot(round_i32(points[0].x), round_i32(points[0].y)),
+        _ => {
+            for w in points.windows(2) {
+                rasterize_line(w[0], w[1], &mut plot);
+            }
+        }
+    }
+}
+
+/// Stamp a filled disc of the given pixel `radius` centred at `(cx, cy)`,
+/// plotting each covered pixel. `radius <= 0` plots the single centre pixel.
+/// The brush footprint that gives the painted stroke its width.
+pub fn stamp_disc(cx: i32, cy: i32, radius: i32, mut plot: impl FnMut(i32, i32)) {
+    if radius <= 0 {
+        plot(cx, cy);
+        return;
+    }
+    let r2 = radius * radius;
+    for dy in -radius..=radius {
+        for dx in -radius..=radius {
+            if dx * dx + dy * dy <= r2 {
+                plot(cx + dx, cy + dy);
+            }
+        }
+    }
+}
+
+/// Rasterize a polyline as a brush stroke of the given `radius`: the centre line
+/// via [`rasterize_polyline`], stamping a [`stamp_disc`] at every pixel. `radius
+/// == 0` degrades to a 1-px [`rasterize_polyline`]. Pixels repeat where discs
+/// overlap — fine for a framebuffer paint.
+pub fn rasterize_thick_polyline(points: &[FxVec2], radius: i32, mut plot: impl FnMut(i32, i32)) {
+    if radius <= 0 {
+        rasterize_polyline(points, plot);
+        return;
+    }
+    rasterize_polyline(points, |x, y| stamp_disc(x, y, radius, &mut plot));
+}
+
+// --- Anti-aliased stroke rasterization (#35) ---------------------------------
+//
+// The ½-resolution painted stroke lives in a 128×128 sub-engine bitmap that the
+// hardware upscales 2× (nearest-neighbour) to fill the screen. Aliased pixels
+// would upscale to blocky stairs, so we spend the 16bpp colour depth on
+// **sub-pixel edge coverage** (Wu's algorithm): each edge pixel carries a 0..=255
+// coverage the consumer blends into the line colour. All fixed-point — no
+// soft-float on the per-frame path.
+
+/// Floor a 20.12 coordinate to its integer part (toward −∞; arithmetic shift).
+#[inline]
+fn floor_i32(x: Fx32) -> i32 {
+    x.raw() >> 12
+}
+
+/// The fractional part of a 20.12 coordinate as a 0..=255 coverage byte.
+#[inline]
+fn frac_u8(x: Fx32) -> u8 {
+    // Low 12 bits are the fraction in `0..4096`; scale to `0..=255`.
+    (((x.raw() & 0xFFF) * 255) >> 12) as u8
+}
+
+/// Rasterize segment `a → b` as a 1-px **anti-aliased** line (Xiaolin Wu),
+/// invoking `plot(x, y, coverage)` where `coverage` is `0..=255` — how much of
+/// that pixel the line covers. Each column across the major axis emits the two
+/// straddling pixels with complementary coverage (they sum to 255), so a shallow
+/// line reads as a smooth ramp rather than a staircase; an axis-aligned or exact
+/// 45° line collapses to a single full-coverage pixel per step.
+///
+/// The consumer should combine overlapping writes by **max** coverage (a stroke
+/// crosses itself and joins segments), never additively — additive blend would
+/// over-brighten joints. No allocation, no floating point.
+pub fn rasterize_line_aa(mut a: FxVec2, mut b: FxVec2, mut plot: impl FnMut(i32, i32, u8)) {
+    // Work in a frame whose major axis is X; `steep` remaps the plot back.
+    let steep = (b.y - a.y).raw().abs() > (b.x - a.x).raw().abs();
+    if steep {
+        core::mem::swap(&mut a.x, &mut a.y);
+        core::mem::swap(&mut b.x, &mut b.y);
+    }
+    if a.x > b.x {
+        core::mem::swap(&mut a, &mut b);
+    }
+    let mut emit = |px: i32, py: i32, cov: u8| {
+        if cov == 0 {
+            return;
+        }
+        if steep {
+            plot(py, px, cov);
+        } else {
+            plot(px, py, cov);
+        }
+    };
+    let x0 = round_i32(a.x);
+    let x1 = round_i32(b.x);
+    let dx = b.x - a.x;
+    let gradient = if dx == Fx32::ZERO {
+        Fx32::ZERO
+    } else {
+        (b.y - a.y) / dx
+    };
+    // y at the centre of column x0, stepped by `gradient` each column.
+    let mut intery = a.y + gradient * (Fx32::from_int(x0) - a.x);
+    for x in x0..=x1 {
+        let iy = floor_i32(intery);
+        let frac = frac_u8(intery);
+        emit(x, iy, 255 - frac); // upper pixel
+        emit(x, iy + 1, frac); // lower pixel
+        intery += gradient;
+    }
+}
+
+/// Anti-aliased polyline: [`rasterize_line_aa`] over consecutive vertices. A
+/// single point plots at full coverage. Joints are written by both adjoining
+/// segments — see [`rasterize_line_aa`] on combining by max coverage.
+pub fn rasterize_polyline_aa(points: &[FxVec2], mut plot: impl FnMut(i32, i32, u8)) {
+    match points.len() {
+        0 => {}
+        1 => plot(round_i32(points[0].x), round_i32(points[0].y), 255),
+        _ => {
+            for w in points.windows(2) {
+                rasterize_line_aa(w[0], w[1], &mut plot);
+            }
+        }
+    }
+}
+
+// --- Feathered glow brush (#35) ----------------------------------------------
+//
+// A soft halo around the painted stroke: full brightness in a small core, then a
+// smooth quadratic falloff to zero. Stamped along the stroke's centreline, the
+// feather *is* the anti-aliasing — the hard 1-px edge dissolves into bloom, so
+// the 2× upscale's blockiness reads as glow. Coverage must be combined by **max**
+// (a CPU buffer), never additively, or overlaps and self-crossings over-brighten.
+
+/// Stamp a radially **feathered** brush at `(cx, cy)`: coverage `255` within
+/// `core` px, falling off quadratically to `0` at `radius` px. `plot(x, y,
+/// coverage)` fires once per covered pixel. `radius <= 0` plots the centre only.
+/// No allocation, no floating point, no sqrt (the falloff is on squared
+/// distance, which is a smoother glow than a linear ramp anyway).
+pub fn stamp_feathered(
+    cx: i32,
+    cy: i32,
+    core: i32,
+    radius: i32,
+    mut plot: impl FnMut(i32, i32, u8),
+) {
+    if radius <= 0 {
+        plot(cx, cy, 255);
+        return;
+    }
+    let core = core.clamp(0, radius);
+    let r2 = radius * radius;
+    let c2 = core * core;
+    let span = (r2 - c2).max(1) as i64;
+    for dy in -radius..=radius {
+        for dx in -radius..=radius {
+            let d2 = dx * dx + dy * dy;
+            if d2 > r2 {
+                continue;
+            }
+            let cov = if d2 <= c2 {
+                255
+            } else {
+                // (r2 - d2) / (r2 - c2) · 255, in `0..255` since c2 < d2 <= r2.
+                (((r2 - d2) as i64 * 255) / span) as u8
+            };
+            if cov > 0 {
+                plot(cx + dx, cy + dy, cov);
+            }
+        }
+    }
+}
+
+/// Rasterize a polyline as a **glowing** stroke: walk the 1-px centreline
+/// ([`rasterize_polyline`]) and stamp a [`stamp_feathered`] brush at every pixel,
+/// giving a continuous tube with a bright core and a soft halo. `core`/`radius`
+/// are the brush's flat-core and falloff-edge radii in pixels. The consumer's
+/// `plot` must **max-combine** overlapping coverage.
+///
+/// Generic over `plot`, so it monomorphizes into the *caller's* crate — fine for
+/// host tests, but on the ARM9 hot path prefer [`paint_glow`], which is concrete
+/// (stays in this optimised crate) and uses a coverage LUT instead of a per-pixel
+/// divide.
+pub fn rasterize_glow_polyline(
+    points: &[FxVec2],
+    core: i32,
+    radius: i32,
+    mut plot: impl FnMut(i32, i32, u8),
+) {
+    rasterize_polyline(points, |x, y| {
+        stamp_feathered(x, y, core, radius, &mut plot)
+    });
+}
+
+/// Paint a glowing stroke straight into a `width × height` **coverage buffer**
+/// (row-major, one byte per pixel), max-combining overlaps — the per-frame path
+/// for the #35 painted stroke. Everything hot lives here: a **non-generic**
+/// signature (compiled once in this opt-3 crate, not the caller's), a
+/// squared-distance → coverage **LUT** built once per call (no per-pixel divide),
+/// and in-bounds writes only. Points are in canvas pixels; `core`/`radius` are
+/// the flat-bright and falloff radii. Existing buffer contents are max-combined
+/// (clear it first for a fresh frame).
+pub fn paint_glow(
+    cov: &mut [u8],
+    width: usize,
+    height: usize,
+    points: &[FxVec2],
+    core: i32,
+    radius: i32,
+) {
+    if points.is_empty() || width == 0 || height == 0 {
+        return;
+    }
+    let radius = radius.max(0);
+    let r2 = radius * radius;
+    let core = core.clamp(0, radius);
+    let c2 = core * core;
+    let span = (r2 - c2).max(1) as i64;
+    // Squared-distance → coverage, indexed by `d2` in `0..=r2`. Built once.
+    let mut lut = alloc::vec![0u8; r2 as usize + 1];
+    for (d2, slot) in lut.iter_mut().enumerate() {
+        let d2 = d2 as i32;
+        *slot = if d2 <= c2 {
+            255
+        } else {
+            (((r2 - d2) as i64 * 255) / span) as u8
+        };
+    }
+    let (w, h) = (width as i32, height as i32);
+    let mut stamp = |cx: i32, cy: i32| {
+        for dy in -radius..=radius {
+            let y = cy + dy;
+            if y < 0 || y >= h {
+                continue;
+            }
+            let row = y as usize * width;
+            for dx in -radius..=radius {
+                let d2 = dx * dx + dy * dy;
+                if d2 > r2 {
+                    continue;
+                }
+                let x = cx + dx;
+                if x < 0 || x >= w {
+                    continue;
+                }
+                let c = lut[d2 as usize];
+                let i = row + x as usize;
+                if c > cov[i] {
+                    cov[i] = c; // max-combine
+                }
+            }
+        }
+    };
+    rasterize_polyline(points, stamp);
+}
+
 // --- Touch-stream path buffer (the Bevy layer) -------------------------------
 
 /// The in-progress stylus stroke, in **raw touch-screen pixels** (x `0..=255`,
@@ -646,5 +951,222 @@ mod tests {
         let sq = [v(0.0, 0.0), v(10.0, 0.0), v(10.0, 10.0), v(0.0, 10.0)];
         assert!(encloses_circle(&sq, v(5.0, 5.0), Fx32::ZERO));
         assert!(!encloses_circle(&sq, v(15.0, 5.0), Fx32::ZERO));
+    }
+
+    /// Collect the deduplicated set of pixels a rasterizer plots.
+    fn pixels(
+        f: impl FnOnce(&mut dyn FnMut(i32, i32)),
+    ) -> alloc::collections::BTreeSet<(i32, i32)> {
+        let mut set = alloc::collections::BTreeSet::new();
+        let mut plot = |x: i32, y: i32| {
+            set.insert((x, y));
+        };
+        f(&mut plot);
+        set
+    }
+
+    #[test]
+    fn rasterize_horizontal_and_vertical_lines() {
+        let h = pixels(|p| rasterize_line(v(0.0, 0.0), v(5.0, 0.0), p));
+        assert_eq!(h.len(), 6); // 0..=5
+        assert!(h.iter().all(|&(_, y)| y == 0));
+        assert!(h.contains(&(0, 0)) && h.contains(&(5, 0)));
+
+        let vert = pixels(|p| rasterize_line(v(2.0, 0.0), v(2.0, 4.0), p));
+        assert_eq!(vert.len(), 5);
+        assert!(vert.iter().all(|&(x, _)| x == 2));
+    }
+
+    #[test]
+    fn rasterize_diagonal_line_hits_endpoints() {
+        let d = pixels(|p| rasterize_line(v(0.0, 0.0), v(3.0, 3.0), p));
+        assert_eq!(d.len(), 4);
+        for k in 0..=3 {
+            assert!(d.contains(&(k, k)), "missing ({k},{k})");
+        }
+        // Direction-independent: reversing the segment plots the same pixels.
+        let rev = pixels(|p| rasterize_line(v(3.0, 3.0), v(0.0, 0.0), p));
+        assert_eq!(d, rev);
+    }
+
+    #[test]
+    fn rasterize_rounds_subpixel_endpoints() {
+        // 2.4 → 2, 2.6 → 3 (round-to-nearest in fixed point).
+        let s = pixels(|p| rasterize_line(v(2.4, 0.0), v(2.6, 0.0), p));
+        assert_eq!(s, [(2, 0), (3, 0)].into_iter().collect());
+    }
+
+    #[test]
+    fn rasterize_polyline_covers_every_segment() {
+        // An "L": (0,0)->(4,0)->(4,3).
+        let path = [v(0.0, 0.0), v(4.0, 0.0), v(4.0, 3.0)];
+        let px = pixels(|p| rasterize_polyline(&path, p));
+        assert!(px.contains(&(0, 0)) && px.contains(&(4, 0))); // first leg
+        assert!(px.contains(&(4, 3))); // second leg
+        // The shared corner is present exactly once (deduped set).
+        assert!(px.contains(&(4, 0)));
+        // Single-point and empty paths are safe.
+        assert_eq!(
+            pixels(|p| rasterize_polyline(&[v(7.0, 9.0)], p)),
+            [(7, 9)].into_iter().collect()
+        );
+        assert!(pixels(|p| rasterize_polyline(&[], p)).is_empty());
+    }
+
+    #[test]
+    fn stamp_disc_footprints() {
+        assert_eq!(
+            pixels(|p| stamp_disc(5, 5, 0, p)),
+            [(5, 5)].into_iter().collect()
+        );
+        // radius 1 → a plus of 5 pixels.
+        assert_eq!(pixels(|p| stamp_disc(0, 0, 1, p)).len(), 5);
+        // radius 2 → 13 pixels (the discretized disc).
+        assert_eq!(pixels(|p| stamp_disc(0, 0, 2, p)).len(), 13);
+    }
+
+    #[test]
+    fn thick_polyline_widens_the_stroke() {
+        let path = [v(0.0, 5.0), v(6.0, 5.0)];
+        let thin = pixels(|p| rasterize_thick_polyline(&path, 0, p));
+        let thick = pixels(|p| rasterize_thick_polyline(&path, 1, p));
+        // radius 0 matches the 1-px polyline.
+        assert_eq!(thin, pixels(|p| rasterize_polyline(&path, p)));
+        // A radius-1 brush paints the rows above and below the centre line.
+        assert!(thick.contains(&(3, 4)) && thick.contains(&(3, 5)) && thick.contains(&(3, 6)));
+        assert!(thick.len() > thin.len());
+    }
+
+    /// Collect every (x, y, coverage) an AA rasterizer plots.
+    fn aa_pixels(f: impl FnOnce(&mut dyn FnMut(i32, i32, u8))) -> alloc::vec::Vec<(i32, i32, u8)> {
+        let mut out = alloc::vec::Vec::new();
+        let mut plot = |x: i32, y: i32, c: u8| out.push((x, y, c));
+        f(&mut plot);
+        out
+    }
+
+    #[test]
+    fn aa_axis_aligned_line_is_crisp() {
+        // A horizontal line sits exactly on a row: full coverage, no bleed.
+        let px = aa_pixels(|p| rasterize_line_aa(v(0.0, 3.0), v(5.0, 3.0), p));
+        assert_eq!(px.len(), 6); // 0..=5, one pixel each
+        assert!(px.iter().all(|&(_, y, c)| y == 3 && c == 255));
+    }
+
+    #[test]
+    fn aa_exact_diagonal_is_crisp() {
+        // A 45° line falls on integer pixels each step → single full-coverage px.
+        let px = aa_pixels(|p| rasterize_line_aa(v(0.0, 0.0), v(4.0, 4.0), p));
+        assert_eq!(px.len(), 5);
+        for k in 0..=4 {
+            assert!(px.contains(&(k, k, 255)), "missing crisp ({k},{k})");
+        }
+    }
+
+    #[test]
+    fn aa_shallow_line_ramps_coverage() {
+        // Gradient 0.5: the true line runs between two rows, so mid-columns split
+        // coverage across both. Per column the two pixels' coverage sums to 255.
+        let px = aa_pixels(|p| rasterize_line_aa(v(0.0, 0.0), v(4.0, 2.0), p));
+        let mut per_col: alloc::collections::BTreeMap<i32, u32> =
+            alloc::collections::BTreeMap::new();
+        for &(x, _, c) in &px {
+            *per_col.entry(x).or_default() += c as u32;
+        }
+        for (&x, &sum) in &per_col {
+            assert_eq!(sum, 255, "column {x} coverage should total 255, got {sum}");
+        }
+        // At least one column is genuinely split (a ~half-covered pixel exists).
+        assert!(
+            px.iter().any(|&(_, _, c)| (120..=135).contains(&c)),
+            "no ~half-coverage pixel"
+        );
+    }
+
+    #[test]
+    fn aa_handles_steep_lines() {
+        // dy > dx → the algorithm iterates over Y; endpoints must still land.
+        let px = aa_pixels(|p| rasterize_line_aa(v(0.0, 0.0), v(2.0, 5.0), p));
+        assert!(
+            px.iter().any(|&(x, y, _)| x == 0 && y == 0),
+            "missing start"
+        );
+        assert!(px.iter().any(|&(x, y, _)| x == 2 && y == 5), "missing end");
+        // Spans the full height (one plot per Y row across the major axis).
+        let ys: alloc::collections::BTreeSet<i32> = px.iter().map(|&(_, y, _)| y).collect();
+        assert!((0..=5).all(|y| ys.contains(&y)));
+    }
+
+    #[test]
+    fn aa_polyline_and_degenerate_cases() {
+        let px = aa_pixels(|p| rasterize_polyline_aa(&[v(0.0, 0.0), v(4.0, 0.0), v(4.0, 4.0)], p));
+        assert!(px.iter().any(|&(x, y, _)| x == 0 && y == 0));
+        assert!(px.iter().any(|&(x, y, _)| x == 4 && y == 4));
+        // Single point → one full-coverage pixel; empty → nothing.
+        assert_eq!(
+            aa_pixels(|p| rasterize_polyline_aa(&[v(2.0, 6.0)], p)),
+            alloc::vec![(2, 6, 255)]
+        );
+        assert!(aa_pixels(|p| rasterize_polyline_aa(&[], p)).is_empty());
+    }
+
+    #[test]
+    fn feathered_stamp_has_bright_core_and_falloff() {
+        let px = aa_pixels(|p| stamp_feathered(10, 10, 1, 4, p));
+        let cov_at = |x: i32, y: i32| {
+            px.iter()
+                .find(|&&(a, b, _)| a == x && b == y)
+                .map(|&(_, _, c)| c)
+        };
+        // Centre + the core radius (dist ≤ 1) are full brightness.
+        assert_eq!(cov_at(10, 10), Some(255));
+        assert_eq!(cov_at(11, 10), Some(255));
+        // Toward the edge it dims (dist 3, inside radius 4).
+        let near_edge = cov_at(13, 10).expect("dist-3 pixel present");
+        assert!(
+            near_edge > 0 && near_edge < 255,
+            "falloff pixel = {near_edge}"
+        );
+        // At/after the radius, nothing is plotted.
+        assert_eq!(cov_at(14, 10), None); // dist 4 == radius → coverage 0
+        assert_eq!(cov_at(15, 10), None);
+        // radius 0 → just the centre.
+        assert_eq!(
+            aa_pixels(|p| stamp_feathered(5, 5, 2, 0, p)),
+            alloc::vec![(5, 5, 255)]
+        );
+    }
+
+    #[test]
+    fn glow_polyline_is_a_bright_line_in_a_halo() {
+        let px = aa_pixels(|p| rasterize_glow_polyline(&[v(0.0, 10.0), v(10.0, 10.0)], 1, 3, p));
+        // The centreline is full brightness...
+        assert!(px.iter().any(|&(x, y, c)| x == 5 && y == 10 && c == 255));
+        // ...wrapped in a dimmer halo above and below.
+        assert!(px.iter().any(|&(_, y, c)| y == 12 && c > 0 && c < 255));
+        assert!(px.iter().any(|&(_, y, c)| y == 8 && c > 0 && c < 255));
+        // No coverage ever exceeds full.
+        assert!(px.iter().all(|&(_, _, c)| c <= 255));
+    }
+
+    #[test]
+    fn paint_glow_writes_line_and_halo_into_buffer() {
+        let (w, h) = (32usize, 16usize);
+        let mut buf = alloc::vec![0u8; w * h];
+        fn at(buf: &[u8], w: usize, x: usize, y: usize) -> u8 {
+            buf[y * w + x]
+        }
+        paint_glow(&mut buf, w, h, &[v(2.0, 8.0), v(28.0, 8.0)], 1, 3);
+        // Bright core on the line, dimmer halo above/below, background clear.
+        assert_eq!(at(&buf, w, 15, 8), 255);
+        assert!(at(&buf, w, 15, 10) > 0 && at(&buf, w, 15, 10) < 255);
+        assert!(at(&buf, w, 15, 6) > 0 && at(&buf, w, 15, 6) < 255);
+        assert_eq!(at(&buf, w, 15, 13), 0); // beyond the halo
+        // Max-combine: a second overlapping pass never exceeds full / darkens.
+        let before = at(&buf, w, 15, 8);
+        paint_glow(&mut buf, w, h, &[v(2.0, 8.0), v(28.0, 8.0)], 1, 3);
+        assert_eq!(at(&buf, w, 15, 8), before);
+        // Out-of-bounds points don't panic (clipped).
+        paint_glow(&mut buf, w, h, &[v(-50.0, -50.0), v(500.0, 500.0)], 1, 3);
     }
 }

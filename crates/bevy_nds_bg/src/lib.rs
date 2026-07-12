@@ -8,8 +8,12 @@
 //! - **BG1**: 4bpp **tile** background, 32×32 tilemap = 256×256 pixels =
 //!   exactly one screen-fill. Hardware-scrollable.
 //! - **BG3**: 16bpp **bitmap** background (extended-mode `BgType_Bmp16`),
-//!   256×256 pixels of RGB15 + alpha-bit. Main engine only — the sub engine
-//!   has no spare VRAM bank for a 128 KiB framebuffer in this layout.
+//!   256×256 pixels of RGB15 + alpha-bit. Main engine only — a full 256×256
+//!   framebuffer is 128 KiB and the sub engine has no spare bank that size.
+//! - **BG2 (sub only)**: the live 128×128 [`PaintCanvas`] (issue #35) — a
+//!   32 KiB 16bpp bitmap that fits VRAM_C's free low region beside the text
+//!   console, hardware-magnified 2× to fill the tactical screen. Opt-in via
+//!   [`Backgrounds::enable_paint_canvas`]; repaint it each frame.
 //!
 //! Game code asks for backgrounds through the [`Backgrounds`] resource. It is
 //! resource-shaped rather than component-shaped because backgrounds are fixed
@@ -116,6 +120,34 @@ struct EngineSlots {
     bitmap: BitmapSlot,
 }
 
+/// Width/height of the sub-engine **paint canvas** bitmap ([`PaintCanvas`]) —
+/// the live, per-frame-mutable framebuffer the game paints the capture stroke
+/// into (issue #35). It is a 128×128 16bpp bitmap (32 KiB) that the hardware
+/// magnifies 2× (see [`ffi::bgSetScale`]) to fill the 256×192 screen, so only
+/// the top-left [`PAINT_VISIBLE_H`] rows are on-screen. Half touch-resolution;
+/// the *capture math* stays full-resolution on the raw touch stream — the
+/// canvas is purely visual.
+const PAINT_W: usize = 128;
+const PAINT_H: usize = 128;
+/// The rows of the 128-tall canvas that are actually visible after the 2×
+/// upscale onto the 192px-tall screen (192 / 2 = 96).
+const PAINT_VISIBLE_H: usize = 96;
+
+/// State of the sub-engine paint canvas. Opt-in (via
+/// [`Backgrounds::enable_paint_canvas`]) so crate consumers that only want tile
+/// backgrounds don't pay for a sub bitmap BG or the mode-5 switch.
+#[derive(Default)]
+enum PaintSlot {
+    #[default]
+    Empty,
+    /// Requested; the plugin initialises the BG on the next frame.
+    Pending,
+    /// Live: `gfx` is the framebuffer's VRAM address (kept as `usize` so
+    /// [`Backgrounds`] stays `Send`/`Sync` without a raw pointer field — the
+    /// DS is single-core and reconstructs the slice on demand).
+    Ready { gfx: usize },
+}
+
 /// Game-facing handle to the BG layers. Insert + populate from a system; the
 /// plugin's per-frame work loads pending slots and syncs scroll.
 ///
@@ -127,6 +159,9 @@ struct EngineSlots {
 pub struct Backgrounds {
     main: EngineSlots,
     sub: EngineSlots,
+    /// The sub-engine live paint canvas (issue #35); `Empty` unless a game opts
+    /// in with [`enable_paint_canvas`](Self::enable_paint_canvas).
+    paint: PaintSlot,
 }
 
 impl Backgrounds {
@@ -179,6 +214,42 @@ impl Backgrounds {
         self.slots_mut(screen).bitmap = BitmapSlot::Empty;
     }
 
+    /// Opt into the sub-engine **paint canvas** (issue #35): a live 128×128
+    /// 16bpp bitmap on the bottom screen's BG2, hardware-magnified 2× to fill
+    /// the tactical surface, that the game repaints each frame (the capture
+    /// stroke). Idempotent — a no-op once enabled. The BG is initialised on the
+    /// next frame; poll [`paint`](Self::paint) for the drawable handle.
+    ///
+    /// It shares the sub engine with the text console (BG0, which stays a text
+    /// layer under mode 5) and the sprite blips (OAM, always on top), and lives
+    /// in VRAM_C's free region between the console's font tiles and map. Do not
+    /// combine it with a sub-screen *tile* background — they'd contend for the
+    /// same VRAM.
+    pub fn enable_paint_canvas(&mut self) {
+        if matches!(self.paint, PaintSlot::Empty) {
+            self.paint = PaintSlot::Pending;
+        }
+    }
+
+    /// Borrow the paint canvas for this frame, or `None` if it isn't enabled /
+    /// initialised yet. Write to it with [`PaintCanvas::clear`] /
+    /// [`PaintCanvas::plot`]; changes are visible immediately (the framebuffer
+    /// is VRAM). See [`enable_paint_canvas`](Self::enable_paint_canvas).
+    pub fn paint(&mut self) -> Option<PaintCanvas<'_>> {
+        match self.paint {
+            PaintSlot::Ready { gfx } => {
+                // SAFETY: `gfx` is the BG's framebuffer base returned by
+                // `bgGetGfxPtr` at init; it owns a contiguous PAINT_W×PAINT_H
+                // u16 region of VRAM. The DS is single-core and nothing else
+                // writes this BG, so a unique &mut slice for the frame is sound.
+                let fb =
+                    unsafe { core::slice::from_raw_parts_mut(gfx as *mut u16, PAINT_W * PAINT_H) };
+                Some(PaintCanvas { fb })
+            }
+            _ => None,
+        }
+    }
+
     fn slots_mut(&mut self, screen: DsScreen) -> &mut EngineSlots {
         match screen {
             DsScreen::Top => &mut self.main,
@@ -191,6 +262,82 @@ impl Backgrounds {
         match screen {
             DsScreen::Top => &self.main,
             DsScreen::Bottom => &self.sub,
+        }
+    }
+}
+
+/// A borrowed, writable view of the sub-engine paint canvas framebuffer for one
+/// frame (issue #35). Obtained from [`Backgrounds::paint`]. Coordinates are in
+/// **canvas space** (0..[`WIDTH`](Self::WIDTH), 0..[`HEIGHT`](Self::HEIGHT)) —
+/// half touch-screen resolution; map a touch pixel to canvas space by halving.
+/// Pixels are 16bpp `aBBBBBGGGGGRRRRR` (bit 15 = opaque); `0` is transparent.
+///
+/// The anti-aliased stroke's per-pixel coverage is baked into the *colour* the
+/// caller passes (blend the line colour toward the backdrop by coverage), since
+/// the hardware bitmap has only a 1-bit alpha — coverage-as-brightness is the
+/// anti-aliasing.
+pub struct PaintCanvas<'a> {
+    fb: &'a mut [u16],
+}
+
+impl PaintCanvas<'_> {
+    /// Canvas width in pixels (half the 256px screen width).
+    pub const WIDTH: usize = PAINT_W;
+    /// Canvas height in pixels (only [`VISIBLE_HEIGHT`](Self::VISIBLE_HEIGHT)
+    /// rows are on-screen after the 2× upscale).
+    pub const HEIGHT: usize = PAINT_H;
+    /// On-screen rows after the 2× upscale onto the 192px-tall screen.
+    pub const VISIBLE_HEIGHT: usize = PAINT_VISIBLE_H;
+
+    /// Clear the whole canvas to transparent.
+    pub fn clear(&mut self) {
+        self.fb.fill(0);
+    }
+
+    /// Set the pixel at canvas `(x, y)` to `color`. Off-canvas coordinates are
+    /// ignored (the rasterizer may emit brush pixels past the edge).
+    pub fn plot(&mut self, x: i32, y: i32, color: u16) {
+        if x >= 0 && (x as usize) < PAINT_W && y >= 0 && (y as usize) < PAINT_H {
+            self.fb[y as usize * PAINT_W + x as usize] = color;
+        }
+    }
+
+    /// Blit a coverage buffer (`WIDTH` × `VISIBLE_HEIGHT`, row-major, one byte
+    /// per pixel) into the visible region of the canvas, mapping each coverage
+    /// byte through a 256-entry colour `palette` (coverage → 16bpp colour). This
+    /// writes **every** visible pixel, so it doubles as the clear — no separate
+    /// [`clear`](Self::clear) needed.
+    ///
+    /// The fast path for painting a whole frame's stroke at once: the game
+    /// rasterizes into a CPU coverage buffer (max-combining overlaps) and hands
+    /// it here in one call. The palette is a plain lookup (no per-pixel closure
+    /// crossing a crate boundary), so this whole loop stays in this opt-3 crate.
+    /// Panics if `cov` is shorter than `WIDTH × VISIBLE_HEIGHT`.
+    pub fn blit_coverage(&mut self, cov: &[u8], palette: &[u16; 256]) {
+        self.blit_coverage_rect(cov, palette, 0, 0, PAINT_W, PAINT_VISIBLE_H);
+    }
+
+    /// Blit only the rectangle `[x0, x1) × [y0, y1)` of the coverage buffer (as
+    /// [`blit_coverage`](Self::blit_coverage)). The fast path for **incremental**
+    /// painting: after stamping just the newest stroke segment, push only its
+    /// bounding box to VRAM — the whole-frame blit is too much when the game is
+    /// already at the vblank budget. Bounds are clamped to the visible canvas.
+    pub fn blit_coverage_rect(
+        &mut self,
+        cov: &[u8],
+        palette: &[u16; 256],
+        x0: usize,
+        y0: usize,
+        x1: usize,
+        y1: usize,
+    ) {
+        let x1 = x1.min(PAINT_W);
+        let y1 = y1.min(PAINT_VISIBLE_H);
+        for y in y0..y1 {
+            let row = y * PAINT_W;
+            for x in x0..x1 {
+                self.fb[row + x] = palette[cov[row + x] as usize];
+            }
         }
     }
 }
@@ -216,6 +363,13 @@ mod vram {
     /// Main BG3 bitmap base: VRAM_B mapped at 0x06020000 = 8 × 16 KiB into
     /// main BG memory.
     pub const MAIN_BITMAP_BASE: c_int = 8;
+    /// Sub BG2 **paint-canvas** bitmap base: 0 × 16 KiB = 0–32 KiB into VRAM_C.
+    /// The sub text console (`consoleDemoInit`) lives in VRAM_C's *upper* region
+    /// — tilemap at map-base 22 (44 KiB), font tiles at tile-base 3 (48–64 KiB)
+    /// — so the low 32 KiB is free for the 128×128 16bpp canvas (verified: a
+    /// full-canvas clear each frame leaves the console text intact). Do **not**
+    /// combine with a sub-screen tile background (it would contend here).
+    pub const SUB_PAINT_BASE: c_int = 0;
 }
 
 /// Which palette bank our tile BG uses. Bank 0 is reserved for the text
@@ -260,6 +414,49 @@ fn ensure_loaded(mut bgs: ResMut<Backgrounds>) {
     for screen in [DsScreen::Top, DsScreen::Bottom] {
         process_tile_slot(&mut bgs, screen);
         process_bitmap_slot(&mut bgs, screen);
+    }
+    process_paint_slot(&mut bgs);
+}
+
+/// PreUpdate: bring up the sub-engine paint canvas if it was requested.
+fn process_paint_slot(bgs: &mut Backgrounds) {
+    if !matches!(bgs.paint, PaintSlot::Pending) {
+        return;
+    }
+    bgs.paint = match init_paint_canvas() {
+        Some(gfx) => PaintSlot::Ready { gfx },
+        // Init can't really fail (no asset), but stay defensive.
+        None => PaintSlot::Empty,
+    };
+}
+
+/// Initialise the sub-engine BG2 paint canvas: switch the sub engine to mode 5
+/// (preserving the console on BG0), init a 128×128 16bpp bitmap in VRAM_C's
+/// free region, clear it, set the 2× top-left-anchored magnification, and show
+/// it. Returns the framebuffer's VRAM address. The `Last` `bgUpdate()` latches
+/// the show + affine matrix into hardware.
+fn init_paint_canvas() -> Option<usize> {
+    unsafe {
+        ffi::set_sub_video_mode_5();
+        let bg_id = ffi::bgInitHiddenSub(
+            2, // BG2 (extended-rotation, so it can be magnified)
+            ffi::BG_TYPE_BMP16,
+            ffi::BG_SIZE_B16_128X128,
+            vram::SUB_PAINT_BASE,
+            0, // tileBase unused for bitmaps
+        );
+        let gfx = ffi::bgGetGfxPtr(bg_id);
+        for i in 0..(PAINT_W * PAINT_H) {
+            write_volatile(gfx.add(i), 0); // transparent
+        }
+        // 0.5 in 24.8 → magnify 2×; anchor + scroll at the origin so screen
+        // (0,0) samples canvas (0,0). The visible 256×192 maps to canvas
+        // 128×96 (top-left).
+        ffi::bgSetScale(bg_id, 128, 128);
+        ffi::bgSetCenterf(bg_id, 0, 0);
+        ffi::bgSetScrollf(bg_id, 0, 0);
+        ffi::show_bg(ffi::BgEngine::Sub, 2);
+        Some(gfx as usize)
     }
 }
 
@@ -421,7 +618,7 @@ fn flush_scroll_and_update(mut bgs: ResMut<Backgrounds>) {
 
 /// Common imports for games using the BG backend.
 pub mod prelude {
-    pub use crate::{BackgroundPlugin, Backgrounds};
+    pub use crate::{BackgroundPlugin, Backgrounds, PaintCanvas};
 }
 
 #[cfg(test)]
@@ -480,6 +677,25 @@ mod tests {
             bgs.slots(DsScreen::Bottom).bitmap,
             BitmapSlot::Empty
         ));
+    }
+
+    #[test]
+    fn enable_paint_canvas_is_pending_and_idempotent() {
+        let mut bgs = Backgrounds::default();
+        assert!(matches!(bgs.paint, PaintSlot::Empty));
+        assert!(bgs.paint().is_none()); // not ready until the plugin inits it
+        bgs.enable_paint_canvas();
+        assert!(matches!(bgs.paint, PaintSlot::Pending));
+        // Second call doesn't reset an already-requested/ready canvas.
+        bgs.enable_paint_canvas();
+        assert!(matches!(bgs.paint, PaintSlot::Pending));
+    }
+
+    #[test]
+    fn paint_canvas_dims_match_half_res_layout() {
+        assert_eq!(PaintCanvas::WIDTH, 128);
+        assert_eq!(PaintCanvas::HEIGHT, 128);
+        assert_eq!(PaintCanvas::VISIBLE_HEIGHT, 96); // 192px screen / 2× upscale
     }
 
     #[test]

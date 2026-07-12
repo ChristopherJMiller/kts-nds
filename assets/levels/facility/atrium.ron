@@ -12,8 +12,16 @@ Zone(instances: [
         scale: (0.11, 0.11, 0.11),
         material: Some((diffuse: (110, 180, 235), ambient: (26, 40, 58))),
     )),
-    // A patroller pacing a diamond around the arena (path[0] == spawn).
-    Use(name: "patroller", pos: (-1.4, 0.0, 0.0), path: [(-1.4, 0.0), (0.0, 1.4), (1.4, 0.0), (0.0, -1.4)]),
+    // A patroller pacing a diamond around the arena (path[0] == spawn). Marked
+    // objective (`flags: Some(1)` == OBJECTIVE) so clearing it — by either exit
+    // (#26 OQ-3: neutralize) — raises the atrium's clear_flag and opens the east
+    // gate to the corridor (#27).
+    Use(name: "patroller", pos: (-1.4, 0.0, 0.0), flags: Some(1), path: [(-1.4, 0.0), (0.0, 1.4), (1.4, 0.0), (0.0, -1.4)]),
+    // A second, freeform patroller in the far corner — marked LEVEL_OBJECTIVE
+    // (`flags: Some(2)`): capturing it doesn't open the gate (that's the objective
+    // patroller above), it contributes to the *level* objective / exit (#27 tier
+    // 2). Demonstrates "not all encounters gate."
+    Use(name: "patroller", pos: (-1.5, 0.0, -1.3), flags: Some(2), path: [(-1.5, -1.3), (-0.7, -1.3)]),
     // Two grey landmarks for sightlines / cover; the second is turned a touch.
     Use(name: "landmark_block", pos: (-1.25, 0.0, 0.95)),
     Use(name: "landmark_block", pos: (1.25, 0.0, -0.95), rot: Some((0.0, 0.3, 0.0))),

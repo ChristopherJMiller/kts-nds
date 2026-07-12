@@ -9,12 +9,13 @@
 //! | offset | type        | field                                          |
 //! |--------|-------------|------------------------------------------------|
 //! | 0      | u32         | magic "BSC1"                                   |
-//! | 4      | u16         | format version (currently 1)                   |
+//! | 4      | u16         | format version (currently 3)                   |
 //! | 6      | u16         | camera mode (0 Follow/1 TopDown/2 Rail/3 Capt) |
 //! | 8      | f32 × 4     | camera params (mode-specific)                  |
 //! | 24     | u32         | instance count N                               |
 //! |        | Instance ×N |                                                |
 //! |        | f32×4       | zone bounds (min_x, min_z, max_x, max_z)       |
+//! |        | u32         | zone clear_flag (v3; 0 = freeform)             |
 //! |        | u32         | connection count M                             |
 //! |        | Conn ×M     |                                                |
 //!
@@ -49,7 +50,8 @@ use alloc::vec::Vec;
 pub const MAGIC: u32 = u32::from_le_bytes(*b"BSC1");
 /// Current `.scene` format version. v2 replaced hand-authored `exits` with a
 /// zone `bounds` + baker-derived `connections` (the Euclidean map rework, #27).
-pub const VERSION: u16 = 2;
+/// v3 added the zone `clear_flag` (the generalized gating model, #27).
+pub const VERSION: u16 = 3;
 
 /// Per-space authored camera (issue #23 / #27). No free player-driven camera;
 /// the framing is chosen per space and the game's director reads this.
@@ -137,6 +139,10 @@ pub struct SceneData {
     pub instances: Vec<SceneInstanceData>,
     /// Walkable extent in local coords: `[min_x, min_z, max_x, max_z]`.
     pub bounds: [f32; 4],
+    /// The flag this zone raises when its objective enemies are all resolved
+    /// (#27); `0` ⇒ a freeform zone that raises nothing. The game's zone-clear
+    /// source reads it; the crossing consumer reads each connection's `gate`.
+    pub clear_flag: u32,
     pub connections: Vec<SceneConnData>,
 }
 
@@ -185,6 +191,7 @@ pub fn parse(bytes: &[u8]) -> Option<SceneData> {
     }
 
     let bounds = [r.f32()?, r.f32()?, r.f32()?, r.f32()?];
+    let clear_flag = r.u32()?;
 
     let m = r.u32()? as usize;
     let mut connections = Vec::with_capacity(m.min(MAX_PREALLOC));
@@ -209,6 +216,7 @@ pub fn parse(bytes: &[u8]) -> Option<SceneData> {
         camera,
         instances,
         bounds,
+        clear_flag,
         connections,
     })
 }
@@ -319,13 +327,14 @@ mod tests {
                 },
             ],
             bounds: [-2.0, -2.0, 2.0, 2.0],
+            clear_flag: 3,
             connections: alloc::vec![SceneConnData {
                 neighbour: String::from("corridor_b"),
                 side: 1,
                 lo: -0.5,
                 hi: 0.5,
                 delta: [-4.0, 0.0],
-                gate: 0,
+                gate: 3,
             }],
         }
     }
@@ -406,6 +415,7 @@ mod tests {
         for v in s.bounds {
             w.f32(v);
         }
+        w.u32(s.clear_flag);
         w.u32(s.connections.len() as u32);
         for c in &s.connections {
             w.string(&c.neighbour);
@@ -463,6 +473,7 @@ mod tests {
                 path: alloc::vec![],
             }],
             bounds: [-1.0, -1.0, 1.0, 1.0],
+            clear_flag: 0,
             connections: alloc::vec![],
         };
         let parsed = parse(&encode(&scene)).unwrap();

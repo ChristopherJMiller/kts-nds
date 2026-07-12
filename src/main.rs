@@ -43,13 +43,15 @@ use bevy_app::prelude::*;
 use bevy_ecs::prelude::*;
 use bevy_nds::prelude::*;
 use bevy_nds_3d::prelude::*;
-use bevy_nds_loop::{densify, smooth as path_smooth};
+use bevy_nds_bg::prelude::*;
+use bevy_nds_loop::paint_glow;
 use bevy_nds_math::{Fx32, FxVec2};
 use bevy_nds_scene::{CameraMode, LoadedScene, SceneInstance, ScenePath};
 use bevy_nds_sprite::prelude::*;
 
 mod capture;
 mod control;
+mod flags;
 mod menu;
 mod player;
 mod radial;
@@ -72,6 +74,14 @@ mod levels {
 /// and a level `exit` seam — are deferred; see #27). Matches the
 /// `assets/levels/<BOOT_LEVEL>/` directory, so neighbour zones resolve within it.
 const BOOT_LEVEL: &str = "facility";
+/// The boot level's entry zone stem (the zone the avatar seeds into). Matches the
+/// `entry` in `assets/levels/facility/level.ron`.
+const BOOT_ZONE: &str = "atrium";
+/// How many zones in [`BOOT_LEVEL`] carry level objectives — the total the level
+/// exit needs (see [`flags::LevelProgress`]). A **hardcoded stand-in** for the
+/// deferred runtime level-header blob (#27); `facility` has two (atrium +
+/// corridor). Moves into the level-header when the menu / level-select lands.
+const BOOT_LEVEL_OBJECTIVE_ZONES: usize = 2;
 
 // --- Arena / camera ----------------------------------------------------------
 
@@ -117,6 +127,12 @@ const LANDMARK_COLLIDE: f32 = 0.26;
 // --- Enemy + projectile ------------------------------------------------------
 
 const ENEMY_SPEED: f32 = 0.8;
+/// Process-range cull radius (world units) for resident-neighbour gameplay (#27
+/// follow-up): enemies farther than this from the avatar skip their per-frame
+/// tick (patrol). Kept ≥ the render range so anything *visible* still animates —
+/// the cull only silences enemies deep in a neighbour zone, off-screen behind the
+/// fog. The explicit per-object twin of `bevy_nds_3d`'s render-side `RenderRange`.
+const PROCESS_RANGE: f32 = 14.0;
 // The enemy's patrol path now lives on its `ScenePath` (authored in the space),
 // not a const — see `assets/spaces/atrium.ron`.
 /// The enemy pauses at each waypoint (stop-and-go), opening capture windows.
@@ -152,9 +168,13 @@ const RADIAL_HOVER_POP: f32 = 8.0; // extra px the hovered spoke pops outward
 
 const MIN_SPACING: f32 = 4.0;
 const MAX_POINTS: usize = 80;
-const DOT_POOL: usize = 90;
-const TRAIL_STEP: f32 = 4.0;
 const CLOSE_TOL: f32 = 2.0;
+
+/// Painted-stroke glow brush (#35), in **canvas** pixels (½ touch-res). A small
+/// flat-bright core wrapped in a feathered halo — the feather is what dissolves
+/// the 2×-upscale aliasing into a glow. `GLOW_RADIUS` px ≈ `2×` on screen.
+const GLOW_CORE: i32 = 1;
+const GLOW_RADIUS: i32 = 4;
 
 /// World XY → tactical-map screen pixels. The map matches the top screen's
 /// orientation 1:1 for the fixed capture framing (camera at +Z looking −Z):
@@ -204,6 +224,102 @@ struct SpaceFloor;
 /// meets the corridor's (x∈[2,6.4]) exactly at the seam, so the ground reads as
 /// one continuous surface. The arena-square / rail-strip shapes fall out of the
 /// bounds themselves (the corridor authors a long, shallow rect).
+/// Height (world units) of a gate barrier wall — about avatar-tall, enough to
+/// read as an obstacle without hiding the fogged neighbour zone behind it.
+const GATE_BARRIER_HEIGHT: f32 = 0.5;
+/// Locked-gate wall colour (a warning red).
+const GATE_BARRIER_COLOR: [u8; 3] = [200, 60, 50];
+
+/// A vertical wall quad (unlit), rising from local `y = 0` to `height`, spanning
+/// ±`half_span` along X (`along_x`) or Z — the gate-barrier slab.
+fn wall_quad(along_x: bool, half_span: f32, height: f32, color: [u8; 3]) -> DsMesh {
+    let v = |s: f32, y: f32| {
+        let p = if along_x {
+            Vec3::new(s, y, 0.0)
+        } else {
+            Vec3::new(0.0, y, s)
+        };
+        Vertex::new(p, color)
+    };
+    let tris = alloc::vec![
+        [v(-half_span, 0.0), v(half_span, 0.0), v(half_span, height)],
+        [
+            v(-half_span, 0.0),
+            v(half_span, height),
+            v(-half_span, height)
+        ],
+    ];
+    DsMesh {
+        tris: Cow::Owned(tris),
+        lit: false,
+        baked: None,
+    }
+}
+
+/// A wall at a **locked gated boundary** (#27): visible while its `gate` flag is
+/// down, hidden the moment it's raised — the in-world "you're gated into this
+/// zone" tell (`update_gate_barriers` reconciles its visibility).
+#[derive(Component)]
+struct GateBarrier {
+    gate: u32,
+}
+
+/// Spawn a wall at each **gated** boundary of the active zone (`gate != 0`), sized
+/// to the connection's span. Called on zone load (boot + crossing); the barriers
+/// are per-zone chrome, torn down with the zone on the next crossing.
+fn spawn_gate_barriers(commands: &mut Commands, zone: &Zone, flags: &flags::Flags) {
+    let [min_x, min_z, max_x, max_z] = zone.bounds;
+    for c in &zone.conns {
+        if c.gate == 0 {
+            continue; // ungated edge — no barrier
+        }
+        let half = (c.hi - c.lo).abs() * 0.5;
+        let center = (c.lo + c.hi) * 0.5;
+        let (along_x, tx, tz) = match c.side {
+            0 => (false, min_x, center), // west −X
+            1 => (false, max_x, center), // east +X
+            2 => (true, center, min_z),  // south −Z
+            3 => (true, center, max_z),  // north +Z
+            _ => continue,
+        };
+        let mut e = commands.spawn((
+            GateBarrier { gate: c.gate },
+            wall_quad(along_x, half, GATE_BARRIER_HEIGHT, GATE_BARRIER_COLOR),
+            Transform3d {
+                translation: Vec3::new(tx, GROUND_Y, tz),
+                rotation: Vec3::ZERO,
+                scale: Vec3::ONE,
+            },
+        ));
+        // If the gate is already open (re-entering a cleared zone), spawn the wall
+        // already `Hidden` so it never flashes before `update_gate_barriers` runs.
+        if flags.is_raised(c.gate) {
+            e.insert(Hidden);
+        }
+    }
+}
+
+/// Show a gate barrier while its flag is down, hide it once raised (#27). Uses
+/// `Hidden` (not despawn) so a START reset — which re-locks the gate — brings the
+/// wall back with no respawn bookkeeping.
+fn update_gate_barriers(
+    mut commands: Commands,
+    flags: Res<flags::Flags>,
+    barriers: Query<(Entity, &GateBarrier, Has<Hidden>)>,
+) {
+    for (e, barrier, hidden) in &barriers {
+        match (flags.is_raised(barrier.gate), hidden) {
+            (true, false) => {
+                commands.entity(e).insert(Hidden);
+            }
+            (false, true) => {
+                commands.entity(e).remove::<Hidden>();
+            }
+            _ => {}
+        }
+    }
+}
+
 fn spawn_zone_floor(commands: &mut Commands, bounds: [f32; 4], offset: (f32, f32)) {
     let [min_x, min_z, max_x, max_z] = bounds;
     let half_x = (max_x - min_x) * 0.5;
@@ -226,7 +342,7 @@ fn spawn_zone_floor(commands: &mut Commands, bounds: [f32; 4], offset: (f32, f32
 /// frame, so the player sees into adjacent zones. A connection's `delta` is
 /// `place_active − place_neighbour`, so the neighbour's geometry sits at `−delta`
 /// in the active frame. Reuses the current zone's already-derived `conns`.
-fn spawn_resident_neighbours(commands: &mut Commands, zone: &Zone) {
+fn spawn_resident_neighbours(commands: &mut Commands, zone: &Zone, snapshot: &ZoneCaptureState) {
     for c in &zone.conns {
         let path = bevy_nds_scene::level_space_path(&zone.level, &c.neighbour);
         let Some(scene) = bevy_nds_scene::load(&path) else {
@@ -234,7 +350,7 @@ fn spawn_resident_neighbours(commands: &mut Commands, zone: &Zone) {
         };
         let offset = (-c.delta[0], -c.delta[1]);
         spawn_zone_floor(commands, scene.bounds, offset); // neighbour's ground, abutting ours
-        spawn_neighbour(commands, &scene, offset);
+        spawn_neighbour(commands, &scene, offset, &c.neighbour, snapshot);
     }
 }
 
@@ -243,15 +359,40 @@ fn spawn_resident_neighbours(commands: &mut Commands, zone: &Zone) {
 /// duplicate gameplay entity) and no map sprite; just mesh + transform +
 /// material, tagged `NeighbourInstance` so the next crossing can clear them. The
 /// avatar instance is skipped — the avatar is the single persistent entity.
-fn spawn_neighbour(commands: &mut Commands, scene: &bevy_nds_scene::SceneData, offset: (f32, f32)) {
+fn spawn_neighbour(
+    commands: &mut Commands,
+    scene: &bevy_nds_scene::SceneData,
+    offset: (f32, f32),
+    stem: &str,
+    snapshot: &ZoneCaptureState,
+) {
     for inst in &scene.instances {
         if inst.role == "avatar" {
             continue;
         }
+        // Enemy identity: its LOCAL (pre-offset) spawn position + zone stem, plus
+        // the render `offset` so its live position persists in the local frame.
+        let enemy_member = (inst.role == "enemy").then(|| ZoneMember {
+            stem: alloc::string::String::from(stem),
+            key: zone_key(inst.pos[0], inst.pos[2]),
+            offset,
+        });
+        let restored = enemy_member.as_ref().and_then(|m| snapshot.restore(m));
+        // Skip-at-spawn (#27): a captured neighbour enemy isn't spawned at all —
+        // not even its render entity — so there's no flash and nothing to process.
+        if restored.is_some_and(|s| s.resolved.is_some()) {
+            continue;
+        }
+        // Spawn at the restored *local* position (into the active frame via the
+        // offset) if we've seen this enemy, else at its authored position.
+        let world = match restored {
+            Some(st) => Vec3::new(st.local.0 + offset.0, inst.pos[1], st.local.1 + offset.1),
+            None => Vec3::new(inst.pos[0] + offset.0, inst.pos[1], inst.pos[2] + offset.1),
+        };
         let mut e = commands.spawn((
             NeighbourInstance,
             Transform3d {
-                translation: Vec3::new(inst.pos[0] + offset.0, inst.pos[1], inst.pos[2] + offset.1),
+                translation: world,
                 rotation: Vec3::from_array(inst.rot),
                 scale: Vec3::from_array(inst.scale),
             },
@@ -263,6 +404,48 @@ fn spawn_neighbour(commands: &mut Commands, scene: &bevy_nds_scene::SceneData, o
         }
         if let Some((diffuse, ambient)) = inst.material {
             e.insert(DsMaterial { diffuse, ambient });
+        }
+        // Enemy neighbours are **full gameplay entities** at their offset (#27
+        // follow-up): they patrol (range-culled) and are capturable through the
+        // fog, and their full runtime state persists across a crossing (`ZoneMember`
+        // + the snapshot). Non-enemy neighbours (landmarks) stay render-only.
+        if let Some(member) = enemy_member {
+            let (enemy, cap) = match restored {
+                Some(st) => (
+                    Enemy {
+                        wp: st.wp,
+                        pause: st.pause,
+                    },
+                    capture::Capture {
+                        progress: st.progress,
+                        resolved: None,
+                    },
+                ),
+                None => (Enemy { wp: 1, pause: 0 }, capture::Capture::default()),
+            };
+            e.insert((
+                enemy,
+                cap,
+                capture::VulnerabilityShape::circle(),
+                WorldPos(FxVec2::from_f32(world.x, world.z)),
+                Stylized,
+                Sprite::new(sprites::BLIP).at(0, PARK_Y),
+                member,
+                // Patrol waypoints offset into the active frame (the path is
+                // authored in the neighbour's local coords).
+                ScenePath(
+                    inst.path
+                        .iter()
+                        .map(|p| bevy_nds_scene::Vec2::new(p[0] + offset.0, p[1] + offset.1))
+                        .collect(),
+                ),
+            ));
+            if inst.flags & flags::OBJECTIVE != 0 {
+                e.insert(flags::Objective);
+            }
+            if inst.flags & flags::LEVEL_OBJECTIVE != 0 {
+                e.insert(flags::LevelObjectiveTag);
+            }
         }
     }
 }
@@ -357,6 +540,59 @@ struct Enemy {
     pause: u8,
 }
 
+/// Stable per-enemy identity for **runtime-state persistence across zone
+/// crossings** (#27 follow-up): the enemy's zone stem + its **local** (pre-offset)
+/// spawn position (quantized to millimetres), plus the world-frame `offset` it's
+/// currently rendered at (`(0,0)` when its zone is active, `−delta` while a
+/// resident neighbour). The stem+key survive despawn/respawn because the `.scene`
+/// always re-spawns the enemy at the same local spawn position; the offset lets
+/// [`mirror_capture`] record the *local* live position so it's frame-independent.
+#[derive(Component, Clone)]
+struct ZoneMember {
+    stem: alloc::string::String,
+    key: (i32, i32),
+    offset: (f32, f32),
+}
+
+/// Quantise a local (x, z) spawn position into a stable [`ZoneMember`] key.
+fn zone_key(x: f32, z: f32) -> (i32, i32) {
+    ((x * 1000.0) as i32, (z * 1000.0) as i32)
+}
+
+/// The full runtime state of one enemy, persisted so it resumes *exactly* across
+/// a zone crossing (#27): capture progress/outcome, current **local** position,
+/// and patrol waypoint + dwell. Position/patrol are stored in the zone's local
+/// frame so they're valid whether the zone reloads as active or as a neighbour.
+#[derive(Clone, Copy)]
+struct EnemyState {
+    progress: f32,
+    resolved: Option<capture::CaptureOutcome>,
+    local: (f32, f32),
+    wp: usize,
+    pause: u8,
+}
+
+/// Persistent snapshot of every resident enemy's runtime state, keyed by
+/// `(zone stem, local x·1000, local z·1000)` (#27 persistence). [`mirror_capture`]
+/// refreshes it live each frame; the spawn path reads it inline the moment an
+/// enemy (re)spawns, so a zone that despawned on a crossing and respawns later
+/// resumes each enemy where it was. Persistence holds within the resident window
+/// (current zone + its 1-hop neighbours); a fully-unloaded zone resets.
+#[derive(Resource, Default)]
+struct ZoneCaptureState(
+    alloc::collections::BTreeMap<(alloc::string::String, i32, i32), EnemyState>,
+);
+
+impl ZoneCaptureState {
+    /// The persisted state for an enemy, or `None` if never seen (spawn fresh).
+    fn restore(&self, m: &ZoneMember) -> Option<EnemyState> {
+        self.0.get(&(m.stem.clone(), m.key.0, m.key.1)).copied()
+    }
+    fn save(&mut self, m: &ZoneMember, st: EnemyState) {
+        self.0.insert((m.stem.clone(), m.key.0, m.key.1), st);
+    }
+}
+
 /// The 3D stylus cursor (shows the pen position in world space while deployed).
 #[derive(Component)]
 struct Cursor;
@@ -372,9 +608,6 @@ struct Projectile {
 /// World XY (fixed-point) — source of truth for the 3D transform and map marker.
 #[derive(Component, Clone, Copy)]
 struct WorldPos(FxVec2);
-
-#[derive(Component)]
-struct PathDot;
 
 /// A radial-wheel spoke icon (index 0 = device/up). A placeholder OAM sprite,
 /// laid out around the wheel origin while the wheel is open (#25).
@@ -398,6 +631,7 @@ pub extern "C" fn main() -> core::ffi::c_int {
     app.add_plugins(DsPlugins)
         .add_plugins(Ds3dPlugin)
         .add_plugins(SpritePlugin)
+        .add_plugins(BackgroundPlugin)
         .add_plugins(menu::MenuPlugin)
         .add_plugins(SpikePlugin);
     bevy_nds::run(app)
@@ -423,23 +657,29 @@ impl Plugin for SpikePlugin {
         .init_resource::<Landmarks>()
         .init_resource::<Transition>()
         .init_resource::<Zone>()
+        .init_resource::<flags::Flags>()
+        .init_resource::<flags::LevelProgress>()
+        .init_resource::<ZoneCaptureState>()
         .init_resource::<capture::CaptureTally>()
         .init_resource::<radial::Radial>()
         .init_resource::<Health>()
+        .init_resource::<GlowBuffer>()
         .add_event::<capture::CaptureResolved>()
-        .add_systems(Startup, setup)
+        .add_systems(Startup, (setup, enable_paint_canvas))
         .add_systems(
             Update,
             (
-                // Sim + gameplay: specialise freshly spawned scene instances,
-                // run the (instant) space transition before gameplay reads the
-                // avatar, then controller, cameras, enemies, and capture.
+                // Sim + gameplay: run the space transition / reset (which spawn a
+                // zone's entities), THEN specialise them the **same frame** — an
+                // auto-inserted sync point flushes the spawns first — so a restored
+                // enemy is positioned before it ever renders (no 1-frame spawn-pos
+                // blip). Then controller, cameras, enemies, and capture.
                 (
-                    specialize_scene,
                     transition::transition_spaces,
                     radial::drive_radial,
                     player::toggle_tuning,
                     reset_enemy,
+                    specialize_scene,
                     player::move_player,
                     player::sync_shadow,
                     orbit_camera,
@@ -451,6 +691,18 @@ impl Plugin for SpikePlugin {
                     capture::dash_destroy,
                     capture::enemy_contact,
                     capture::tally_captures,
+                    // Zone-clear source (#27): after this frame's captures
+                    // resolve, raise the arena's flag so the next crossing check
+                    // sees the gate open.
+                    flags::clear_zone,
+                    // Level-objective source (#27 tier 2): roll freeform captures
+                    // up to the level exit.
+                    flags::tally_level_objective,
+                    // Persist this frame's capture state so it survives a zone
+                    // despawn/respawn on crossing (#27). Runs after captures
+                    // resolve and after `restore_capture`, so it never clobbers a
+                    // just-restored snapshot.
+                    mirror_capture,
                 )
                     .chain()
                     // Paused while the options menu is open (Select). Rendering
@@ -462,8 +714,9 @@ impl Plugin for SpikePlugin {
                     sync_3d,
                     update_cursor,
                     sync_map_markers,
-                    update_trail,
+                    paint_stroke,
                     update_radial_overlay,
+                    update_gate_barriers,
                     update_hud,
                 )
                     .chain(),
@@ -475,7 +728,17 @@ impl Plugin for SpikePlugin {
 
 // --- Setup -------------------------------------------------------------------
 
-fn setup(mut commands: Commands, mut camera: ResMut<Camera3d>, mut zone: ResMut<Zone>) {
+fn setup(
+    mut commands: Commands,
+    mut camera: ResMut<Camera3d>,
+    mut zone: ResMut<Zone>,
+    mut level: ResMut<flags::LevelProgress>,
+    snapshot: Res<ZoneCaptureState>,
+    game_flags: Res<flags::Flags>,
+) {
+    // The level exit needs every level-objective zone cleared (hardcoded total —
+    // the deferred level-header's stand-in, #27).
+    level.needed = BOOT_LEVEL_OBJECTIVE_ZONES;
     let cube = include_obj!("assets/cube.obj", center);
 
     // Level content — avatar, enemy, landmarks — is authored data (issue #27).
@@ -490,6 +753,8 @@ fn setup(mut commands: Commands, mut camera: ResMut<Camera3d>, mut zone: ResMut<
     camera.pitch = CAM_PITCH;
     zone.level.clear();
     zone.level.push_str(BOOT_LEVEL); // neighbour zones resolve within this level
+    zone.stem.clear();
+    zone.stem.push_str(BOOT_ZONE); // the entry zone's stable key (level-objective)
     if let Some(scene) = bevy_nds_scene::load(levels::facility::ATRIUM) {
         // Seed the initial framing from the space's authored camera (avatar at
         // origin) so boot lands on the right view instead of gliding in from the
@@ -502,10 +767,12 @@ fn setup(mut commands: Commands, mut camera: ResMut<Camera3d>, mut zone: ResMut<
         spawn_zone_floor(&mut commands, scene.bounds, (0.0, 0.0)); // active floor (sized to bounds)
         bevy_nds_scene::spawn(&mut commands, scene); // active zone (incl. the avatar)
     }
+    // Walls at this zone's locked gated edges (#27): the in-world "gated in" tell.
+    spawn_gate_barriers(&mut commands, &zone, &game_flags);
     // Resident neighbours (#27 seamless streaming): render-only, fogged, each
     // with its own floor at its offset, so you see into the next zone over
     // continuous ground. Read from the just-set `zone.conns`.
-    spawn_resident_neighbours(&mut commands, &zone);
+    spawn_resident_neighbours(&mut commands, &zone, &snapshot);
 
     // Ground shadow — a flat dark quad (no `Height`) that stays at the avatar's
     // ground position, so a jump's screen-Y lift opens a visible gap above it.
@@ -561,11 +828,6 @@ fn setup(mut commands: Commands, mut camera: ResMut<Camera3d>, mut zone: ResMut<
         Hidden,
     ));
 
-    // Trail-dot pool (map), parked.
-    for _ in 0..DOT_POOL {
-        commands.spawn((PathDot, Sprite::new(sprites::DOT).at(0, PARK_Y)));
-    }
-
     // Radial-wheel overlay (#25): 5 spoke icons + a pointer line of dots, parked
     // off-screen until the wheel opens. Placeholder art — OBSTACLE for the spokes,
     // DOT for the pointer (both already loaded, so no extra palette bank).
@@ -601,6 +863,8 @@ fn setup(mut commands: Commands, mut camera: ResMut<Camera3d>, mut zone: ResMut<
 fn specialize_scene(
     mut commands: Commands,
     mut landmarks: ResMut<Landmarks>,
+    zone: Res<Zone>,
+    snapshot: Res<ZoneCaptureState>,
     q: Query<(Entity, &SceneInstance, &Transform3d), Added<SceneInstance>>,
 ) {
     for (e, inst, tf) in &q {
@@ -621,16 +885,74 @@ fn specialize_scene(
                 ));
             }
             "enemy" => {
-                commands.entity(e).insert((
-                    Enemy { wp: 1, pause: 0 },
-                    capture::Capture::default(),
+                // Active zone is origin-centric (offset 0), so the spawned
+                // transform *is* the local position — the stable persistence key.
+                let member = ZoneMember {
+                    stem: zone.stem.clone(),
+                    key: zone_key(tf.translation.x, tf.translation.z),
+                    offset: (0.0, 0.0),
+                };
+                let restored = snapshot.restore(&member);
+                // Skip-at-spawn (#27): an already-captured enemy isn't spawned at
+                // all — no lingering Hidden entity, no per-frame processing, no
+                // flash. The crate already spawned a render entity for it, so drop
+                // that. Completion is recorded in the persistent Flags/LevelProgress,
+                // so nothing downstream needs the dead enemy. START-reset clears the
+                // snapshot + reloads the zone to bring captured enemies back.
+                if restored.is_some_and(|s| s.resolved.is_some()) {
+                    commands.entity(e).despawn();
+                    continue;
+                }
+                // Resume the enemy's full state (position + patrol + progress) if
+                // it was seen before, else spawn fresh at its authored position.
+                let (enemy, cap, epos) = match restored {
+                    Some(st) => (
+                        Enemy {
+                            wp: st.wp,
+                            pause: st.pause,
+                        },
+                        capture::Capture {
+                            progress: st.progress,
+                            resolved: None,
+                        },
+                        WorldPos(FxVec2::from_f32(st.local.0, st.local.1)), // offset 0
+                    ),
+                    None => (Enemy { wp: 1, pause: 0 }, capture::Capture::default(), pos),
+                };
+                let mut ec = commands.entity(e);
+                ec.insert((
+                    enemy,
+                    cap,
                     capture::VulnerabilityShape::circle(),
-                    pos,
+                    epos,
                     // Outlined + cel-shaded so the threat reads at a glance;
                     // terrain stays smooth (see `Stylized`).
                     Stylized,
                     Sprite::new(sprites::BLIP).at(0, PARK_Y),
+                    member,
+                    // Correct the render transform now (not next frame via
+                    // `sync_3d`): a restored enemy's crate-spawned transform sits at
+                    // its *authored* position, so overwrite it with the resumed one.
+                    Transform3d {
+                        translation: Vec3::new(
+                            epos.0.x.to_f32(),
+                            tf.translation.y,
+                            epos.0.y.to_f32(),
+                        ),
+                        rotation: tf.rotation,
+                        scale: tf.scale,
+                    },
                 ));
+                // Objective enemies (OBJECTIVE bit) count toward the zone-clear
+                // gate (#27); freeform ones don't. `flags` rides the `SceneInstance`.
+                if inst.flags & flags::OBJECTIVE != 0 {
+                    ec.insert(flags::Objective);
+                }
+                // Level-objective enemies (LEVEL_OBJECTIVE bit) roll up to the
+                // level exit instead of a zone gate (#27 tier 2).
+                if inst.flags & flags::LEVEL_OBJECTIVE != 0 {
+                    ec.insert(flags::LevelObjectiveTag);
+                }
             }
             "landmark" => {
                 landmarks.0.push(pos.0);
@@ -646,16 +968,62 @@ fn specialize_scene(
     }
 }
 
+/// Mirror every resident enemy's live runtime state (capture + position + patrol)
+/// into [`ZoneCaptureState`], so a zone that despawns on a crossing and respawns
+/// later resumes each enemy exactly (#27 persistence). Covers active *and*
+/// neighbour enemies. Position is de-offset to the zone's **local** frame so it's
+/// valid regardless of how the zone later reloads.
+fn mirror_capture(
+    mut snapshot: ResMut<ZoneCaptureState>,
+    q: Query<(&ZoneMember, &capture::Capture, &WorldPos, &Enemy)>,
+) {
+    for (member, cap, pos, enemy) in &q {
+        let local = (
+            pos.0.x.to_f32() - member.offset.0,
+            pos.0.y.to_f32() - member.offset.1,
+        );
+        snapshot.save(
+            member,
+            EnemyState {
+                progress: cap.progress,
+                resolved: cap.resolved,
+                local,
+                wp: enemy.wp,
+                pause: enemy.pause,
+            },
+        );
+    }
+}
+
 // --- Enemy reset -------------------------------------------------------------
 
-/// START re-arms every enemy (clear resolution + progress, back to its patrol
-/// start), so the capture loop is replayable.
+/// START replays the run: drop all progress and **reload the current zone**, so
+/// every enemy — including ones skipped-at-spawn because they were captured —
+/// comes back un-armed at its patrol start. The persistent avatar stays put.
+#[allow(clippy::too_many_arguments)]
 fn reset_enemy(
     input: Res<ButtonInput<DsButton>>,
     mut pending: ResMut<menu::PendingReset>,
     mut tally: ResMut<capture::CaptureTally>,
     mut health: ResMut<Health>,
-    mut q: Query<(&mut Enemy, &mut capture::Capture, &mut WorldPos, &ScenePath)>,
+    mut flags: ResMut<flags::Flags>,
+    mut level: ResMut<flags::LevelProgress>,
+    mut snapshot: ResMut<ZoneCaptureState>,
+    mut commands: Commands,
+    mut zone: ResMut<Zone>,
+    mut device: ResMut<Device>,
+    mut stroke: ResMut<Stroke>,
+    mut loco: ResMut<Locomotion>,
+    mut landmarks: ResMut<Landmarks>,
+    despawnable: Query<
+        Entity,
+        Or<(
+            With<SceneInstance>,
+            With<SpaceFloor>,
+            With<NeighbourInstance>,
+            With<GateBarrier>,
+        )>,
+    >,
 ) {
     // START, or the options-menu Reset item (which closes the menu and latches
     // this so the reset runs here, in the Playing-gated chain).
@@ -665,15 +1033,23 @@ fn reset_enemy(
     pending.0 = false;
     *tally = capture::CaptureTally::default();
     *health = Health::default();
-    for (mut enemy, mut cap, mut pos, path) in &mut q {
-        cap.progress = 0.0;
-        cap.resolved = None;
-        enemy.wp = 1;
-        enemy.pause = 0;
-        if let Some(start) = path.0.first() {
-            pos.0 = FxVec2::from_f32(start.x, start.y);
-        }
-    }
+    // Drop raised flags + level progress so gated arenas re-lock and the level
+    // objective resets, and clear the capture snapshot so the reload respawns
+    // every enemy un-captured. Then rebuild the current zone from its `.scene`.
+    flags.clear();
+    level.reset();
+    snapshot.0.clear();
+    transition::reload_zone(
+        &snapshot,
+        &flags,
+        &mut zone,
+        &mut commands,
+        &mut device,
+        &mut stroke,
+        &mut loco,
+        &mut landmarks,
+        &despawnable,
+    );
 }
 
 /// The enemy lobs a projectile at the avatar while deployed (the dodge threat),
@@ -685,7 +1061,10 @@ fn fire_projectile(
     mut fire: ResMut<EnemyFire>,
     mut was_deployed: Local<bool>,
     avatar: Query<&WorldPos, With<Avatar>>,
-    enemy: Query<(&WorldPos, &capture::Capture), With<Enemy>>,
+    // Only the *active* zone's enemies shoot — a resident neighbour (across the
+    // seam) patrols + is capturable but doesn't fire until you enter its zone
+    // (#27 follow-up); also avoids firing from an arbitrary off-screen neighbour.
+    enemy: Query<(&WorldPos, &capture::Capture), (With<Enemy>, Without<NeighbourInstance>)>,
     mut proj: Query<(&mut Projectile, &mut WorldPos), (Without<Avatar>, Without<Enemy>)>,
 ) {
     fire.cd = fire.cd.saturating_sub(1);
@@ -763,11 +1142,20 @@ fn move_projectile(
 /// once captured).
 fn patrol_enemy(
     time: Res<Time>,
-    mut q: Query<(&mut Enemy, &capture::Capture, &mut WorldPos, &ScenePath)>,
+    avatar: Query<&WorldPos, With<Avatar>>,
+    mut q: Query<(&mut Enemy, &capture::Capture, &mut WorldPos, &ScenePath), Without<Avatar>>,
 ) {
     let step = Fx32::from_f32(ENEMY_SPEED * time.delta_secs());
+    let apos = avatar.iter().next().map(|w| w.0);
+    let range = Fx32::from_f32(PROCESS_RANGE);
     for (mut enemy, cap, mut pos, path) in &mut q {
         if cap.is_resolved() || path.0.is_empty() {
+            continue;
+        }
+        // Process-range cull (#27 follow-up): a resident-neighbour enemy deep in
+        // its zone (off-screen behind the fog) freezes rather than ticking. Active
+        // enemies sit near the avatar, so they always run.
+        if apos.is_some_and(|a| (pos.0 - a).length() > range) {
             continue;
         }
         if enemy.pause > 0 {
@@ -1136,29 +1524,131 @@ fn sync_map_markers(
     }
 }
 
-/// Trail dots along the densified stroke (deployed + drawing); parked otherwise.
-fn update_trail(
-    state: Res<PlayerState>,
-    stroke: Res<Stroke>,
-    mut dots: Query<&mut Sprite, With<PathDot>>,
-) {
-    let line = if state.is_deployed() {
-        densify(
-            &path_smooth(&stroke.0),
-            Fx32::from_f32(TRAIL_STEP),
-            DOT_POOL,
-        )
-    } else {
-        Vec::new()
-    };
-    for (i, mut sprite) in dots.iter_mut().enumerate() {
-        if let Some(p) = line.get(i) {
-            sprite.x = p.x.to_f32() as i16 - 4;
-            sprite.y = p.y.to_f32() as i16 - 4;
-        } else {
-            sprite.y = PARK_Y;
+/// Enable the sub-engine paint canvas (issue #35) — the bitmap BG the capture
+/// stroke is painted into. Requested at Startup; `bevy_nds_bg` brings it up on
+/// the next frame.
+fn enable_paint_canvas(mut bgs: ResMut<Backgrounds>) {
+    bgs.enable_paint_canvas();
+}
+
+/// The painted-stroke coverage buffer + colour LUT (#35). `cov` is a
+/// `WIDTH × VISIBLE_HEIGHT` byte-per-pixel canvas the glow is rasterized into
+/// (max-combining overlaps); `palette` maps coverage → 16bpp colour, precomputed
+/// once so the per-frame blit is a plain table lookup in the optimised bg crate.
+/// `painted` is how many stroke points have already been stamped — the cursor
+/// for **incremental** painting (only the new tail is drawn each frame).
+#[derive(Resource)]
+struct GlowBuffer {
+    cov: Vec<u8>,
+    palette: [u16; 256],
+    painted: usize,
+}
+
+impl Default for GlowBuffer {
+    fn default() -> Self {
+        let mut palette = [0u16; 256];
+        for (i, slot) in palette.iter_mut().enumerate() {
+            *slot = stroke_color(i as u8);
+        }
+        Self {
+            cov: alloc::vec![0u8; PaintCanvas::WIDTH * PaintCanvas::VISIBLE_HEIGHT],
+            palette,
+            painted: 0,
         }
     }
+}
+
+/// Map a stroke pixel's coverage (`0..=255`) to a 16bpp colour. The bitmap BG
+/// has only a 1-bit alpha, so coverage becomes **brightness**: a bright cyan
+/// scaled by coverage over the dark tactical backdrop. The glow's feathered
+/// falloff thus reads as a halo (bright core → dim edge). `0` is transparent so
+/// the rest of the tactical surface shows through. Called once per coverage
+/// level at startup to fill [`GlowBuffer::palette`].
+fn stroke_color(cov: u8) -> u16 {
+    if cov == 0 {
+        return 0; // transparent (alpha bit clear)
+    }
+    let c = cov as u32;
+    // Base cyan (5-bit BGR channels), intensity-scaled by coverage.
+    let r = (10 * c / 255) as u16;
+    let g = (31 * c / 255) as u16;
+    let b = (31 * c / 255) as u16;
+    0x8000 | (b << 10) | (g << 5) | r
+}
+
+/// Paint the capture stroke into the sub-engine bitmap canvas as a glowing line
+/// (issue #35), replacing the old OAM dot-trail. The canvas is half
+/// touch-resolution (hardware-magnified 2×), so touch pixels map to canvas space
+/// by halving; the *capture* math still runs full-res on the raw stroke.
+///
+/// **Incremental**: the stroke only appends points, and the glow's max-combine
+/// never needs un-drawing, so each frame stamps only the *new* tail into the
+/// persistent canvas and blits just its bounding box. The whole canvas is wiped
+/// only when the stroke resets (pen up / stow / a fresh loop). The game already
+/// runs at the vblank budget, so a full-stroke repaint each frame would drop it
+/// to 30 fps; this keeps the per-frame cost proportional to the ~1–2 points a
+/// frame actually adds.
+fn paint_stroke(
+    state: Res<PlayerState>,
+    stroke: Res<Stroke>,
+    mut bgs: ResMut<Backgrounds>,
+    mut glow: ResMut<GlowBuffer>,
+) {
+    let Some(mut canvas) = bgs.paint() else {
+        return;
+    };
+    let n = stroke.0.len();
+    let drawing = state.is_deployed() && n >= 1;
+
+    // Reset: the stroke was cleared, shrank, or the device stowed. Wipe the
+    // whole canvas once, then fall through to (re)paint from scratch if drawing.
+    if !drawing || n < glow.painted {
+        if glow.painted != 0 {
+            glow.cov.fill(0);
+            canvas.blit_coverage(&glow.cov, &glow.palette);
+            glow.painted = 0;
+        }
+        if !drawing {
+            return;
+        }
+    }
+
+    // Nothing new this frame — the common case, and free.
+    if n == glow.painted {
+        return;
+    }
+
+    // Stamp only the new tail, including the last already-painted point so the
+    // new segment connects to what's there. Touch pixels → canvas (½ res).
+    let start = glow.painted.saturating_sub(1);
+    let half = Fx32::from_f32(0.5);
+    let seg: Vec<FxVec2> = stroke.0[start..n].iter().map(|&p| p * half).collect();
+
+    // Bounding box of the new segment (+ glow radius), for the incremental blit.
+    let (mut x0, mut y0, mut x1, mut y1) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
+    for p in &seg {
+        let (x, y) = (p.x.raw() >> 12, p.y.raw() >> 12);
+        x0 = x0.min(x);
+        y0 = y0.min(y);
+        x1 = x1.max(x);
+        y1 = y1.max(y);
+    }
+    let r = GLOW_RADIUS + 1;
+    let x0 = (x0 - r).max(0) as usize;
+    let y0 = (y0 - r).max(0) as usize;
+    let x1 = (x1 + r).max(0) as usize;
+    let y1 = (y1 + r).max(0) as usize;
+
+    paint_glow(
+        &mut glow.cov,
+        PaintCanvas::WIDTH,
+        PaintCanvas::VISIBLE_HEIGHT,
+        &seg,
+        GLOW_CORE,
+        GLOW_RADIUS,
+    );
+    canvas.blit_coverage_rect(&glow.cov, &glow.palette, x0, y0, x1, y1);
+    glow.painted = n;
 }
 
 /// Draw the radial-wheel placeholder overlay while it's open (#25): the 5 spoke
@@ -1223,6 +1713,9 @@ fn update_hud(
     health: Res<Health>,
     tally: Res<capture::CaptureTally>,
     radial: Res<radial::Radial>,
+    zone: Res<Zone>,
+    flags: Res<flags::Flags>,
+    level: Res<flags::LevelProgress>,
     caps: Query<&capture::Capture>,
     mut hud: Query<(&mut DsText, Has<InfoHud>), Or<(With<InfoHud>, With<TallyHud>)>>,
 ) {
@@ -1231,12 +1724,32 @@ fn update_hud(
     for (mut text, is_status) in &mut hud {
         text.0.clear();
         if !is_status {
-            // The tally line: health + how the two exits have played out (#32).
+            // The tally line: health + how the two exits have played out (#32),
+            // plus the compact progression state — zone gate + level exit — kept
+            // within the 32-col console grid.
             let _ = write!(
                 text.0,
-                "hp {}/{}  lib {}  des {}",
+                "hp {}/{} lib {} des {}",
                 health.hp, health.max, tally.liberated, tally.destroyed
             );
+            // Zone-gate hint (#27 tier 1): whether this zone's arena-trap gate is
+            // open yet (`g:LK`/`g:OP`).
+            if let Some(gate) = zone.conns.iter().map(|c| c.gate).find(|&g| g != 0) {
+                let _ = write!(
+                    text.0,
+                    " g:{}",
+                    if flags.is_raised(gate) { "OP" } else { "LK" }
+                );
+            }
+            // Level-objective hint (#27 tier 2): progress toward the level exit,
+            // or `EXIT` once the level objective is met.
+            if level.needed > 0 {
+                if level.complete() {
+                    let _ = write!(text.0, " EXIT");
+                } else {
+                    let _ = write!(text.0, " lv{}/{}", level.done(), level.needed);
+                }
+            }
             continue;
         }
         // While the wheel is open, the status line previews the spoke under the
