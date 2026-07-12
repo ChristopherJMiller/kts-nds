@@ -13,10 +13,16 @@ Level(
     name: "Facility",
     entry: "atrium",
     zones: {
+        // The atrium is an "arena trap" (#27): clearing its objective enemy
+        // raises flag 1, which unlocks the east exit toward the corridor. The
+        // patroller is marked objective in atrium.ron (`flags: Some(1)`). The
+        // return crossing (corridor -> atrium) is ungated, so you can retreat.
         "atrium": (
             place: (0.0, 0.0),
             bounds: (min: (-2.0, -2.0), max: (2.0, 2.0)),
             camera: Follow(height: 1.7, dist: 2.0, pitch: -0.7),
+            clear_flag: 1,
+            gates: [Gate(neighbour: "corridor", flag: 1)],
         ),
         "corridor": (
             place: (4.2, 0.0),

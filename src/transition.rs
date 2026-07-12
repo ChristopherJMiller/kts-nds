@@ -51,8 +51,17 @@ pub struct Zone {
     /// Set once at boot (intra-level streaming keeps it constant; a level-exit
     /// seam that changes it is deferred — see #27).
     pub level: String,
+    /// The **current** zone's own stem (e.g. `"atrium"`). Set at boot from the
+    /// entry zone and on each crossing from the neighbour's stem; used as the
+    /// stable per-zone key for level-objective completion
+    /// ([`crate::flags::tally_level_objective`]).
+    pub stem: String,
     /// `[min_x, min_z, max_x, max_z]` in local coords.
     pub bounds: [f32; 4],
+    /// The flag this zone raises when its objective enemies are all resolved
+    /// (#27, the zone-clear source); `0` ⇒ freeform. Read by
+    /// [`crate::flags::clear_zone`].
+    pub clear_flag: u32,
     /// Derived connections to neighbouring zones.
     pub conns: Vec<SceneConnData>,
 }
@@ -63,7 +72,9 @@ impl Default for Zone {
         // never traps the avatar at the origin).
         Self {
             level: String::new(),
+            stem: String::new(),
             bounds: [-1.0e6, -1.0e6, 1.0e6, 1.0e6],
+            clear_flag: 0,
             conns: Vec::new(),
         }
     }
@@ -74,6 +85,7 @@ impl Zone {
     /// across an intra-level swap, so it's left untouched).
     pub fn set(&mut self, scene: &SceneData) {
         self.bounds = scene.bounds;
+        self.clear_flag = scene.clear_flag;
         self.conns = scene.connections.clone();
     }
 }
@@ -113,6 +125,8 @@ fn at_edge(px: f32, pz: f32, bounds: &[f32; 4], c: &SceneConnData) -> bool {
 #[allow(clippy::too_many_arguments)]
 pub fn transition_spaces(
     state: Res<PlayerState>,
+    flags: Res<crate::flags::Flags>,
+    snapshot: Res<crate::ZoneCaptureState>,
     mut avatar: Query<&mut WorldPos, With<Avatar>>,
     mut tr: ResMut<Transition>,
     mut zone: ResMut<Zone>,
@@ -123,9 +137,17 @@ pub fn transition_spaces(
     mut stroke: ResMut<Stroke>,
     mut loco: ResMut<Locomotion>,
     mut landmarks: ResMut<Landmarks>,
-    instances: Query<Entity, With<SceneInstance>>,
-    floors: Query<Entity, With<SpaceFloor>>,
-    neighbours: Query<Entity, With<NeighbourInstance>>,
+    // One query over every kind of per-zone entity the crossing tears down
+    // (kept as a single param — a function system caps at 16 params).
+    despawnable: Query<
+        Entity,
+        Or<(
+            With<SceneInstance>,
+            With<SpaceFloor>,
+            With<NeighbourInstance>,
+            With<crate::GateBarrier>,
+        )>,
+    >,
 ) {
     if state.is_deployed() {
         return;
@@ -147,8 +169,10 @@ pub fn transition_spaces(
     for c in &zone.conns {
         if at_edge(px, pz, &bounds, c) {
             clear = false;
-            // gate 0 = always open; gated boundaries wait for objectives (#26).
-            if c.gate == 0 && crossing.is_none() {
+            // A connection's `gate` is a required-flag id (#27): `0` is always
+            // open; a nonzero gate opens once that flag is raised (e.g. the
+            // zone-clear "arena trap" flag). Consumer side of the `Flags` model.
+            if flags.is_raised(c.gate) && crossing.is_none() {
                 crossing = Some(c.clone());
             }
         }
@@ -180,15 +204,16 @@ pub fn transition_spaces(
     let path = level_space_path(&zone.level, &c.neighbour);
     swap_zone(
         &path,
+        &c.neighbour,
+        &snapshot,
+        &flags,
         &mut zone,
         &mut commands,
         &mut device,
         &mut stroke,
         &mut loco,
         &mut landmarks,
-        &instances,
-        &floors,
-        &neighbours,
+        &despawnable,
     );
 
     // The avatar is the single persistent entity — carry it across by the delta
@@ -218,17 +243,68 @@ pub fn transition_spaces(
 /// chrome (shadow, cursor, projectile, trail-dot pool, HUD) carry no
 /// [`SceneInstance`]/[`SpaceFloor`]/[`NeighbourInstance`], so they survive.
 #[allow(clippy::too_many_arguments)]
-fn swap_zone(
-    path: &[u8],
+/// Rebuild the **current** zone in place (START reset): reload it from its
+/// `.scene`, so enemies skipped-at-spawn because they were captured come back
+/// un-armed once the caller has cleared the [`crate::ZoneCaptureState`] snapshot.
+/// The persistent avatar is never respawned, so it stays exactly where it is.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn reload_zone(
+    snapshot: &crate::ZoneCaptureState,
+    flags: &crate::flags::Flags,
     zone: &mut Zone,
     commands: &mut Commands,
     device: &mut Device,
     stroke: &mut Stroke,
     loco: &mut Locomotion,
     landmarks: &mut Landmarks,
-    instances: &Query<Entity, With<SceneInstance>>,
-    floors: &Query<Entity, With<SpaceFloor>>,
-    neighbours: &Query<Entity, With<NeighbourInstance>>,
+    despawnable: &Query<
+        Entity,
+        Or<(
+            With<SceneInstance>,
+            With<SpaceFloor>,
+            With<NeighbourInstance>,
+            With<crate::GateBarrier>,
+        )>,
+    >,
+) {
+    let path = level_space_path(&zone.level, &zone.stem);
+    let stem = zone.stem.clone();
+    swap_zone(
+        &path,
+        &stem,
+        snapshot,
+        flags,
+        zone,
+        commands,
+        device,
+        stroke,
+        loco,
+        landmarks,
+        despawnable,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn swap_zone(
+    path: &[u8],
+    stem: &str,
+    snapshot: &crate::ZoneCaptureState,
+    flags: &crate::flags::Flags,
+    zone: &mut Zone,
+    commands: &mut Commands,
+    device: &mut Device,
+    stroke: &mut Stroke,
+    loco: &mut Locomotion,
+    landmarks: &mut Landmarks,
+    despawnable: &Query<
+        Entity,
+        Or<(
+            With<SceneInstance>,
+            With<SpaceFloor>,
+            With<NeighbourInstance>,
+            With<crate::GateBarrier>,
+        )>,
+    >,
 ) {
     // Load the neighbour first — if it fails, bail without tearing down the zone
     // we're standing in (no blank screen).
@@ -242,20 +318,16 @@ fn swap_zone(
     scene.instances.retain(|i| i.role != "avatar");
 
     // Despawn the old active zone's instances, the previous resident neighbours,
-    // and all floors (the persistent avatar + chrome carry none of these markers,
-    // so they survive).
-    for e in instances
-        .iter()
-        .chain(neighbours.iter())
-        .chain(floors.iter())
-    {
+    // all floors, and the old gate barriers (the persistent avatar + chrome carry
+    // none of these markers, so they survive).
+    for e in despawnable.iter() {
         commands.entity(e).despawn();
     }
     spawn_zone_floor(commands, scene.bounds, (0.0, 0.0)); // active floor (sized to bounds)
 
-    // Per-zone state that mustn't carry over. (Capture progress is per-enemy
-    // now — the old zone's enemies are despawned above, the new zone's spawn
-    // with a fresh `Capture` — so only the device cooldown needs clearing.)
+    // Per-zone state that mustn't carry over. (Capture progress persists per-enemy
+    // via the `ZoneCaptureState` snapshot — restored inline when the new zone's
+    // enemies spawn — so only the device cooldown needs clearing here.)
     landmarks.0.clear(); // `specialize_scene` re-harvests the new zone's set
     stroke.0.clear();
     device.hit_cd = 0;
@@ -263,8 +335,11 @@ fn swap_zone(
     // Movement feel + walkable bounds follow the new zone.
     *loco = Locomotion::for_camera(scene.camera);
     zone.set(&scene);
+    zone.stem.clear();
+    zone.stem.push_str(stem); // the new active zone's stable key
+    crate::spawn_gate_barriers(commands, zone, flags); // walls at the new zone's locked edges
 
     bevy_nds_scene::spawn(commands, scene); // new active zone (minus the avatar)
     // …and its neighbours become resident (render-only, fogged) in turn.
-    spawn_resident_neighbours(commands, zone);
+    spawn_resident_neighbours(commands, zone, snapshot);
 }
