@@ -142,7 +142,6 @@ pub const fn poly_id(n: u32) -> u32 {
     (n & 0x3F) << 24
 }
 
-
 /// Pack a 0-255-per-channel RGB colour into the DS 15-bit `RGB15` format (5 bits
 /// per channel), used by light and material colour registers.
 pub const fn rgb15(r: u8, g: u8, b: u8) -> u32 {

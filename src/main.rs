@@ -43,7 +43,8 @@ use bevy_app::prelude::*;
 use bevy_ecs::prelude::*;
 use bevy_nds::prelude::*;
 use bevy_nds_3d::prelude::*;
-use bevy_nds_loop::{densify, smooth as path_smooth};
+use bevy_nds_bg::prelude::*;
+use bevy_nds_loop::paint_glow;
 use bevy_nds_math::{Fx32, FxVec2};
 use bevy_nds_scene::{CameraMode, LoadedScene, SceneInstance, ScenePath};
 use bevy_nds_sprite::prelude::*;
@@ -152,9 +153,13 @@ const RADIAL_HOVER_POP: f32 = 8.0; // extra px the hovered spoke pops outward
 
 const MIN_SPACING: f32 = 4.0;
 const MAX_POINTS: usize = 80;
-const DOT_POOL: usize = 90;
-const TRAIL_STEP: f32 = 4.0;
 const CLOSE_TOL: f32 = 2.0;
+
+/// Painted-stroke glow brush (#35), in **canvas** pixels (½ touch-res). A small
+/// flat-bright core wrapped in a feathered halo — the feather is what dissolves
+/// the 2×-upscale aliasing into a glow. `GLOW_RADIUS` px ≈ `2×` on screen.
+const GLOW_CORE: i32 = 1;
+const GLOW_RADIUS: i32 = 4;
 
 /// World XY → tactical-map screen pixels. The map matches the top screen's
 /// orientation 1:1 for the fixed capture framing (camera at +Z looking −Z):
@@ -373,9 +378,6 @@ struct Projectile {
 #[derive(Component, Clone, Copy)]
 struct WorldPos(FxVec2);
 
-#[derive(Component)]
-struct PathDot;
-
 /// A radial-wheel spoke icon (index 0 = device/up). A placeholder OAM sprite,
 /// laid out around the wheel origin while the wheel is open (#25).
 #[derive(Component)]
@@ -398,6 +400,7 @@ pub extern "C" fn main() -> core::ffi::c_int {
     app.add_plugins(DsPlugins)
         .add_plugins(Ds3dPlugin)
         .add_plugins(SpritePlugin)
+        .add_plugins(BackgroundPlugin)
         .add_plugins(menu::MenuPlugin)
         .add_plugins(SpikePlugin);
     bevy_nds::run(app)
@@ -426,8 +429,9 @@ impl Plugin for SpikePlugin {
         .init_resource::<capture::CaptureTally>()
         .init_resource::<radial::Radial>()
         .init_resource::<Health>()
+        .init_resource::<GlowBuffer>()
         .add_event::<capture::CaptureResolved>()
-        .add_systems(Startup, setup)
+        .add_systems(Startup, (setup, enable_paint_canvas))
         .add_systems(
             Update,
             (
@@ -462,7 +466,7 @@ impl Plugin for SpikePlugin {
                     sync_3d,
                     update_cursor,
                     sync_map_markers,
-                    update_trail,
+                    paint_stroke,
                     update_radial_overlay,
                     update_hud,
                 )
@@ -560,11 +564,6 @@ fn setup(mut commands: Commands, mut camera: ResMut<Camera3d>, mut zone: ResMut<
         },
         Hidden,
     ));
-
-    // Trail-dot pool (map), parked.
-    for _ in 0..DOT_POOL {
-        commands.spawn((PathDot, Sprite::new(sprites::DOT).at(0, PARK_Y)));
-    }
 
     // Radial-wheel overlay (#25): 5 spoke icons + a pointer line of dots, parked
     // off-screen until the wheel opens. Placeholder art — OBSTACLE for the spokes,
@@ -1136,29 +1135,131 @@ fn sync_map_markers(
     }
 }
 
-/// Trail dots along the densified stroke (deployed + drawing); parked otherwise.
-fn update_trail(
-    state: Res<PlayerState>,
-    stroke: Res<Stroke>,
-    mut dots: Query<&mut Sprite, With<PathDot>>,
-) {
-    let line = if state.is_deployed() {
-        densify(
-            &path_smooth(&stroke.0),
-            Fx32::from_f32(TRAIL_STEP),
-            DOT_POOL,
-        )
-    } else {
-        Vec::new()
-    };
-    for (i, mut sprite) in dots.iter_mut().enumerate() {
-        if let Some(p) = line.get(i) {
-            sprite.x = p.x.to_f32() as i16 - 4;
-            sprite.y = p.y.to_f32() as i16 - 4;
-        } else {
-            sprite.y = PARK_Y;
+/// Enable the sub-engine paint canvas (issue #35) — the bitmap BG the capture
+/// stroke is painted into. Requested at Startup; `bevy_nds_bg` brings it up on
+/// the next frame.
+fn enable_paint_canvas(mut bgs: ResMut<Backgrounds>) {
+    bgs.enable_paint_canvas();
+}
+
+/// The painted-stroke coverage buffer + colour LUT (#35). `cov` is a
+/// `WIDTH × VISIBLE_HEIGHT` byte-per-pixel canvas the glow is rasterized into
+/// (max-combining overlaps); `palette` maps coverage → 16bpp colour, precomputed
+/// once so the per-frame blit is a plain table lookup in the optimised bg crate.
+/// `painted` is how many stroke points have already been stamped — the cursor
+/// for **incremental** painting (only the new tail is drawn each frame).
+#[derive(Resource)]
+struct GlowBuffer {
+    cov: Vec<u8>,
+    palette: [u16; 256],
+    painted: usize,
+}
+
+impl Default for GlowBuffer {
+    fn default() -> Self {
+        let mut palette = [0u16; 256];
+        for (i, slot) in palette.iter_mut().enumerate() {
+            *slot = stroke_color(i as u8);
+        }
+        Self {
+            cov: alloc::vec![0u8; PaintCanvas::WIDTH * PaintCanvas::VISIBLE_HEIGHT],
+            palette,
+            painted: 0,
         }
     }
+}
+
+/// Map a stroke pixel's coverage (`0..=255`) to a 16bpp colour. The bitmap BG
+/// has only a 1-bit alpha, so coverage becomes **brightness**: a bright cyan
+/// scaled by coverage over the dark tactical backdrop. The glow's feathered
+/// falloff thus reads as a halo (bright core → dim edge). `0` is transparent so
+/// the rest of the tactical surface shows through. Called once per coverage
+/// level at startup to fill [`GlowBuffer::palette`].
+fn stroke_color(cov: u8) -> u16 {
+    if cov == 0 {
+        return 0; // transparent (alpha bit clear)
+    }
+    let c = cov as u32;
+    // Base cyan (5-bit BGR channels), intensity-scaled by coverage.
+    let r = (10 * c / 255) as u16;
+    let g = (31 * c / 255) as u16;
+    let b = (31 * c / 255) as u16;
+    0x8000 | (b << 10) | (g << 5) | r
+}
+
+/// Paint the capture stroke into the sub-engine bitmap canvas as a glowing line
+/// (issue #35), replacing the old OAM dot-trail. The canvas is half
+/// touch-resolution (hardware-magnified 2×), so touch pixels map to canvas space
+/// by halving; the *capture* math still runs full-res on the raw stroke.
+///
+/// **Incremental**: the stroke only appends points, and the glow's max-combine
+/// never needs un-drawing, so each frame stamps only the *new* tail into the
+/// persistent canvas and blits just its bounding box. The whole canvas is wiped
+/// only when the stroke resets (pen up / stow / a fresh loop). The game already
+/// runs at the vblank budget, so a full-stroke repaint each frame would drop it
+/// to 30 fps; this keeps the per-frame cost proportional to the ~1–2 points a
+/// frame actually adds.
+fn paint_stroke(
+    state: Res<PlayerState>,
+    stroke: Res<Stroke>,
+    mut bgs: ResMut<Backgrounds>,
+    mut glow: ResMut<GlowBuffer>,
+) {
+    let Some(mut canvas) = bgs.paint() else {
+        return;
+    };
+    let n = stroke.0.len();
+    let drawing = state.is_deployed() && n >= 1;
+
+    // Reset: the stroke was cleared, shrank, or the device stowed. Wipe the
+    // whole canvas once, then fall through to (re)paint from scratch if drawing.
+    if !drawing || n < glow.painted {
+        if glow.painted != 0 {
+            glow.cov.fill(0);
+            canvas.blit_coverage(&glow.cov, &glow.palette);
+            glow.painted = 0;
+        }
+        if !drawing {
+            return;
+        }
+    }
+
+    // Nothing new this frame — the common case, and free.
+    if n == glow.painted {
+        return;
+    }
+
+    // Stamp only the new tail, including the last already-painted point so the
+    // new segment connects to what's there. Touch pixels → canvas (½ res).
+    let start = glow.painted.saturating_sub(1);
+    let half = Fx32::from_f32(0.5);
+    let seg: Vec<FxVec2> = stroke.0[start..n].iter().map(|&p| p * half).collect();
+
+    // Bounding box of the new segment (+ glow radius), for the incremental blit.
+    let (mut x0, mut y0, mut x1, mut y1) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
+    for p in &seg {
+        let (x, y) = (p.x.raw() >> 12, p.y.raw() >> 12);
+        x0 = x0.min(x);
+        y0 = y0.min(y);
+        x1 = x1.max(x);
+        y1 = y1.max(y);
+    }
+    let r = GLOW_RADIUS + 1;
+    let x0 = (x0 - r).max(0) as usize;
+    let y0 = (y0 - r).max(0) as usize;
+    let x1 = (x1 + r).max(0) as usize;
+    let y1 = (y1 + r).max(0) as usize;
+
+    paint_glow(
+        &mut glow.cov,
+        PaintCanvas::WIDTH,
+        PaintCanvas::VISIBLE_HEIGHT,
+        &seg,
+        GLOW_CORE,
+        GLOW_RADIUS,
+    );
+    canvas.blit_coverage_rect(&glow.cov, &glow.palette, x0, y0, x1, y1);
+    glow.painted = n;
 }
 
 /// Draw the radial-wheel placeholder overlay while it's open (#25): the 5 spoke

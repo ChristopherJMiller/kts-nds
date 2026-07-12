@@ -27,6 +27,12 @@ pub const BG_SIZE_T_256X256: c_int = (0 << 14) | (1 << 16);
 /// `BgSize_B16_256x256` (16-bit bitmap, 256x256 = 128 KiB).
 pub const BG_SIZE_B16_256X256: c_int = (1 << 14) | (1 << 7) | (1 << 2) | (4 << 16);
 
+/// `BgSize_B16_128x128` (16-bit bitmap, 128x128 = 32 KiB). The sub-engine paint
+/// canvas: 32 KiB fits in VRAM_C's free low region below the text console
+/// (whose map/tiles sit at 44/48 KiB), where a 128 KiB 256×256 bitmap can't.
+/// Same encoding as [`BG_SIZE_B16_256X256`] minus the `(1 << 14)` size bit.
+pub const BG_SIZE_B16_128X128: c_int = (1 << 7) | (1 << 2) | (4 << 16);
+
 // --- BG palette addresses (see <nds/arm9/background.h>) ----------------------
 
 /// Main-engine BG palette (256 × u16 at `0x05000000`).
@@ -91,6 +97,16 @@ unsafe extern "C" {
     /// with `(x << 8, y << 8)`. We do the shift on the Rust side.
     pub fn bgSetScrollf(id: c_int, x: i32, y: i32);
 
+    /// `bgSetScale(id, sx, sy)` — set the affine scale of a rot/ext-rotation
+    /// background (24.8 fixed-point). `1 << 8` (256) is 1:1; **`128` (0.5)
+    /// magnifies 2×** — how the 128×128 paint canvas fills the 256×192 screen.
+    pub fn bgSetScale(id: c_int, sx: i32, sy: i32);
+
+    /// `bgSetCenterf(id, x, y)` — the rot/scale reference point (24.8). Anchored
+    /// at `(0, 0)` so screen-(0,0) samples texture-(0,0) and the 2× upscale is
+    /// top-left aligned with the tactical map.
+    pub fn bgSetCenterf(id: c_int, x: i32, y: i32);
+
     /// `bgUpdate()` — flush BG control + scroll shadow state to the hardware
     /// registers. Must run once per frame after any `bgSetScroll*` or
     /// [`show_bg`] / [`hide_bg`] call.
@@ -145,6 +161,22 @@ pub enum BgEngine {
 /// Touches `REG_DISPCNT`; must run on the DS.
 pub unsafe fn set_main_video_mode_5() {
     unsafe { write_volatile(REG_DISPCNT, MODE_5_2D) };
+}
+
+/// Switch the **sub** engine into video mode 5 so its extended BG2 (the paint
+/// canvas bitmap) is available, **preserving** the bits the text console already
+/// set. `consoleDemoInit` left the sub engine in mode 0 with BG0 (the console)
+/// active; we rewrite only the 3-bit video-mode field (bits 0..2) to 5, so BG0
+/// stays a text layer and keeps rendering. (Unlike the main-engine helper, which
+/// can clobber the whole register because 3D re-owns it anyway.)
+///
+/// # Safety
+/// Touches `REG_DISPCNT_SUB`; must run on the DS, after the sub console is up.
+pub unsafe fn set_sub_video_mode_5() {
+    unsafe {
+        let cur = core::ptr::read_volatile(REG_DISPCNT_SUB);
+        write_volatile(REG_DISPCNT_SUB, (cur & !0x7) | 5);
+    }
 }
 
 /// Map VRAM bank B (128 KiB) to the main engine's BG memory at 0x06020000,

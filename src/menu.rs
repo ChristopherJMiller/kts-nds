@@ -182,12 +182,7 @@ fn menu_input(
 }
 
 /// Apply the effect of the item at `idx`.
-fn activate(
-    idx: usize,
-    settings: &mut Settings,
-    mode: &mut GameMode,
-    pending: &mut PendingReset,
-) {
+fn activate(idx: usize, settings: &mut Settings, mode: &mut GameMode, pending: &mut PendingReset) {
     match ITEMS[idx] {
         MenuItem::EdgeMarking => settings.edge_marking = !settings.edge_marking,
         MenuItem::Handedness => {
