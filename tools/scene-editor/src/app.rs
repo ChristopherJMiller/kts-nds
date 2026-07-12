@@ -285,6 +285,8 @@ impl EditorApp {
                 place: [self.view.center.x, self.view.center.y],
                 bounds: scene2bin::Bounds::default(),
                 camera: Camera::default(),
+                clear_flag: 0,
+                gates: Vec::new(),
             },
         );
         self.contents.insert(

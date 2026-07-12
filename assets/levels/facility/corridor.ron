@@ -7,8 +7,10 @@
 // authors no avatar; the player carries in from the atrium.
 Zone(instances: [
     // A lone patroller pacing the corridor along X (a light threat on the rest
-    // beat). path[0] == spawn.
-    Use(name: "patroller", pos: (1.6, 0.0, 0.0), path: [(1.6, 0.0), (0.4, 0.0)]),
+    // beat). Freeform — marked LEVEL_OBJECTIVE (`flags: Some(2)`): it doesn't gate
+    // this zone, it contributes to the *level* objective that opens the level exit
+    // (#27 tier 2). path[0] == spawn.
+    Use(name: "patroller", pos: (1.6, 0.0, 0.0), flags: Some(2), path: [(1.6, 0.0), (0.4, 0.0)]),
     // Walls / props lining the rail.
     Use(name: "landmark_block", pos: (-0.8, 0.0, -0.5)),
     Use(name: "landmark_block", pos: (0.6, 0.0, -0.5), rot: Some((0.0, 0.3, 0.0))),
