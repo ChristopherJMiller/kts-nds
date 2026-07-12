@@ -71,7 +71,7 @@ pub struct Space {
 }
 
 /// A rectangle on the ground (XZ) plane, in a zone's **local** coordinates.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Bounds {
     pub min: [f32; 2],
     pub max: [f32; 2],
@@ -88,7 +88,7 @@ impl Default for Bounds {
 
 /// Per-space authored camera. Variant order is the wire enum (#27); extend at
 /// the end to keep the encoding stable.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum Camera {
     Follow { height: f32, dist: f32, pitch: f32 },
     TopDown { height: f32 },
@@ -108,7 +108,7 @@ impl Default for Camera {
 }
 
 /// One placed object.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Instance {
     /// Bare mesh name (`"teapot"` ⇒ `nitro:/teapot.dl`); omit for a
     /// transform-only marker (spawn point, logical node).
@@ -136,7 +136,7 @@ fn one3() -> [f32; 3] {
 }
 
 /// Lit-material colours for an instance.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Material {
     pub diffuse: [u8; 3],
     pub ambient: [u8; 3],
@@ -149,7 +149,7 @@ pub struct Material {
 /// place; the per-zone *content* (instances) lives in sibling `<zone>.ron`
 /// files. The map key is the zone's content filename stem (`"atrium"` ⇒
 /// `atrium.ron`). `entry` names the zone the game boots into / the menu lands on.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Level {
     /// Display name (for a future level-select menu).
     pub name: String,
@@ -163,7 +163,7 @@ pub struct Level {
 /// One zone's entry in a [`Level`] manifest: where it sits in the shared global
 /// frame (`place`), its local walkable rect (`bounds`), and its camera framing.
 /// The instances themselves live in the matching `<stem>.ron` ([`Zone`]).
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct ZoneEntry {
     #[serde(default)]
     pub place: [f32; 2],
@@ -176,7 +176,7 @@ pub struct ZoneEntry {
 /// A zone **content** file (`<zone>.ron`) — just the placed objects, as a single
 /// ordered list of literal instances and prefab uses (`place`/`bounds`/`camera`
 /// live up in the [`Level`] manifest, not here).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Zone {
     #[serde(default)]
     pub instances: Vec<Placement>,
@@ -186,7 +186,7 @@ pub struct Zone {
 /// inline, or an instantiation of a named [`Prefab`] with a placement and
 /// optional per-field overrides. Resolved to a flat [`Instance`] host-side by
 /// [`resolve_placement`] — the DS never sees a prefab.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Placement {
     /// A literal instance (the same shape as the old per-space format).
     Lit(Instance),

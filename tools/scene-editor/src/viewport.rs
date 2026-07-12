@@ -10,7 +10,7 @@
 
 use eframe::egui;
 use egui::{Align2, Color32, FontId, Pos2, Rect, Sense, Shape, Stroke, Vec2};
-use scene2bin::Instance;
+use scene2bin::{Camera, Instance, ZoneEntry};
 
 use crate::app::{EditorApp, Sel};
 use crate::widgets::role_style;
@@ -70,6 +70,49 @@ fn norm(a: [f32; 3]) -> [f32; 3] {
 
 /// Euler-XYZ rotation matching the runtime `Transform3d` (apply X, then Y, then
 /// Z). Keep in step with `bevy_nds_3d`'s model matrix so previews don't lie.
+/// A representative camera rig for a zone's authored mode (#50): `(eye, forward,
+/// up, target)`, target = zone ground-plane centre. Follow/Rail tilt by `pitch`;
+/// TopDown looks straight down; CaptureFraming is a fixed 3/4 pose.
+fn camera_pose(entry: &ZoneEntry) -> ([f32; 3], [f32; 3], [f32; 3], [f32; 3]) {
+    let cx = entry.place[0] + (entry.bounds.min[0] + entry.bounds.max[0]) * 0.5;
+    let cz = entry.place[1] + (entry.bounds.min[1] + entry.bounds.max[1]) * 0.5;
+    let t = [cx, 0.0, cz];
+    let rot_x = |v: [f32; 3], a: f32| {
+        let (s, c) = (a.sin(), a.cos());
+        [v[0], v[1] * c - v[2] * s, v[1] * s + v[2] * c]
+    };
+    match entry.camera {
+        Camera::Follow {
+            height,
+            dist,
+            pitch,
+        }
+        | Camera::Rail2_5D {
+            height,
+            dist,
+            pitch,
+        } => {
+            let eye = [t[0], t[1] + height, t[2] + dist];
+            (
+                eye,
+                rot_x([0.0, 0.0, -1.0], pitch),
+                rot_x([0.0, 1.0, 0.0], pitch),
+                t,
+            )
+        }
+        Camera::TopDown { height } => (
+            [t[0], t[1] + height, t[2] + 0.001],
+            [0.0, -1.0, 0.0],
+            [0.0, 0.0, -1.0],
+            t,
+        ),
+        Camera::CaptureFraming => {
+            let eye = [t[0], t[1] + 2.2, t[2] + 2.8];
+            (eye, norm(sub(t, eye)), [0.0, 1.0, 0.0], t)
+        }
+    }
+}
+
 fn rot_xyz(v: [f32; 3], r: [f32; 3]) -> [f32; 3] {
     let (sx, cx) = r[0].sin_cos();
     let v = [v[0], v[1] * cx - v[2] * sx, v[1] * sx + v[2] * cx];
@@ -361,31 +404,37 @@ impl EditorApp {
         // edge stays visible on top of it.
         self.draw_zone_bounds_3d(&painter, &proj);
 
-        // Selected-instance ring (active zone).
-        if let (Sel::Instance(si), Some(stem)) = (self.sel, self.active.clone()) {
+        // Active zone's camera frustum for its authored mode (#50).
+        self.camera_frustum(&painter, &proj);
+
+        // Selected-instance rings (active zone) — one per selected instance (#46).
+        if let Some(stem) = self.active.clone() {
             if let (Some(entry), Some(zone)) =
                 (self.level.zones.get(&stem), self.contents.get(&stem))
             {
-                if let Some(p) = zone.instances.get(si) {
-                    let lp = p.pos();
-                    let world = [lp[0] + entry.place[0], lp[1], lp[2] + entry.place[1]];
-                    if let Some((s, _)) = proj.project(world) {
-                        painter.circle_stroke(s, 11.0, Stroke::new(2.0_f32, Color32::WHITE));
+                for &si in self.sel.items() {
+                    if let Some(p) = zone.instances.get(si) {
+                        let lp = p.pos();
+                        let world = [lp[0] + entry.place[0], lp[1], lp[2] + entry.place[1]];
+                        if let Some((s, _)) = proj.project(world) {
+                            painter.circle_stroke(s, 11.0, Stroke::new(2.0_f32, Color32::WHITE));
+                        }
                     }
                 }
             }
         }
 
         if resp.clicked() {
+            let shift = ui.input(|i| i.modifiers.shift);
             if let Some(pp) = resp.interact_pointer_pos() {
-                self.pick_3d(&proj, pp);
+                self.pick_3d(&proj, pp, shift);
             }
         }
 
         painter.text(
             rect.left_bottom() + Vec2::new(6.0, -6.0),
             Align2::LEFT_BOTTOM,
-            "LMB orbit · RMB pan · scroll zoom · click to select",
+            "LMB orbit · RMB pan · scroll zoom · click/shift-click to select",
             FontId::proportional(11.0),
             Color32::from_rgb(110, 120, 140),
         );
@@ -406,6 +455,55 @@ impl EditorApp {
             let st = if i == 0 { axis } else { minor };
             seg(painter, [v, 0.0, -n as f32], [v, 0.0, n as f32], st);
             seg(painter, [-n as f32, 0.0, v], [n as f32, 0.0, v], st);
+        }
+    }
+
+    /// The active zone's camera pose for its authored mode: `(eye, forward, up,
+    /// target)`. A *representative* rig (not a frame-exact runtime match) so
+    /// switching the mode visibly changes what the frustum frames (#50). The
+    /// target is the zone's ground-plane centre.
+    fn camera_frustum(&self, painter: &egui::Painter, proj: &Proj) {
+        let Some(stem) = self.active.as_ref() else {
+            return;
+        };
+        let Some(entry) = self.level.zones.get(stem) else {
+            return;
+        };
+        let (eye, dir, up, target) = camera_pose(entry);
+        let f = norm(dir);
+        let r = norm(cross(f, up));
+        let u = cross(r, f);
+        let fov_v = 0.7_f32;
+        let aspect = 4.0 / 3.0; // DS screen
+        let far =
+            (sub(target, eye).iter().map(|c| c * c).sum::<f32>().sqrt() * 1.25).clamp(1.5, 12.0);
+        let half_v = far * (fov_v * 0.5).tan();
+        let half_h = far * (fov_v * aspect * 0.5).tan();
+        let cf = add(eye, scl(f, far));
+        let corners = [
+            add(add(cf, scl(r, half_h)), scl(u, half_v)),
+            add(add(cf, scl(r, -half_h)), scl(u, half_v)),
+            add(add(cf, scl(r, -half_h)), scl(u, -half_v)),
+            add(add(cf, scl(r, half_h)), scl(u, -half_v)),
+        ];
+        let col = Color32::from_rgb(90, 195, 225);
+        let st = Stroke::new(1.4_f32, col);
+        // Apex → far corners.
+        if let Some((ae, _)) = proj.project(eye) {
+            for c in &corners {
+                if let Some((cp, _)) = proj.project(*c) {
+                    painter.line_segment([ae, cp], st);
+                }
+            }
+            painter.circle_filled(ae, 3.5, col);
+        }
+        // Far rectangle.
+        for k in 0..4 {
+            if let (Some((a, _)), Some((b, _))) =
+                (proj.project(corners[k]), proj.project(corners[(k + 1) % 4]))
+            {
+                painter.line_segment([a, b], st);
+            }
         }
     }
 
@@ -454,7 +552,7 @@ impl EditorApp {
 
     /// Pick the instance whose projected origin is nearest the click (across all
     /// zones); selects it and makes its zone active. Mirrors the top-down pick.
-    fn pick_3d(&mut self, proj: &Proj, p: Pos2) {
+    fn pick_3d(&mut self, proj: &Proj, p: Pos2, shift: bool) {
         let mut best: Option<(String, usize, f32)> = None;
         for (stem, entry) in &self.level.zones {
             let (px, pz) = (entry.place[0], entry.place[1]);
@@ -472,10 +570,20 @@ impl EditorApp {
         }
         match best {
             Some((stem, i, _)) => {
-                self.active = Some(stem);
-                self.sel = Sel::Instance(i);
+                // Shift-toggle only extends within the active zone; picking in a
+                // different zone switches active and starts a fresh selection.
+                if shift && self.active.as_deref() == Some(stem.as_str()) {
+                    self.sel.toggle(i);
+                } else {
+                    self.active = Some(stem);
+                    self.sel = Sel::single(i);
+                }
             }
-            None => self.sel = Sel::None,
+            None => {
+                if !shift {
+                    self.sel = Sel::none();
+                }
+            }
         }
     }
 }
