@@ -21,6 +21,7 @@
 
 mod app;
 mod canvas;
+mod history;
 mod panel;
 mod viewport;
 mod widgets;
