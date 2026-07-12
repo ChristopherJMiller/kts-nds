@@ -130,11 +130,15 @@ pub fn tally_captures(mut events: EventReader<CaptureResolved>, mut tally: ResMu
 pub fn draw_capture(
     touches: Res<Touches>,
     state: Res<PlayerState>,
+    radial: Res<crate::radial::Radial>,
     mut stroke: ResMut<Stroke>,
     mut resolved: EventWriter<CaptureResolved>,
     mut enemies: Query<(&WorldPos, &VulnerabilityShape, &mut Capture)>,
 ) {
-    if !state.is_deployed() {
+    // While the radial wheel is open the pen is selecting a spoke, not drawing
+    // (#25): the shoulder-hold gates it out of the capture stroke, the deployed
+    // twin of the locomotion gate in `stowed_step`.
+    if !state.is_deployed() || radial.open {
         stroke.0.clear();
         return;
     }

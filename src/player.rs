@@ -25,7 +25,7 @@ use bevy_nds_math::stick::{StickConfig, smooth as vel_smooth, stick_vector};
 use bevy_nds_scene::CameraMode;
 
 use crate::control::{self, Action};
-use crate::{Avatar, LANDMARK_COLLIDE, Landmarks, Stroke, WorldPos};
+use crate::{Avatar, LANDMARK_COLLIDE, Landmarks, WorldPos};
 
 // --- Stylus conditioning (Spike A defaults, locked 2026-06-14) ---------------
 
@@ -220,23 +220,6 @@ impl Default for Locomotion {
 
 // --- Systems -----------------------------------------------------------------
 
-/// Toggle the capture device (`Action::DeviceRadial` — the shoulder, a stand-in
-/// for the #25 radial). Any transition drops the in-flight stroke.
-pub fn transition_state(
-    input: Res<ButtonInput<DsButton>>,
-    handed: Res<Handedness>,
-    mut state: ResMut<PlayerState>,
-    mut stroke: ResMut<Stroke>,
-) {
-    if control::just_pressed(Action::DeviceRadial, *handed, &input) {
-        *state = match *state {
-            PlayerState::Stowed => PlayerState::Deployed,
-            PlayerState::Deployed => PlayerState::Stowed,
-        };
-        stroke.0.clear();
-    }
-}
-
 /// Debug: cycle the movement tuning preset (Arena ↔ Corridor) on `Select`,
 /// until #27 assigns it per-space.
 pub fn toggle_tuning(input: Res<ButtonInput<DsButton>>, mut loco: ResMut<Locomotion>) {
@@ -260,6 +243,7 @@ pub fn move_player(
     state: Res<PlayerState>,
     loco: Res<Locomotion>,
     zone: Res<crate::transition::Zone>,
+    radial: Res<crate::radial::Radial>,
     mut stick: ResMut<StickState>,
     mut motion: ResMut<Motion>,
     landmarks: Res<Landmarks>,
@@ -287,6 +271,7 @@ pub fn move_player(
             &touches,
             &input,
             *handed,
+            radial.open,
             &mut stick,
             &mut motion,
             &mut height,
@@ -335,16 +320,20 @@ fn stowed_step(
     touches: &Touches,
     input: &ButtonInput<DsButton>,
     handed: Handedness,
+    radial_open: bool,
     stick: &mut StickState,
     motion: &mut Motion,
     height: &mut Height,
     loco: &Locomotion,
     dt: Fx32,
 ) -> FxVec2 {
+    // The radial wheel gates the pen out of locomotion (#25): while the shoulder
+    // is held, the same drag is picking a spoke, not moving the avatar. Suppress
+    // locomotion and drop the stick so it re-anchors cleanly on release — the
+    // same borrow-the-stylus pattern OrbitSet uses below.
     // OrbitSet borrows the stylus to aim the camera while cluster ◄ is held
     // (#23): suppress locomotion so the same drag doesn't also move the avatar.
-    // Drop the stick so the pen re-anchors cleanly when it returns to moving.
-    if control::pressed(Action::CamOrbit, handed, input) {
+    if radial_open || control::pressed(Action::CamOrbit, handed, input) {
         stick.active = false;
         return FxVec2::ZERO;
     }
