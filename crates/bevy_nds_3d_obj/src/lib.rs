@@ -142,9 +142,15 @@ pub fn obj_preview_mesh(source: &str) -> Result<PreviewMesh, String> {
                 max[k] = max[k].max(p[k]);
             }
         }
-        out.push(PreviewTri { pos, normal: flat_normal(pos[0], pos[1], pos[2]) });
+        out.push(PreviewTri {
+            pos,
+            normal: flat_normal(pos[0], pos[1], pos[2]),
+        });
     }
-    Ok(PreviewMesh { tris: out, aabb: [min, max] })
+    Ok(PreviewMesh {
+        tris: out,
+        aabb: [min, max],
+    })
 }
 
 /// One triangle's worth of baked vertex data: position + normal per corner.

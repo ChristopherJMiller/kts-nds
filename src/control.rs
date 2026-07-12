@@ -73,7 +73,9 @@ impl Action {
 /// Is `action` currently held, for the active handedness? Stylus / derived
 /// actions report `false` here (read them via `Touches` / the dash detector).
 pub fn pressed(action: Action, handedness: Handedness, buttons: &ButtonInput<DsButton>) -> bool {
-    action.button(handedness).is_some_and(|b| buttons.pressed(b))
+    action
+        .button(handedness)
+        .is_some_and(|b| buttons.pressed(b))
 }
 
 /// Did `action` go down this frame?

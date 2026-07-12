@@ -376,10 +376,7 @@ pub fn discover(src: &Path) -> Result<Vec<Baked>, String> {
     if !src.is_dir() {
         return Ok(out);
     }
-    for (subdir, kind) in [
-        (TILED_SUBDIR, Kind::Tile),
-        (BITMAP_SUBDIR, Kind::Bitmap),
-    ] {
+    for (subdir, kind) in [(TILED_SUBDIR, Kind::Tile), (BITMAP_SUBDIR, Kind::Bitmap)] {
         let root = src.join(subdir);
         if !root.is_dir() {
             continue;
@@ -622,8 +619,12 @@ mod tests {
         let src = emit_rust_consts(&items);
         assert!(src.contains("pub mod tiled {"));
         assert!(src.contains("pub mod bitmap {"));
-        assert!(src.contains("pub const FOREST: &[u8] = b\"nitro:/backgrounds/tiled/forest.bg\\0\";"));
-        assert!(src.contains("pub const PHOTO: &[u8] = b\"nitro:/backgrounds/bitmap/photo.bbg\\0\";"));
+        assert!(
+            src.contains("pub const FOREST: &[u8] = b\"nitro:/backgrounds/tiled/forest.bg\\0\";")
+        );
+        assert!(
+            src.contains("pub const PHOTO: &[u8] = b\"nitro:/backgrounds/bitmap/photo.bbg\\0\";")
+        );
     }
 
     #[test]

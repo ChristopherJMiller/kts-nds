@@ -53,7 +53,14 @@ mod asset;
 mod ffi;
 
 /// Internal: pick the libnds main-engine vs sub-engine `bgInit*` variant.
-fn bg_init_hidden(screen: DsScreen, layer: c_int, ty: c_int, size: c_int, map_base: c_int, tile_base: c_int) -> c_int {
+fn bg_init_hidden(
+    screen: DsScreen,
+    layer: c_int,
+    ty: c_int,
+    size: c_int,
+    map_base: c_int,
+    tile_base: c_int,
+) -> c_int {
     unsafe {
         match screen {
             DsScreen::Top => ffi::bgInitHidden(layer, ty, size, map_base, tile_base),

@@ -180,7 +180,10 @@ fn apply_brightness(bright: Res<MasterBright>) {
     if !bright.is_changed() {
         return;
     }
-    let (top, bottom) = (master_bright_bits(bright.top), master_bright_bits(bright.bottom));
+    let (top, bottom) = (
+        master_bright_bits(bright.top),
+        master_bright_bits(bright.bottom),
+    );
     // SAFETY: fixed MMIO addresses for the two 2D engines' brightness latches;
     // the DS is single-core and these are plain register writes.
     #[cfg(target_vendor = "nintendo")]

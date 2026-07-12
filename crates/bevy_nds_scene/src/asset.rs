@@ -69,9 +69,17 @@ pub enum CameraMode {
 impl CameraMode {
     fn from_wire(mode: u16, p: [f32; 4]) -> Option<Self> {
         Some(match mode {
-            0 => CameraMode::Follow { height: p[0], dist: p[1], pitch: p[2] },
+            0 => CameraMode::Follow {
+                height: p[0],
+                dist: p[1],
+                pitch: p[2],
+            },
             1 => CameraMode::TopDown { height: p[0] },
-            2 => CameraMode::Rail2_5D { height: p[0], dist: p[1], pitch: p[2] },
+            2 => CameraMode::Rail2_5D {
+                height: p[0],
+                dist: p[1],
+                pitch: p[2],
+            },
             3 => CameraMode::CaptureFraming,
             _ => return None,
         })
@@ -165,7 +173,14 @@ pub fn parse(bytes: &[u8]) -> Option<SceneData> {
             path.push([r.f32()?, r.f32()?]);
         }
         instances.push(SceneInstanceData {
-            mesh, role, pos, rot, scale, material, flags, path,
+            mesh,
+            role,
+            pos,
+            rot,
+            scale,
+            material,
+            flags,
+            path,
         });
     }
 
@@ -180,10 +195,22 @@ pub fn parse(bytes: &[u8]) -> Option<SceneData> {
         let hi = r.f32()?;
         let delta = [r.f32()?, r.f32()?];
         let gate = r.u32()?;
-        connections.push(SceneConnData { neighbour, side, lo, hi, delta, gate });
+        connections.push(SceneConnData {
+            neighbour,
+            side,
+            lo,
+            hi,
+            delta,
+            gate,
+        });
     }
 
-    Some(SceneData { camera, instances, bounds, connections })
+    Some(SceneData {
+        camera,
+        instances,
+        bounds,
+        connections,
+    })
 }
 
 /// Cap on count-driven `with_capacity` so a corrupt length can't request a
@@ -244,10 +271,18 @@ mod tests {
     #[derive(Default)]
     struct Writer(Vec<u8>);
     impl Writer {
-        fn u8(&mut self, v: u8) { self.0.push(v); }
-        fn u16(&mut self, v: u16) { self.0.extend_from_slice(&v.to_le_bytes()); }
-        fn u32(&mut self, v: u32) { self.0.extend_from_slice(&v.to_le_bytes()); }
-        fn f32(&mut self, v: f32) { self.u32(v.to_bits()); }
+        fn u8(&mut self, v: u8) {
+            self.0.push(v);
+        }
+        fn u16(&mut self, v: u16) {
+            self.0.extend_from_slice(&v.to_le_bytes());
+        }
+        fn u32(&mut self, v: u32) {
+            self.0.extend_from_slice(&v.to_le_bytes());
+        }
+        fn f32(&mut self, v: f32) {
+            self.u32(v.to_bits());
+        }
         fn string(&mut self, s: &str) {
             self.u16(s.len() as u16);
             self.0.extend_from_slice(s.as_bytes());
@@ -256,7 +291,11 @@ mod tests {
 
     fn sample() -> SceneData {
         SceneData {
-            camera: CameraMode::Follow { height: 1.7, dist: 2.0, pitch: -0.7 },
+            camera: CameraMode::Follow {
+                height: 1.7,
+                dist: 2.0,
+                pitch: -0.7,
+            },
             instances: alloc::vec![
                 SceneInstanceData {
                     mesh: Some(String::from("teapot")),
@@ -296,42 +335,77 @@ mod tests {
         w.u32(MAGIC);
         w.u16(VERSION);
         match s.camera {
-            CameraMode::Follow { height, dist, pitch } => {
+            CameraMode::Follow {
+                height,
+                dist,
+                pitch,
+            } => {
                 w.u16(0);
-                w.f32(height); w.f32(dist); w.f32(pitch); w.f32(0.0);
+                w.f32(height);
+                w.f32(dist);
+                w.f32(pitch);
+                w.f32(0.0);
             }
             CameraMode::TopDown { height } => {
                 w.u16(1);
-                w.f32(height); w.f32(0.0); w.f32(0.0); w.f32(0.0);
+                w.f32(height);
+                w.f32(0.0);
+                w.f32(0.0);
+                w.f32(0.0);
             }
-            CameraMode::Rail2_5D { height, dist, pitch } => {
+            CameraMode::Rail2_5D {
+                height,
+                dist,
+                pitch,
+            } => {
                 w.u16(2);
-                w.f32(height); w.f32(dist); w.f32(pitch); w.f32(0.0);
+                w.f32(height);
+                w.f32(dist);
+                w.f32(pitch);
+                w.f32(0.0);
             }
             CameraMode::CaptureFraming => {
                 w.u16(3);
-                w.f32(0.0); w.f32(0.0); w.f32(0.0); w.f32(0.0);
+                w.f32(0.0);
+                w.f32(0.0);
+                w.f32(0.0);
+                w.f32(0.0);
             }
         }
         w.u32(s.instances.len() as u32);
         for inst in &s.instances {
             w.string(inst.mesh.as_deref().unwrap_or(""));
             w.string(&inst.role);
-            for v in inst.pos { w.f32(v); }
-            for v in inst.rot { w.f32(v); }
-            for v in inst.scale { w.f32(v); }
+            for v in inst.pos {
+                w.f32(v);
+            }
+            for v in inst.rot {
+                w.f32(v);
+            }
+            for v in inst.scale {
+                w.f32(v);
+            }
             let (has, d, a) = match inst.material {
                 Some((d, a)) => (1, d, a),
                 None => (0, [0; 3], [0; 3]),
             };
             w.u8(has);
-            for v in d { w.u8(v); }
-            for v in a { w.u8(v); }
+            for v in d {
+                w.u8(v);
+            }
+            for v in a {
+                w.u8(v);
+            }
             w.u32(inst.flags);
             w.u16(inst.path.len() as u16);
-            for p in &inst.path { w.f32(p[0]); w.f32(p[1]); }
+            for p in &inst.path {
+                w.f32(p[0]);
+                w.f32(p[1]);
+            }
         }
-        for v in s.bounds { w.f32(v); }
+        for v in s.bounds {
+            w.f32(v);
+        }
         w.u32(s.connections.len() as u32);
         for c in &s.connections {
             w.string(&c.neighbour);

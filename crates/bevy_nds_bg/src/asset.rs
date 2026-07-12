@@ -138,7 +138,8 @@ mod tests {
     use super::*;
 
     fn tile_blob(palette: &[u16], gfx: &[u8], map: &[u8]) -> Vec<u8> {
-        let mut out = Vec::with_capacity(TILE_HEADER_LEN + palette.len() * 2 + gfx.len() + map.len());
+        let mut out =
+            Vec::with_capacity(TILE_HEADER_LEN + palette.len() * 2 + gfx.len() + map.len());
         out.extend_from_slice(&TILE_MAGIC.to_le_bytes());
         out.extend_from_slice(&(palette.len() as u32).to_le_bytes());
         out.extend_from_slice(&(gfx.len() as u32).to_le_bytes());

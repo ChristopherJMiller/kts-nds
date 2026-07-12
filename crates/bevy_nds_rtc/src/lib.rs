@@ -158,7 +158,9 @@ mod tests {
     fn epoch_is_1970_01_01_thursday() {
         let c = WallClock::from_unix(0);
         assert_eq!(
-            (c.year, c.month, c.day, c.hour, c.minute, c.second, c.weekday),
+            (
+                c.year, c.month, c.day, c.hour, c.minute, c.second, c.weekday
+            ),
             (1970, 1, 1, 0, 0, 0, 4),
         );
     }
@@ -168,7 +170,9 @@ mod tests {
         // 2000-01-01T00:00:00Z — verifiable against `date -u -d @946684800`.
         let c = WallClock::from_unix(946_684_800);
         assert_eq!(
-            (c.year, c.month, c.day, c.hour, c.minute, c.second, c.weekday),
+            (
+                c.year, c.month, c.day, c.hour, c.minute, c.second, c.weekday
+            ),
             (2000, 1, 1, 0, 0, 0, 6), // Saturday
         );
     }
@@ -178,7 +182,9 @@ mod tests {
         // 2026-06-08T01:54:54Z (Monday) — `date -u -d @1780883694`.
         let c = WallClock::from_unix(1_780_883_694);
         assert_eq!(
-            (c.year, c.month, c.day, c.hour, c.minute, c.second, c.weekday),
+            (
+                c.year, c.month, c.day, c.hour, c.minute, c.second, c.weekday
+            ),
             (2026, 6, 8, 1, 54, 54, 1),
         );
     }
@@ -187,12 +193,21 @@ mod tests {
     fn last_second_of_day_and_first_second_of_next() {
         let end = WallClock::from_unix(86_399);
         assert_eq!(
-            (end.year, end.month, end.day, end.hour, end.minute, end.second),
+            (
+                end.year, end.month, end.day, end.hour, end.minute, end.second
+            ),
             (1970, 1, 1, 23, 59, 59),
         );
         let next = WallClock::from_unix(86_400);
         assert_eq!(
-            (next.year, next.month, next.day, next.hour, next.minute, next.second),
+            (
+                next.year,
+                next.month,
+                next.day,
+                next.hour,
+                next.minute,
+                next.second
+            ),
             (1970, 1, 2, 0, 0, 0),
         );
     }
@@ -209,7 +224,9 @@ mod tests {
         // -1 second is 1969-12-31T23:59:59 — a Wednesday (weekday 3).
         let c = WallClock::from_unix(-1);
         assert_eq!(
-            (c.year, c.month, c.day, c.hour, c.minute, c.second, c.weekday),
+            (
+                c.year, c.month, c.day, c.hour, c.minute, c.second, c.weekday
+            ),
             (1969, 12, 31, 23, 59, 59, 3),
         );
     }

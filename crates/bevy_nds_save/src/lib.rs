@@ -230,10 +230,7 @@ fn init_storage(mut commands: Commands, base: Res<PendingBaseDir>) {
     } else {
         StorageStatus::Unavailable
     };
-    commands.insert_resource(SaveStorage {
-        base_dir,
-        status,
-    });
+    commands.insert_resource(SaveStorage { base_dir, status });
     commands.insert_resource(status);
     commands.remove_resource::<PendingBaseDir>();
 }

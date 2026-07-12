@@ -79,7 +79,10 @@ pub struct Bounds {
 
 impl Default for Bounds {
     fn default() -> Self {
-        Self { min: [-2.0, -2.0], max: [2.0, 2.0] }
+        Self {
+            min: [-2.0, -2.0],
+            max: [2.0, 2.0],
+        }
     }
 }
 
@@ -96,7 +99,11 @@ pub enum Camera {
 impl Default for Camera {
     fn default() -> Self {
         // Spike-C follow defaults (src/main.rs CAM_* constants).
-        Camera::Follow { height: 1.7, dist: 2.0, pitch: -0.7 }
+        Camera::Follow {
+            height: 1.7,
+            dist: 2.0,
+            pitch: -0.7,
+        }
     }
 }
 
@@ -298,7 +305,9 @@ pub struct Connection {
 /// edge with overlapping extent. This is the heart of the Euclidean model — the
 /// designer lays zones out in one frame and the connections (and the cross-over
 /// `delta`) fall out of the geometry. Pure + host-tested.
-pub fn derive_connections(zones: &[(String, Space)]) -> std::collections::BTreeMap<String, Vec<Connection>> {
+pub fn derive_connections(
+    zones: &[(String, Space)],
+) -> std::collections::BTreeMap<String, Vec<Connection>> {
     /// Abutment / overlap tolerance (world units).
     const TOL: f32 = 0.01;
     let mut out = std::collections::BTreeMap::new();
@@ -334,8 +343,20 @@ pub fn derive_connections(zones: &[(String, Space)]) -> std::collections::BTreeM
             push(SIDE_WEST, (axmin - bxmax).abs() < TOL, zlo, zhi, a.place[1]);
             let xlo = axmin.max(bxmin);
             let xhi = axmax.min(bxmax);
-            push(SIDE_NORTH, (azmax - bzmin).abs() < TOL, xlo, xhi, a.place[0]);
-            push(SIDE_SOUTH, (azmin - bzmax).abs() < TOL, xlo, xhi, a.place[0]);
+            push(
+                SIDE_NORTH,
+                (azmax - bzmin).abs() < TOL,
+                xlo,
+                xhi,
+                a.place[0],
+            );
+            push(
+                SIDE_SOUTH,
+                (azmin - bzmax).abs() < TOL,
+                xlo,
+                xhi,
+                a.place[0],
+            );
         }
         out.insert(an.clone(), conns);
     }
@@ -416,7 +437,11 @@ pub fn resolve_placement(p: &Placement, prefabs: &PrefabLib) -> Result<Instance,
                 scale: scale.unwrap_or(pf.scale),
                 material: material.or(pf.material),
                 flags: flags.unwrap_or(pf.flags),
-                path: if path.is_empty() { pf.path.clone() } else { path.clone() },
+                path: if path.is_empty() {
+                    pf.path.clone()
+                } else {
+                    path.clone()
+                },
             })
         }
     }
@@ -440,9 +465,9 @@ pub fn assemble(
     }
     let mut out = Vec::with_capacity(level.zones.len());
     for (stem, entry) in &level.zones {
-        let zone = zones
-            .get(stem)
-            .ok_or_else(|| format!("zone `{stem}` in the manifest has no `{stem}.ron` content file"))?;
+        let zone = zones.get(stem).ok_or_else(|| {
+            format!("zone `{stem}` in the manifest has no `{stem}.ron` content file")
+        })?;
         let mut instances = Vec::with_capacity(zone.instances.len());
         for (i, p) in zone.instances.iter().enumerate() {
             instances.push(
@@ -465,10 +490,7 @@ pub fn assemble(
 
 /// Hard-validate a zone (errors that *guarantee* a broken ROM). `mesh_exists`
 /// reports whether a referenced mesh has a source `.obj`.
-pub fn validate(
-    space: &Space,
-    mesh_exists: impl Fn(&str) -> bool,
-) -> Result<(), String> {
+pub fn validate(space: &Space, mesh_exists: impl Fn(&str) -> bool) -> Result<(), String> {
     for (i, inst) in space.instances.iter().enumerate() {
         if inst.role.trim().is_empty() {
             return Err(format!("instance {i}: empty `role`"));
@@ -523,7 +545,11 @@ pub fn encode(space: &Space, conns: &[Connection]) -> Vec<u8> {
     w.u32(ASSET_MAGIC);
     w.u16(VERSION);
     match space.camera {
-        Camera::Follow { height, dist, pitch } => {
+        Camera::Follow {
+            height,
+            dist,
+            pitch,
+        } => {
             w.u16(0);
             w.f32(height);
             w.f32(dist);
@@ -537,7 +563,11 @@ pub fn encode(space: &Space, conns: &[Connection]) -> Vec<u8> {
             w.f32(0.0);
             w.f32(0.0);
         }
-        Camera::Rail2_5D { height, dist, pitch } => {
+        Camera::Rail2_5D {
+            height,
+            dist,
+            pitch,
+        } => {
             w.u16(2);
             w.f32(height);
             w.f32(dist);
@@ -708,10 +738,10 @@ pub fn build_levels_dir(
         let mut zone_contents = std::collections::BTreeMap::new();
         for stem in level.zones.keys() {
             let content_path = level_dir.join(format!("{stem}.ron"));
-            let src = std::fs::read_to_string(&content_path).map_err(|e| {
-                format!("could not read {}: {e}", content_path.display())
-            })?;
-            let zone = parse_zone_ron(&src).map_err(|e| format!("{}: {e}", content_path.display()))?;
+            let src = std::fs::read_to_string(&content_path)
+                .map_err(|e| format!("could not read {}: {e}", content_path.display()))?;
+            let zone =
+                parse_zone_ron(&src).map_err(|e| format!("{}: {e}", content_path.display()))?;
             zone_contents.insert(stem.clone(), zone);
         }
 
@@ -729,7 +759,9 @@ pub fn build_levels_dir(
 
         for (stem, space) in &zones {
             let zone_conns = conns.get(stem).map(Vec::as_slice).unwrap_or(&[]);
-            let output = dst_root.join(&level_name).join(format!("{stem}.{ASSET_EXT}"));
+            let output = dst_root
+                .join(&level_name)
+                .join(format!("{stem}.{ASSET_EXT}"));
             if let Some(parent) = output.parent() {
                 std::fs::create_dir_all(parent)
                     .map_err(|e| format!("could not create {}: {e}", parent.display()))?;
@@ -775,7 +807,10 @@ pub fn emit_rust_consts(built: &[Built]) -> String {
     s.push_str("// Each constant is a NUL-terminated NitroFS path you can pass to\n");
     s.push_str("// `bevy_nds_scene::load` (or `LoadSpace { path }`).\n");
     for (level, zones) in &by_level {
-        s.push_str(&format!("pub mod {} {{\n", const_name(level).to_ascii_lowercase()));
+        s.push_str(&format!(
+            "pub mod {} {{\n",
+            const_name(level).to_ascii_lowercase()
+        ));
         for b in zones {
             s.push_str("    pub const ");
             s.push_str(&const_name(&b.stem));
@@ -802,7 +837,11 @@ pub fn predict_consts(levels_root: &Path) -> String {
         if !level_dir.join(MANIFEST_NAME).is_file() {
             continue;
         }
-        let Some(level) = level_dir.file_name().and_then(|s| s.to_str()).map(String::from) else {
+        let Some(level) = level_dir
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(String::from)
+        else {
             continue;
         };
         for path in read_dir_sorted(&level_dir).unwrap_or_default() {
@@ -879,8 +918,14 @@ mod tests {
 
     fn prefabs() -> PrefabLib {
         PrefabLib::from([
-            ("patroller".to_string(), parse_prefab_ron(PATROLLER).unwrap()),
-            ("landmark_block".to_string(), parse_prefab_ron(LANDMARK).unwrap()),
+            (
+                "patroller".to_string(),
+                parse_prefab_ron(PATROLLER).unwrap(),
+            ),
+            (
+                "landmark_block".to_string(),
+                parse_prefab_ron(LANDMARK).unwrap(),
+            ),
         ])
     }
 
@@ -924,7 +969,8 @@ mod tests {
 
     #[test]
     fn unknown_prefab_errors() {
-        let zone: Zone = parse_zone_ron(r#"Zone(instances: [Use(name: "ghost", pos: (0,0,0))])"#).unwrap();
+        let zone: Zone =
+            parse_zone_ron(r#"Zone(instances: [Use(name: "ghost", pos: (0,0,0))])"#).unwrap();
         let err = resolve_placement(&zone.instances[0], &prefabs()).unwrap_err();
         assert!(err.contains("ghost"), "{err}");
     }
@@ -934,7 +980,10 @@ mod tests {
         let level = parse_level_ron(MANIFEST).unwrap();
         let zones = BTreeMap::from([
             ("atrium".to_string(), parse_zone_ron(ATRIUM_ZONE).unwrap()),
-            ("corridor".to_string(), parse_zone_ron("Zone(instances: [])").unwrap()),
+            (
+                "corridor".to_string(),
+                parse_zone_ron("Zone(instances: [])").unwrap(),
+            ),
         ]);
         let assembled = assemble(&level, &zones, &prefabs()).unwrap();
 
@@ -967,7 +1016,10 @@ mod tests {
         let level = parse_level_ron(MANIFEST).unwrap();
         let zones = BTreeMap::from([
             ("atrium".to_string(), parse_zone_ron(ATRIUM_ZONE).unwrap()),
-            ("corridor".to_string(), parse_zone_ron("Zone(instances: [])").unwrap()),
+            (
+                "corridor".to_string(),
+                parse_zone_ron("Zone(instances: [])").unwrap(),
+            ),
         ]);
         let assembled = assemble(&level, &zones, &prefabs()).unwrap();
         let atrium = &assembled.iter().find(|(s, _)| s == "atrium").unwrap().1;
@@ -982,7 +1034,10 @@ mod tests {
         let level = parse_level_ron(MANIFEST).unwrap();
         let zones = BTreeMap::from([
             ("atrium".to_string(), parse_zone_ron(ATRIUM_ZONE).unwrap()),
-            ("corridor".to_string(), parse_zone_ron("Zone(instances: [])").unwrap()),
+            (
+                "corridor".to_string(),
+                parse_zone_ron("Zone(instances: [])").unwrap(),
+            ),
         ]);
         let atrium = assemble(&level, &zones, &prefabs())
             .unwrap()
@@ -1009,7 +1064,12 @@ mod tests {
             .map(|(stem, e)| {
                 (
                     stem.clone(),
-                    Space { camera: e.camera, place: e.place, bounds: e.bounds, instances: Vec::new() },
+                    Space {
+                        camera: e.camera,
+                        place: e.place,
+                        bounds: e.bounds,
+                        instances: Vec::new(),
+                    },
                 )
             })
             .collect();
@@ -1020,7 +1080,11 @@ mod tests {
         assert_eq!(a[0].neighbour, "corridor");
         assert_eq!(a[0].side, SIDE_EAST);
         // Crossing east adds (place_atrium - place_corridor): (0 - 4.2, 0).
-        assert!((a[0].delta[0] - (-4.2)).abs() < 1e-4, "delta {:?}", a[0].delta);
+        assert!(
+            (a[0].delta[0] - (-4.2)).abs() < 1e-4,
+            "delta {:?}",
+            a[0].delta
+        );
         assert!(a[0].delta[1].abs() < 1e-4);
         assert!((a[0].lo - (-0.55)).abs() < 1e-4 && (a[0].hi - 0.55).abs() < 1e-4);
 
@@ -1034,18 +1098,27 @@ mod tests {
     fn isolated_zone_warns_only_in_a_multi_zone_map() {
         let zones = std::vec![
             ("a".to_string(), zone([0.0, 0.0], [-1.0, -1.0], [1.0, 1.0])),
-            ("b".to_string(), zone([100.0, 0.0], [-1.0, -1.0], [1.0, 1.0])),
+            (
+                "b".to_string(),
+                zone([100.0, 0.0], [-1.0, -1.0], [1.0, 1.0])
+            ),
         ];
         let warns = isolation_warnings(&derive_connections(&zones));
         assert_eq!(warns.len(), 2);
-        let lone = std::vec![("solo".to_string(), zone([0.0, 0.0], [-1.0, -1.0], [1.0, 1.0]))];
+        let lone = std::vec![(
+            "solo".to_string(),
+            zone([0.0, 0.0], [-1.0, -1.0], [1.0, 1.0])
+        )];
         assert!(isolation_warnings(&derive_connections(&lone)).is_empty());
     }
 
     #[test]
     fn validate_rejects_degenerate_bounds() {
         let mut space = zone([0.0, 0.0], [-2.0, -2.0], [2.0, 2.0]);
-        space.bounds = Bounds { min: [2.0, -2.0], max: [-2.0, 2.0] }; // min.x >= max.x
+        space.bounds = Bounds {
+            min: [2.0, -2.0],
+            max: [-2.0, 2.0],
+        }; // min.x >= max.x
         assert!(validate(&space, |_| true).is_err());
     }
 
@@ -1063,11 +1136,17 @@ mod tests {
         // Compare via assembled-encode (covers every field without PartialEq).
         let zones = BTreeMap::from([
             ("atrium".to_string(), zone),
-            ("corridor".to_string(), parse_zone_ron("Zone(instances: [])").unwrap()),
+            (
+                "corridor".to_string(),
+                parse_zone_ron("Zone(instances: [])").unwrap(),
+            ),
         ]);
         let zones2 = BTreeMap::from([
             ("atrium".to_string(), zone2),
-            ("corridor".to_string(), parse_zone_ron("Zone(instances: [])").unwrap()),
+            (
+                "corridor".to_string(),
+                parse_zone_ron("Zone(instances: [])").unwrap(),
+            ),
         ]);
         let enc = |lv: &Level, zs| {
             let a = assemble(lv, zs, &prefabs()).unwrap();

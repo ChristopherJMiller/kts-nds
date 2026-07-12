@@ -265,7 +265,10 @@ pub mod gl {
         unsafe {
             glClearFogEnable(true);
             let (r, g, b, a) = colour;
-            write_volatile(GFX_FOG_COLOR, rgb15(r << 3, g << 3, b << 3) | ((a as u32) << 16));
+            write_volatile(
+                GFX_FOG_COLOR,
+                rgb15(r << 3, g << 3, b << 3) | ((a as u32) << 16),
+            );
             write_volatile(GFX_FOG_OFFSET, offset);
             // Fog-shift lives in bits 8-11 of GFX_CONTROL (read-modify-write).
             let c = read_volatile(GFX_CONTROL) & GFX_FOG_SHIFT_MASK;

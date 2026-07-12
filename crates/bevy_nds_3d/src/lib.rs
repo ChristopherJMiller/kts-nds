@@ -806,8 +806,7 @@ fn render_3d(
             // beyond the render range (resident-neighbour streaming, #27).
             // Hand-authored meshes without an AABB always draw.
             if draw.has_bounds
-                && (!aabb_visible(&frustum, draw)
-                    || !within_range(draw, camera.position, range.0))
+                && (!aabb_visible(&frustum, draw) || !within_range(draw, camera.position, range.0))
             {
                 continue;
             }
@@ -822,7 +821,9 @@ fn render_3d(
                     ffi::rgb15(m.ambient[0], m.ambient[1], m.ambient[2]),
                     true,
                 );
-                gl::poly_fmt(ffi::poly_alpha(31) | ffi::POLY_CULL_BACK | ffi::POLY_FOG | light_mask);
+                gl::poly_fmt(
+                    ffi::poly_alpha(31) | ffi::POLY_CULL_BACK | ffi::POLY_FOG | light_mask,
+                );
 
                 if let Some(baked) = &mesh.baked {
                     // Fast path: hand the whole display list to the GPU via DMA

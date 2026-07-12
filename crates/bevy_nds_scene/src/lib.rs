@@ -129,8 +129,7 @@ pub fn load_mesh(name: &str) -> Option<DsMesh> {
 pub fn level_space_path(level: &str, zone: &str) -> Vec<u8> {
     const PREFIX: &[u8] = b"nitro:/levels/";
     const SUFFIX: &[u8] = b".scene\0";
-    let mut path =
-        Vec::with_capacity(PREFIX.len() + level.len() + 1 + zone.len() + SUFFIX.len());
+    let mut path = Vec::with_capacity(PREFIX.len() + level.len() + 1 + zone.len() + SUFFIX.len());
     path.extend_from_slice(PREFIX);
     path.extend_from_slice(level.as_bytes());
     path.push(b'/');
@@ -151,7 +150,9 @@ impl LoadSpace {
     /// Request a neighbour zone by its stem within a level
     /// (see [`level_space_path`]).
     pub fn by_name(level: &str, zone: &str) -> Self {
-        Self { path: level_space_path(level, zone) }
+        Self {
+            path: level_space_path(level, zone),
+        }
     }
 }
 
@@ -180,8 +181,8 @@ impl Plugin for ScenePlugin {
 
 pub mod prelude {
     pub use crate::{
-        CameraMode, LoadSpace, LoadedScene, ScenePath, ScenePlugin, SceneConnData,
-        SceneData, SceneInstance, SceneInstanceData, level_space_path,
+        CameraMode, LoadSpace, LoadedScene, SceneConnData, SceneData, SceneInstance,
+        SceneInstanceData, ScenePath, ScenePlugin, level_space_path,
     };
 }
 
