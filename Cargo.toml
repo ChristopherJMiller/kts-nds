@@ -28,6 +28,7 @@ members = [
   "crates/png2bg",
   "crates/bevy_nds_scene",
   "crates/scene2bin",
+  "crates/kts_schema",
 ]
 # The desktop scene editor is a standalone host GUI app, detached from this DS
 # workspace (it has its own `[workspace]` + `.cargo/config.toml`); excluded so
@@ -54,6 +55,10 @@ bevy_nds_sprite = { path = "crates/bevy_nds_sprite" }
 bevy_nds_bg = { path = "crates/bevy_nds_bg" }
 bevy_nds_math = { path = "crates/bevy_nds_math" }
 bevy_nds_loop = { path = "crates/bevy_nds_loop" }
+
+# The game-owned authored vocabulary (roles, role-scoped kinds, flag bits/ids)
+# shared with the `scene2bin` baker — see crates/kts_schema.
+kts_schema = { path = "crates/kts_schema" }
 
 # Soft-float trig for the orbit-camera yaw (no FPU; matches the engine crates).
 libm = "0.2"
@@ -182,6 +187,9 @@ opt-level = 3
 opt-level = 3
 
 [profile.dev.package.bevy_nds_scene]
+opt-level = 3
+
+[profile.dev.package.kts_schema]
 opt-level = 3
 
 [profile.release]

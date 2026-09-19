@@ -78,7 +78,13 @@ fn compile_levels() {
             }
         }
         Err(e) => {
-            println!("cargo:warning=level baking failed: {e}");
+            // A `cargo:warning=` is all a build script can do — the build still
+            // succeeds, and `build/nitrofs/levels` keeps whatever was baked last
+            // time (or nothing). Say that loudly, and point at the recipe that
+            // *does* exit non-zero.
+            println!(
+                "cargo:warning=level baking FAILED — build/nitrofs/levels holds STALE or MISSING blobs: {e} (run `just check-levels`)"
+            );
             std::fs::write(&out_rs, scene2bin::predict_consts(&src)).ok();
         }
     }

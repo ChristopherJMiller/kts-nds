@@ -63,6 +63,16 @@ impl VulnerabilityShape {
             radius: Fx32::from_f32(CAPTURE_RADIUS),
         }
     }
+
+    /// The shape an enemy of this kind is vulnerable to.
+    ///
+    /// The kind→shape pairing is **OPEN on #29**; every kind is circle-vulnerable
+    /// today, so introducing the kind vocabulary changed no behaviour. This is
+    /// the ONE site the shape-matrix item rewrites — the spawn path already
+    /// reads the authored kind and routes it through here.
+    pub fn for_kind(_kind: kts_schema::EnemyKind) -> Self {
+        Self::circle()
+    }
 }
 
 /// How a capture ended (issue #26). `Liberated` is the canonical, rewarded path;

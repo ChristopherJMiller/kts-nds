@@ -5,6 +5,7 @@
 
 use eframe::egui;
 use egui::{Align2, Color32, FontId, Pos2, Rect, Sense, Shape, Stroke, Vec2};
+use scene2bin::schema::Role;
 use scene2bin::{Placement, Zone};
 
 use crate::app::{Drag, EditorApp, Sel};
@@ -283,11 +284,14 @@ impl EditorApp {
             } else {
                 Stroke::new(1.0_f32, Color32::from_black_alpha(160))
             };
-            match role.as_str() {
-                "enemy" => {
+            // Glyph by role: enemies read as diamonds, static geometry as rects,
+            // the avatar as a circle. An unparseable role falls through to a
+            // circle in the error tint (`role_style` already supplied it).
+            match Role::parse(&role) {
+                Some(Role::Enemy) => {
                     painter.add(Shape::convex_polygon(diamond(sp, r), col, outline));
                 }
-                "landmark" | "prop" => {
+                Some(Role::Landmark | Role::Prop | Role::Block) => {
                     painter.rect(
                         Rect::from_center_size(sp, Vec2::splat(r * 1.7)),
                         0.0,
@@ -296,7 +300,7 @@ impl EditorApp {
                         egui::StrokeKind::Inside,
                     );
                 }
-                _ => {
+                Some(Role::Avatar) | None => {
                     painter.circle(sp, r, col, outline);
                 }
             }

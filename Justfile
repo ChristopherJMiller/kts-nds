@@ -84,6 +84,7 @@ test *args:
         -p bevy_nds_save \
         -p bevy_nds_scene \
         -p scene2bin \
+        -p kts_schema \
         --target "$(rustc -vV | sed -n 's/^host: //p')" \
         --config 'unstable.build-std=["std","panic_unwind","proc_macro"]' \
         --config 'profile.dev.panic="unwind"' \
@@ -103,6 +104,15 @@ test-crate crate *args:
 # Run the desktop editor's own unit tests (its detached host workspace).
 test-editor *args:
     cd tools/scene-editor && cargo test {{args}}
+
+# Parse + validate + derive every level under assets/levels with a NON-ZERO exit
+# on any validation Error (build.rs only warns and falls back to stale blobs).
+check-levels:
+    cargo run -p scene2bin \
+        --target "$(rustc -vV | sed -n 's/^host: //p')" \
+        --config 'unstable.build-std=["std","panic_unwind","proc_macro"]' \
+        --config 'profile.dev.panic="unwind"' \
+        -- --check assets/levels --assets assets --prefabs assets/prefabs
 
 # Format the Rust sources.
 fmt:

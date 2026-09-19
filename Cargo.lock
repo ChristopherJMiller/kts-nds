@@ -757,6 +757,7 @@ dependencies = [
  "bevy_nds_scene",
  "bevy_nds_sprite",
  "bevy_time",
+ "kts_schema",
  "libm",
  "obj2dl",
  "png2bg",
@@ -764,6 +765,10 @@ dependencies = [
  "scene2bin",
  "wav2bank",
 ]
+
+[[package]]
+name = "kts_schema"
+version = "0.1.0"
 
 [[package]]
 name = "leb128fmt"
@@ -947,6 +952,8 @@ checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 name = "scene2bin"
 version = "0.1.0"
 dependencies = [
+ "bevy_nds_scene",
+ "kts_schema",
  "ron",
  "serde",
 ]

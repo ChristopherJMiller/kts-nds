@@ -6,13 +6,15 @@ use std::collections::BTreeMap;
 use bevy_nds_3d_obj::PreviewMesh;
 use eframe::egui;
 use egui::{Color32, Pos2, Sense, Stroke, Vec2};
+use scene2bin::schema::Role;
 use scene2bin::{Camera, Instance, Level, Material, Placement, Prefab, PrefabLib};
 
 /// A sensible starting prefab for the in-editor prefab editor (#51).
 pub(crate) fn default_prefab() -> Prefab {
     Prefab {
         mesh: Some("cube".to_string()),
-        role: "prop".to_string(),
+        role: Role::Prop.as_str().to_string(),
+        kind: None,
         rot: [0.0, 0.0, 0.0],
         scale: [0.16, 0.16, 0.16],
         material: Some(Material {
@@ -108,7 +110,8 @@ pub(crate) fn empty_level() -> Level {
 pub(crate) fn new_instance(at: Vec2) -> Instance {
     Instance {
         mesh: Some("cube".to_string()),
-        role: "landmark".to_string(),
+        role: Role::Landmark.as_str().to_string(),
+        kind: None,
         pos: [at.x, 0.0, at.y],
         rot: [0.0, 0.0, 0.0],
         scale: [0.16, 0.16, 0.16],
@@ -147,16 +150,22 @@ pub(crate) fn default_camera(tag: &str) -> Camera {
     }
 }
 
-/// (fill colour, radius) for an instance marker, keyed on role.
+/// An unparseable role's tint: loud magenta, so a stale or hand-typed role
+/// reads as *broken* on the canvas rather than as a slightly-different grey.
+pub(crate) const BAD_ROLE_COLOR: Color32 = Color32::from_rgb(235, 60, 220);
+
+/// (fill colour, radius) for an instance marker, keyed on role. Takes the raw
+/// authored string (a prefab `Use` resolves to one; see [`placement_role`]) and
+/// matches the [`Role`] vocabulary exhaustively — an unknown role gets
+/// [`BAD_ROLE_COLOR`].
 pub(crate) fn role_style(role: &str) -> (Color32, f32) {
-    match role {
-        "avatar" => (Color32::from_rgb(110, 180, 235), 8.0),
-        "enemy" => (Color32::from_rgb(225, 80, 70), 8.0),
-        "landmark" => (Color32::from_rgb(150, 150, 168), 7.0),
-        "block" => (Color32::from_rgb(110, 116, 130), 7.0),
-        "prop" => (Color32::from_rgb(120, 130, 120), 7.0),
-        "spawn" => (Color32::from_rgb(110, 200, 140), 6.0),
-        _ => (Color32::from_rgb(210, 210, 220), 6.0),
+    match Role::parse(role) {
+        Some(Role::Avatar) => (Color32::from_rgb(110, 180, 235), 8.0),
+        Some(Role::Enemy) => (Color32::from_rgb(225, 80, 70), 8.0),
+        Some(Role::Landmark) => (Color32::from_rgb(150, 150, 168), 7.0),
+        Some(Role::Block) => (Color32::from_rgb(110, 116, 130), 7.0),
+        Some(Role::Prop) => (Color32::from_rgb(120, 130, 120), 7.0),
+        None => (BAD_ROLE_COLOR, 6.0),
     }
 }
 
@@ -205,21 +214,28 @@ pub(crate) fn opt_vec3_row(ui: &mut egui::Ui, label: &str, v: &mut Option<[f32; 
     });
 }
 
-/// The named bits of the instance `flags: u32`, per the #27 (2026-07-11) generalized
-/// flag model. Semantics live in the game/runtime; the editor only *names the
-/// authorable bits* (#54). Extend as the reserved bits (vuln-state, item/supply,
-/// tether) get defined.
-pub(crate) const FLAG_BITS: &[(u32, &str)] = &[
-    (0x1, "OBJECTIVE"),       // gate objective — counts toward its zone's clear_flag
-    (0x2, "LEVEL_OBJECTIVE"), // freeform capture — rolls up to the level exit
-];
-
-/// Draw the named-bit checkboxes for `flags`, plus a raw value for undefined
-/// bits (#54). Returns nothing; edits `flags` in place.
-pub(crate) fn named_flags_ui(ui: &mut egui::Ui, label: &str, flags: &mut u32) {
+/// Draw the named-bit checkboxes for `flags`, plus a raw value for anything
+/// hand-set (#54). Only the bits `role` may actually carry
+/// ([`Role::allowed_flags`]) are offered, and the raw `DragValue` is masked to
+/// the same set — so the editor can't author a state the bake would reject.
+pub(crate) fn named_flags_ui(ui: &mut egui::Ui, label: &str, flags: &mut u32, role: Role) {
+    let allowed = role.allowed_flags();
     ui.label(label);
+    if allowed == 0 {
+        // Display only — never rewrite the document just because it was drawn.
+        // A stray bit is a bake Error the problems panel already reports, and it
+        // is cleared by an actual user edit, not by looking at the instance.
+        ui.weak("(no authorable flags for this role)");
+        if *flags != 0 {
+            ui.colored_label(BAD_ROLE_COLOR, format!("raw {:#x} — won't bake", *flags));
+        }
+        return;
+    }
     ui.horizontal_wrapped(|ui| {
-        for (bit, name) in FLAG_BITS {
+        for (bit, name) in scene2bin::schema::flag_bits::NAMED {
+            if allowed & bit == 0 {
+                continue;
+            }
             let mut on = *flags & bit != 0;
             if ui.checkbox(&mut on, *name).changed() {
                 if on {
@@ -232,20 +248,90 @@ pub(crate) fn named_flags_ui(ui: &mut egui::Ui, label: &str, flags: &mut u32) {
     });
     ui.horizontal(|ui| {
         ui.label("raw u32");
-        ui.add(egui::DragValue::new(flags).speed(1.0));
+        if ui.add(egui::DragValue::new(flags).speed(1.0)).changed() {
+            *flags &= allowed;
+        }
     });
 }
 
 /// A named-bit flags editor for a `Some(u32)` override (the prefab-`Use` case),
-/// gated behind an on/off checkbox (#54).
-pub(crate) fn opt_named_flags_ui(ui: &mut egui::Ui, label: &str, v: &mut Option<u32>) {
+/// gated behind an on/off checkbox (#54). `role` is the *effective* role — the
+/// prefab's, for a `Use` — so the same allowed-bit mask applies.
+pub(crate) fn opt_named_flags_ui(ui: &mut egui::Ui, label: &str, v: &mut Option<u32>, role: Role) {
     let mut on = v.is_some();
     if ui.checkbox(&mut on, label).changed() {
         *v = on.then_some(0);
     }
     if let Some(f) = v {
-        named_flags_ui(ui, "bits", f);
+        named_flags_ui(ui, "bits", f, role);
     }
+}
+
+/// A role picker plus the role-scoped `kind` combo, shared by the
+/// literal-instance and prefab editors. Clears `kind` when the chosen role has
+/// no kinds, so the two fields can never disagree.
+///
+/// `allow_avatar` widens the list from [`Role::AUTHORABLE`] to [`Role::ALL`]:
+/// the bake demands exactly one `avatar` and it must sit in the level's entry
+/// zone, so only a literal in *that* zone may pick it (a prefab never can — a
+/// prefab is a reusable template and the avatar is unique). The instance's
+/// **current** role is always offered as well, so an existing avatar stays
+/// selectable after a mis-click instead of being a one-way trip out of the
+/// vocabulary.
+pub(crate) fn role_kind_ui(
+    ui: &mut egui::Ui,
+    id: &str,
+    role: &mut String,
+    kind: &mut Option<String>,
+    allow_avatar: bool,
+) {
+    let choices: &[Role] = if allow_avatar {
+        Role::ALL
+    } else {
+        Role::AUTHORABLE
+    };
+    ui.horizontal(|ui| {
+        ui.label("role:");
+        egui::ComboBox::from_id_salt(format!("{id}-role"))
+            .selected_text(role.clone())
+            .show_ui(ui, |ui| {
+                for r in choices {
+                    ui.selectable_value(role, r.as_str().to_string(), r.as_str());
+                }
+                // Keep the way back: a role this picker wouldn't offer fresh
+                // (an `avatar` being edited outside the entry zone) is still
+                // re-selectable, so no single click is irreversible.
+                if let Some(cur) = Role::parse(role)
+                    && !choices.contains(&cur)
+                {
+                    ui.selectable_value(role, cur.as_str().to_string(), cur.as_str());
+                }
+            });
+    });
+
+    let kinds = Role::parse(role).map(|r| r.kinds()).unwrap_or(&[]);
+    if kinds.is_empty() {
+        *kind = None;
+        return;
+    }
+    ui.horizontal(|ui| {
+        ui.label("kind:");
+        egui::ComboBox::from_id_salt(format!("{id}-kind"))
+            .selected_text(kind.clone().unwrap_or_else(|| "(default)".into()))
+            .show_ui(ui, |ui| {
+                if ui.selectable_label(kind.is_none(), "(default)").clicked() {
+                    *kind = None;
+                }
+                for k in kinds {
+                    if ui
+                        .selectable_label(kind.as_deref() == Some(*k), *k)
+                        .clicked()
+                    {
+                        *kind = Some((*k).to_string());
+                    }
+                }
+            });
+    });
 }
 
 /// A placement's effective role for display: a literal's own role, or the

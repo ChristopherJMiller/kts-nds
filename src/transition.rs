@@ -315,7 +315,9 @@ fn swap_zone(
     // The avatar is the single persistent entity, carried across by the caller —
     // never re-spawned. Strip the new active zone's avatar instance (only the
     // entry zone authors one, but it would otherwise re-specialize a duplicate).
-    scene.instances.retain(|i| i.role != "avatar");
+    scene
+        .instances
+        .retain(|i| kts_schema::Role::parse(&i.role) != Some(kts_schema::Role::Avatar));
 
     // Despawn the old active zone's instances, the previous resident neighbours,
     // all floors, and the old gate barriers (the persistent avatar + chrome carry

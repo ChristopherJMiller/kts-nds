@@ -55,6 +55,7 @@ mod flags;
 mod menu;
 mod player;
 mod radial;
+mod spawn;
 mod transition;
 
 use player::{Health, Height, Locomotion, Motion, PlayerState, Shadow, StickState};
@@ -354,11 +355,15 @@ fn spawn_resident_neighbours(commands: &mut Commands, zone: &Zone, snapshot: &Zo
     }
 }
 
-/// Spawn one neighbour zone's instances as render-only entities, offset into the
-/// active frame. No `SceneInstance` (so `specialize_scene` skips them — no
-/// duplicate gameplay entity) and no map sprite; just mesh + transform +
-/// material, tagged `NeighbourInstance` so the next crossing can clear them. The
-/// avatar instance is skipped — the avatar is the single persistent entity.
+/// Spawn one neighbour zone's instances, offset into the active frame. They get
+/// no `SceneInstance` (so `specialize_scene` skips them — no duplicate gameplay
+/// entity) and are tagged `NeighbourInstance` so the next crossing can clear
+/// them; on top of that render shell, [`spawn::attach`] adds exactly the same
+/// gameplay components the active zone gets, with
+/// [`spawn::Residency::Neighbour`] as the one visible difference (enemies are
+/// live and capturable through the fog; landmarks stay render-only). The avatar
+/// instance is skipped by [`spawn::skip_spawn`] — it's the single persistent
+/// entity.
 fn spawn_neighbour(
     commands: &mut Commands,
     scene: &bevy_nds_scene::SceneData,
@@ -366,86 +371,58 @@ fn spawn_neighbour(
     stem: &str,
     snapshot: &ZoneCaptureState,
 ) {
+    let ctx = spawn::SpawnCtx {
+        stem,
+        offset,
+        residency: spawn::Residency::Neighbour,
+    };
     for inst in &scene.instances {
-        if inst.role == "avatar" {
-            continue;
-        }
-        // Enemy identity: its LOCAL (pre-offset) spawn position + zone stem, plus
-        // the render `offset` so its live position persists in the local frame.
-        let enemy_member = (inst.role == "enemy").then(|| ZoneMember {
-            stem: alloc::string::String::from(stem),
-            key: zone_key(inst.pos[0], inst.pos[2]),
-            offset,
+        // An unparsed role (a stale blob) stays render-only, exactly as before.
+        let mut authored = kts_schema::Role::parse(&inst.role).map(|role| spawn::Authored {
+            role,
+            kind: inst.kind,
+            flags: inst.flags,
+            local: inst.pos,
+            rot: Vec3::from_array(inst.rot),
+            scale: Vec3::from_array(inst.scale),
+            path: &inst.path,
+            material: inst
+                .material
+                .map(|(diffuse, ambient)| DsMaterial { diffuse, ambient }),
+            aabb: None, // filled from the mesh below (after the skip check)
         });
-        let restored = enemy_member.as_ref().and_then(|m| snapshot.restore(m));
-        // Skip-at-spawn (#27): a captured neighbour enemy isn't spawned at all —
-        // not even its render entity — so there's no flash and nothing to process.
-        if restored.is_some_and(|s| s.resolved.is_some()) {
+        // Skip-at-spawn (#27) *before* anything is allocated: a neighbour avatar
+        // and an already-captured enemy never become entities at all, so there's
+        // no flash and nothing to process.
+        if authored
+            .as_ref()
+            .is_some_and(|a| spawn::skip_spawn(a, &ctx, snapshot))
+        {
             continue;
         }
-        // Spawn at the restored *local* position (into the active frame via the
-        // offset) if we've seen this enemy, else at its authored position.
-        let world = match restored {
-            Some(st) => Vec3::new(st.local.0 + offset.0, inst.pos[1], st.local.1 + offset.1),
-            None => Vec3::new(inst.pos[0] + offset.0, inst.pos[1], inst.pos[2] + offset.1),
-        };
+        let mesh = inst.mesh.as_deref().and_then(bevy_nds_scene::load_mesh);
+        if let (Some(a), Some(m)) = (authored.as_mut(), mesh.as_ref()) {
+            a.aabb = m.baked.as_ref().map(|b| b.aabb);
+        }
+        // The authored placement; `attach` overwrites it for an enemy resuming
+        // from the snapshot (same command flush, so nothing renders in between).
         let mut e = commands.spawn((
             NeighbourInstance,
             Transform3d {
-                translation: world,
+                translation: Vec3::new(inst.pos[0] + offset.0, inst.pos[1], inst.pos[2] + offset.1),
                 rotation: Vec3::from_array(inst.rot),
                 scale: Vec3::from_array(inst.scale),
             },
         ));
-        if let Some(name) = &inst.mesh {
-            if let Some(mesh) = bevy_nds_scene::load_mesh(name) {
-                e.insert(mesh);
-            }
+        if let Some(mesh) = mesh {
+            e.insert(mesh);
         }
         if let Some((diffuse, ambient)) = inst.material {
             e.insert(DsMaterial { diffuse, ambient });
         }
-        // Enemy neighbours are **full gameplay entities** at their offset (#27
-        // follow-up): they patrol (range-culled) and are capturable through the
-        // fog, and their full runtime state persists across a crossing (`ZoneMember`
-        // + the snapshot). Non-enemy neighbours (landmarks) stay render-only.
-        if let Some(member) = enemy_member {
-            let (enemy, cap) = match restored {
-                Some(st) => (
-                    Enemy {
-                        wp: st.wp,
-                        pause: st.pause,
-                    },
-                    capture::Capture {
-                        progress: st.progress,
-                        resolved: None,
-                    },
-                ),
-                None => (Enemy { wp: 1, pause: 0 }, capture::Capture::default()),
-            };
-            e.insert((
-                enemy,
-                cap,
-                capture::VulnerabilityShape::circle(),
-                WorldPos(FxVec2::from_f32(world.x, world.z)),
-                Stylized,
-                Sprite::new(sprites::BLIP).at(0, PARK_Y),
-                member,
-                // Patrol waypoints offset into the active frame (the path is
-                // authored in the neighbour's local coords).
-                ScenePath(
-                    inst.path
-                        .iter()
-                        .map(|p| bevy_nds_scene::Vec2::new(p[0] + offset.0, p[1] + offset.1))
-                        .collect(),
-                ),
-            ));
-            if inst.flags & flags::OBJECTIVE != 0 {
-                e.insert(flags::Objective);
-            }
-            if inst.flags & flags::LEVEL_OBJECTIVE != 0 {
-                e.insert(flags::LevelObjectiveTag);
-            }
+        if let Some(a) = &authored {
+            // `None`: a neighbour's landmarks aren't in the active collision set.
+            spawn::attach(&mut e, a, &ctx, snapshot, None);
         }
     }
 }
@@ -519,13 +496,14 @@ struct Persistent;
 #[derive(Component)]
 struct NeighbourInstance;
 
-/// A static landmark obstacle, attached by `specialize_scene` to every scene
-/// instance with `role: "landmark"`.
+/// A static landmark obstacle, attached by [`spawn::attach`] to every
+/// **active-zone** scene instance whose role parses as
+/// [`kts_schema::Role::Landmark`].
 #[derive(Component)]
 struct Landmark;
 
 /// Landmark world positions, harvested from the loaded space by
-/// `specialize_scene` so avatar collision has a single source of truth (no
+/// [`spawn::attach`] so avatar collision has a single source of truth (no
 /// duplicated const). Populated once when the space's instances first appear.
 #[derive(Resource, Default)]
 struct Landmarks(alloc::vec::Vec<FxVec2>);
@@ -578,18 +556,40 @@ struct EnemyState {
 /// enemy (re)spawns, so a zone that despawned on a crossing and respawns later
 /// resumes each enemy where it was. Persistence holds within the resident window
 /// (current zone + its 1-hop neighbours); a fully-unloaded zone resets.
+/// Held as a small association list rather than a `BTreeMap` keyed by
+/// `(String, i32, i32)`: a map key that owns its stem can only be probed by
+/// *building* one, i.e. cloning the stem — and [`mirror_capture`] saves every
+/// resident enemy every frame, so that was a heap allocation per enemy per
+/// frame. The resident window is one zone plus its 1-hop neighbours (a handful
+/// of enemies), so the linear scan costs less than the allocation it replaces,
+/// and it lets the spawn path probe from a bare `&str`.
 #[derive(Resource, Default)]
-struct ZoneCaptureState(
-    alloc::collections::BTreeMap<(alloc::string::String, i32, i32), EnemyState>,
-);
+struct ZoneCaptureState(alloc::vec::Vec<(alloc::string::String, (i32, i32), EnemyState)>);
 
 impl ZoneCaptureState {
     /// The persisted state for an enemy, or `None` if never seen (spawn fresh).
     fn restore(&self, m: &ZoneMember) -> Option<EnemyState> {
-        self.0.get(&(m.stem.clone(), m.key.0, m.key.1)).copied()
+        self.restore_at(&m.stem, m.key)
+    }
+    /// [`Self::restore`] without a [`ZoneMember`] — the spawn path's skip check
+    /// asks *before* one is worth building (and allocating).
+    fn restore_at(&self, stem: &str, key: (i32, i32)) -> Option<EnemyState> {
+        self.0
+            .iter()
+            .find(|(s, k, _)| *k == key && s.as_str() == stem)
+            .map(|(_, _, st)| *st)
     }
     fn save(&mut self, m: &ZoneMember, st: EnemyState) {
-        self.0.insert((m.stem.clone(), m.key.0, m.key.1), st);
+        // Overwrite in place where we can: only an enemy's first sighting since
+        // the last reset allocates.
+        match self
+            .0
+            .iter_mut()
+            .find(|(s, k, _)| *k == m.key && s.as_str() == m.stem)
+        {
+            Some(slot) => slot.2 = st,
+            None => self.0.push((m.stem.clone(), m.key, st)),
+        }
     }
 }
 
@@ -766,6 +766,16 @@ fn setup(
         zone.set(&scene); // boot zone's bounds + connections
         spawn_zone_floor(&mut commands, scene.bounds, (0.0, 0.0)); // active floor (sized to bounds)
         bevy_nds_scene::spawn(&mut commands, scene); // active zone (incl. the avatar)
+    } else {
+        // A half-bumped `.scene` VERSION or a stale `build/nitrofs/` parses as
+        // `None` and would otherwise boot an *empty world* with no clue why. Say
+        // so on the bottom screen. (The level-exit item's `boot_level` None arm
+        // inherits this line — keep it there.)
+        commands.spawn((
+            DsScreen::Bottom,
+            TilePos::new(1, 21),
+            DsText::new("scene load failed"),
+        ));
     }
     // Walls at this zone's locked gated edges (#27): the in-world "gated in" tell.
     spawn_gate_barriers(&mut commands, &zone, &game_flags);
@@ -854,117 +864,75 @@ fn setup(
 }
 
 /// The game-specific half of the scene pipeline: turn freshly loaded, opaque
-/// scene instances into gameplay entities by their authored `role`.
+/// scene instances into gameplay entities by their authored `role` + `kind`.
 /// `bevy_nds_scene` stays game-agnostic (it only knows meshes, transforms,
-/// materials, and a role string); this is where `"avatar"` / `"enemy"` /
-/// `"landmark"` become the game's components. The `Added` filter runs it once
-/// per instance; a loaded instance's ground position comes from its spawned
-/// `Transform3d` (x, z), seeding the `WorldPos` that `sync_3d` then drives.
+/// materials, a role string and a kind byte); the vocabulary those name lives in
+/// `kts_schema`, and the mapping onto components is [`spawn::attach`] — shared
+/// with `spawn_neighbour`, so the active zone and its resident neighbours can't
+/// drift. The `Added` filter runs this once per instance; a loaded instance's
+/// ground position comes from its spawned `Transform3d` (x, z), which for the
+/// active zone *is* its local position.
 fn specialize_scene(
     mut commands: Commands,
     mut landmarks: ResMut<Landmarks>,
     zone: Res<Zone>,
     snapshot: Res<ZoneCaptureState>,
-    q: Query<(Entity, &SceneInstance, &Transform3d), Added<SceneInstance>>,
+    q: Query<
+        (
+            Entity,
+            &SceneInstance,
+            &Transform3d,
+            Option<&ScenePath>,
+            Option<&DsMesh>,
+            Option<&DsMaterial>,
+        ),
+        Added<SceneInstance>,
+    >,
 ) {
-    for (e, inst, tf) in &q {
-        let pos = WorldPos(FxVec2::from_f32(tf.translation.x, tf.translation.z));
-        match inst.role.as_str() {
-            "avatar" => {
-                // The avatar is the single persistent entity (#27 seamless
-                // streaming): consumed once from the entry zone at boot, it drops
-                // its `SceneInstance` and gains `Persistent` so no crossing ever
-                // despawns it (later zone spawns strip their avatar instance, so
-                // this arm fires exactly once).
-                commands.entity(e).remove::<SceneInstance>().insert((
-                    Avatar,
-                    Persistent,
-                    pos,
-                    Height::default(),
-                    Sprite::new(sprites::PLAYER).at(0, PARK_Y),
-                ));
-            }
-            "enemy" => {
-                // Active zone is origin-centric (offset 0), so the spawned
-                // transform *is* the local position — the stable persistence key.
-                let member = ZoneMember {
-                    stem: zone.stem.clone(),
-                    key: zone_key(tf.translation.x, tf.translation.z),
-                    offset: (0.0, 0.0),
-                };
-                let restored = snapshot.restore(&member);
-                // Skip-at-spawn (#27): an already-captured enemy isn't spawned at
-                // all — no lingering Hidden entity, no per-frame processing, no
-                // flash. The crate already spawned a render entity for it, so drop
-                // that. Completion is recorded in the persistent Flags/LevelProgress,
-                // so nothing downstream needs the dead enemy. START-reset clears the
-                // snapshot + reloads the zone to bring captured enemies back.
-                if restored.is_some_and(|s| s.resolved.is_some()) {
-                    commands.entity(e).despawn();
-                    continue;
-                }
-                // Resume the enemy's full state (position + patrol + progress) if
-                // it was seen before, else spawn fresh at its authored position.
-                let (enemy, cap, epos) = match restored {
-                    Some(st) => (
-                        Enemy {
-                            wp: st.wp,
-                            pause: st.pause,
-                        },
-                        capture::Capture {
-                            progress: st.progress,
-                            resolved: None,
-                        },
-                        WorldPos(FxVec2::from_f32(st.local.0, st.local.1)), // offset 0
-                    ),
-                    None => (Enemy { wp: 1, pause: 0 }, capture::Capture::default(), pos),
-                };
-                let mut ec = commands.entity(e);
-                ec.insert((
-                    enemy,
-                    cap,
-                    capture::VulnerabilityShape::circle(),
-                    epos,
-                    // Outlined + cel-shaded so the threat reads at a glance;
-                    // terrain stays smooth (see `Stylized`).
-                    Stylized,
-                    Sprite::new(sprites::BLIP).at(0, PARK_Y),
-                    member,
-                    // Correct the render transform now (not next frame via
-                    // `sync_3d`): a restored enemy's crate-spawned transform sits at
-                    // its *authored* position, so overwrite it with the resumed one.
-                    Transform3d {
-                        translation: Vec3::new(
-                            epos.0.x.to_f32(),
-                            tf.translation.y,
-                            epos.0.y.to_f32(),
-                        ),
-                        rotation: tf.rotation,
-                        scale: tf.scale,
-                    },
-                ));
-                // Objective enemies (OBJECTIVE bit) count toward the zone-clear
-                // gate (#27); freeform ones don't. `flags` rides the `SceneInstance`.
-                if inst.flags & flags::OBJECTIVE != 0 {
-                    ec.insert(flags::Objective);
-                }
-                // Level-objective enemies (LEVEL_OBJECTIVE bit) roll up to the
-                // level exit instead of a zone gate (#27 tier 2).
-                if inst.flags & flags::LEVEL_OBJECTIVE != 0 {
-                    ec.insert(flags::LevelObjectiveTag);
-                }
-            }
-            "landmark" => {
-                landmarks.0.push(pos.0);
-                commands.entity(e).insert((
-                    Landmark,
-                    pos,
-                    Sprite::new(sprites::OBSTACLE).at(0, PARK_Y),
-                ));
-            }
-            // Unknown roles render (mesh + transform) but carry no behaviour.
-            _ => {}
+    let ctx = spawn::SpawnCtx {
+        stem: &zone.stem,
+        offset: (0.0, 0.0), // the active zone is origin-centric
+        residency: spawn::Residency::Active,
+    };
+    for (e, inst, tf, path, mesh, material) in &q {
+        // An unparsed role (a stale blob, or a level from a newer build) renders
+        // — mesh + transform, already spawned by the loader — but carries no
+        // behaviour. The bake rejects one, so this only fires on a stale ROM.
+        let Some(role) = kts_schema::Role::parse(&inst.role) else {
+            continue;
+        };
+        // One small Vec per instance at spawn (never per frame), so both callers
+        // hand `Authored` the same `&[[f32; 2]]` shape.
+        let pts: Vec<[f32; 2]> = path
+            .map(|p| p.0.iter().map(|v| [v.x, v.y]).collect())
+            .unwrap_or_default();
+        let authored = spawn::Authored {
+            role,
+            kind: inst.kind,
+            flags: inst.flags,
+            local: tf.translation.to_array(),
+            rot: tf.rotation,
+            scale: tf.scale,
+            path: &pts,
+            material: material.copied(),
+            aabb: mesh.and_then(|m| m.baked.as_ref().map(|b| b.aabb)),
+        };
+        // Skip-at-spawn (#27): an already-captured enemy isn't kept at all — no
+        // lingering Hidden entity, no per-frame processing, no flash. The loader
+        // already spawned a render entity for it, so drop that. Completion lives
+        // in the persistent `Flags`/`LevelProgress`; a START reset clears the
+        // snapshot and reloads the zone to bring captured enemies back.
+        if spawn::skip_spawn(&authored, &ctx, &snapshot) {
+            commands.entity(e).despawn();
+            continue;
         }
+        spawn::attach(
+            &mut commands.entity(e),
+            &authored,
+            &ctx,
+            &snapshot,
+            Some(&mut landmarks),
+        );
     }
 }
 

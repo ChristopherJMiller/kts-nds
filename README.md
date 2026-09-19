@@ -214,7 +214,10 @@ For the smaller, faster build, append `release`, e.g. `just run release`.
 | `just preview [profile]` | Build, package, boot in **desmume** headlessly, save `preview.png` and print frame-time stats (`samples=… min=… avg=… p95=… fps_avg=…`) read from the ROM's `PERF_BLOB` via the gdbstub. Override with `OUT=`, `WAIT=`, `DISP=`, `GDBPORT=`. |
 | `just snap [profile]`    | Like `preview`, but with a short default `WAIT` for grabbing the first stable frame (README banners, changelog snaps). Accepts fractional seconds. |
 | `just check`             | `cargo check`.                                             |
-| `just test [filter]`     | Run the `bevy_nds` host-side unit tests (builds for the host triple). |
+| `just test [filter]`     | Run the `bevy_nds` host-side unit tests (builds for the host triple). `filter` is a test-**name** filter, not a package filter. |
+| `just test-crate <crate> [filter]` | Run one crate's host tests (the per-crate form of `just test`). |
+| `just check-editor` / `just test-editor` | Type-check / test the detached desktop level editor. |
+| `just check-levels`      | Validate every level under `assets/levels/` — non-zero exit on any Error (`build.rs` can only warn). |
 | `just fmt`               | `cargo fmt`.                                               |
 | `just clean`             | Remove build artifacts and the ROM.                        |
 
@@ -283,7 +286,14 @@ crates/wav2bank/                host CLI/lib: WAV -> soundbank.bin via mmutil (u
 crates/obj2dl/                  host CLI/lib: OBJ -> .dl NitroFS asset (used by build.rs)
 crates/bevy_nds_bg/             tile + bitmap BG layers (BackgroundPlugin + Backgrounds resource)
 crates/png2bg/                  host CLI/lib: PNG -> .bg/.bbg NitroFS asset via grit (used by build.rs)
+crates/bevy_nds_scene/          game-agnostic .scene loader (opaque role string + kind byte)
+crates/scene2bin/               host CLI/lib: assets/levels/<name>/ -> .scene blobs + validate_all
+crates/kts_schema/              the game's authored vocabulary: roles, role-scoped kinds, flag bits/ids
+tools/scene-editor/             desktop level editor (detached workspace; reads scene2bin's RON)
+src/spawn.rs                    the one authored-instance -> components dispatch (attach/skip_spawn)
 assets/                         uncompiled source models (e.g. teapot.obj)
+assets/levels/<name>/           authored levels: level.ron manifest + one <zone>.ron per zone
+assets/prefabs/                 reusable instance templates resolved host-side at bake
 audio/                          uncompiled source sounds (music/*.wav, sfx/*.wav)
 build/nitrofs/                  compiled .dl + soundbank.bin, packed into the ROM (gitignored)
 ```

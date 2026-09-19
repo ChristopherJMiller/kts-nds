@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use bevy_nds_3d_obj::PreviewMesh;
 use eframe::egui;
 use egui::{Pos2, Rect, Vec2};
+use scene2bin::schema::Role;
 use scene2bin::{Camera, Instance, Level, Material, Placement, Prefab, PrefabLib, Zone, ZoneEntry};
 
 use crate::history::History;
@@ -294,16 +295,26 @@ impl EditorApp {
     }
 
     pub(crate) fn save(&mut self) {
-        // Validate each assembled zone first so the editor can't write a level
-        // that won't bake (unknown prefab, missing mesh, degenerate bounds).
+        // Validate the whole level first so the editor can't write one that won't
+        // bake (unknown prefab/role/kind, a disallowed flag bit, missing mesh,
+        // degenerate bounds, no avatar in the entry zone…). Warnings are fine —
+        // gray-boxing and a half-authored arena are legitimate work in progress.
         match scene2bin::assemble(&self.level, &self.contents, &self.prefabs) {
             Ok(zones) => {
                 let mesh_exists = |name: &str| self.meshes.iter().any(|m| m == name);
-                for (stem, space) in &zones {
-                    if let Err(e) = scene2bin::validate(space, mesh_exists) {
-                        self.status = format!("not saved — zone `{stem}`: {e}");
-                        return;
-                    }
+                let issues = scene2bin::validate_all(&self.level, &zones, mesh_exists);
+                let errors: Vec<String> = issues
+                    .iter()
+                    .filter(|i| i.severity == scene2bin::Severity::Error)
+                    .map(|i| format!("{}: {}", i.scope(), i.msg))
+                    .collect();
+                if !errors.is_empty() {
+                    self.status = format!(
+                        "not saved — {} error(s): {}",
+                        errors.len(),
+                        errors.join("; ")
+                    );
+                    return;
                 }
             }
             Err(e) => {
@@ -436,30 +447,10 @@ impl EditorApp {
             return;
         }
         self.level_dir = dir.to_string_lossy().into_owned();
-        let mut zones = BTreeMap::new();
-        zones.insert(
-            "start".to_string(),
-            ZoneEntry {
-                place: [0.0, 0.0],
-                bounds: scene2bin::Bounds::default(),
-                camera: Camera::default(),
-                clear_flag: 0,
-                gates: Vec::new(),
-            },
-        );
-        self.level = Level {
-            name: name.to_string(),
-            entry: "start".to_string(),
-            zones,
-        };
-        self.contents = BTreeMap::new();
-        self.contents.insert(
-            "start".to_string(),
-            Zone {
-                instances: Vec::new(),
-            },
-        );
-        self.active = Some("start".to_string());
+        let (level, contents) = scaffold_level(name);
+        self.level = level;
+        self.contents = contents;
+        self.active = Some(SCAFFOLD_ZONE.to_string());
         self.sel = Sel::none();
         self.history_reset();
         self.save();
@@ -527,6 +518,7 @@ impl EditorApp {
         let prefab = Prefab {
             mesh: inst.mesh.clone(),
             role: inst.role.clone(),
+            kind: inst.kind.clone(),
             rot: inst.rot,
             scale: inst.scale,
             material: inst.material,
@@ -562,7 +554,9 @@ impl EditorApp {
         let at = self.view.center;
         let inst = Instance {
             mesh: Some(mesh),
-            role: "block".to_string(),
+            role: Role::Block.as_str().to_string(),
+            // `block` has no kinds yet (the collide item may add box/ramp/round).
+            kind: None,
             pos: [at.x, 0.0, at.y],
             rot: [0.0, 0.0, 0.0],
             scale: [0.8, 0.8, 0.8],
@@ -1033,6 +1027,64 @@ fn cylinder_obj(sides: usize) -> String {
     s
 }
 
+/// The stem of the zone a scaffolded level starts with.
+pub(crate) const SCAFFOLD_ZONE: &str = "start";
+
+/// The documents a brand-new level starts from (#55): one `start` entry zone
+/// holding the level's **required** avatar.
+///
+/// The avatar is not decoration. `scene2bin::validate_all` makes "no avatar" and
+/// "avatar outside the entry zone" hard bake `Error`s, and [`EditorApp::save`]
+/// refuses on any Error — so a scaffold without one would be a level the editor
+/// could create but never save. Kept pure (no IO) so the test below can assert
+/// exactly that.
+pub(crate) fn scaffold_level(name: &str) -> (Level, BTreeMap<String, Zone>) {
+    let mut zones = BTreeMap::new();
+    zones.insert(
+        SCAFFOLD_ZONE.to_string(),
+        ZoneEntry {
+            place: [0.0, 0.0],
+            bounds: scene2bin::Bounds::default(),
+            camera: Camera::default(),
+            clear_flag: 0,
+            gates: Vec::new(),
+        },
+    );
+    let level = Level {
+        name: name.to_string(),
+        entry: SCAFFOLD_ZONE.to_string(),
+        zones,
+    };
+    let mut contents = BTreeMap::new();
+    contents.insert(
+        SCAFFOLD_ZONE.to_string(),
+        Zone {
+            instances: vec![Placement::Lit(scaffold_avatar())],
+        },
+    );
+    (level, contents)
+}
+
+/// The avatar literal a scaffolded entry zone seeds — the same shape the shipped
+/// `facility/atrium.ron` authors (teapot, laid flat, player blue).
+fn scaffold_avatar() -> Instance {
+    Instance {
+        mesh: Some("teapot".to_string()),
+        role: Role::Avatar.as_str().to_string(),
+        kind: None,
+        pos: [0.0, 0.0, 0.0],
+        // Laid flat: the teapot OBJ is authored Z-up.
+        rot: [-std::f32::consts::FRAC_PI_2, 0.0, 0.0],
+        scale: [0.11, 0.11, 0.11],
+        material: Some(Material {
+            diffuse: [110, 180, 235],
+            ambient: [26, 40, 58],
+        }),
+        flags: 0,
+        path: Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1061,5 +1113,41 @@ mod tests {
     #[test]
     fn cylinder_bakes() {
         assert_bakes(&cylinder_obj(12));
+    }
+
+    /// `+ new` must produce a level the editor can immediately **save**.
+    /// `save` refuses on any `Severity::Error`, and the level-scope rules make a
+    /// missing / misplaced avatar exactly that — so an avatar-less scaffold
+    /// would strand the author in a directory they could never write to.
+    #[test]
+    fn new_level_scaffold_has_no_validation_errors() {
+        let (level, contents) = scaffold_level("demo");
+        let prefabs = PrefabLib::new();
+        let zones = scene2bin::assemble(&level, &contents, &prefabs)
+            .expect("the scaffold assembles (no prefab uses)");
+        let issues = scene2bin::validate_all(&level, &zones, |m| m == "teapot" || m == "cube");
+        let errors: Vec<String> = issues
+            .iter()
+            .filter(|i| i.severity == scene2bin::Severity::Error)
+            .map(|i| format!("{}: {}", i.scope(), i.msg))
+            .collect();
+        assert!(errors.is_empty(), "scaffold must bake clean: {errors:?}");
+    }
+
+    /// The scaffolded avatar is in the entry zone and is the only one — the two
+    /// halves of the level-scope rule, pinned so a future scaffold tweak (a
+    /// second seeded zone, say) can't quietly duplicate or move it.
+    #[test]
+    fn new_level_scaffold_seeds_exactly_one_avatar_in_the_entry_zone() {
+        let (level, contents) = scaffold_level("demo");
+        let avatars: Vec<&String> = contents
+            .iter()
+            .flat_map(|(stem, z)| z.instances.iter().map(move |p| (stem, p)))
+            .filter(|(_, p)| {
+                matches!(p, Placement::Lit(i) if Role::parse(&i.role) == Some(Role::Avatar))
+            })
+            .map(|(stem, _)| stem)
+            .collect();
+        assert_eq!(avatars, vec![&level.entry], "one avatar, in the entry zone");
     }
 }

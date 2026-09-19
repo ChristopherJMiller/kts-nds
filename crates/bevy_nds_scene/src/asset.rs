@@ -9,7 +9,7 @@
 //! | offset | type        | field                                          |
 //! |--------|-------------|------------------------------------------------|
 //! | 0      | u32         | magic "BSC1"                                   |
-//! | 4      | u16         | format version (currently 3)                   |
+//! | 4      | u16         | format version (currently 4)                   |
 //! | 6      | u16         | camera mode (0 Follow/1 TopDown/2 Rail/3 Capt) |
 //! | 8      | f32 × 4     | camera params (mode-specific)                  |
 //! | 24     | u32         | instance count N                               |
@@ -26,6 +26,7 @@
 //!   u8    has_material
 //!   u8×3  diffuse / u8×3 ambient
 //!   u32   flags
+//!   u8    kind       (v4; role-scoped sub-archetype, game-defined)
 //!   u16   path_len   then f32×2 (x,z) × path_len  (ground-plane waypoints)
 //!
 //! Conn (derived host-side from the global layout; never hand-authored):
@@ -51,7 +52,9 @@ pub const MAGIC: u32 = u32::from_le_bytes(*b"BSC1");
 /// Current `.scene` format version. v2 replaced hand-authored `exits` with a
 /// zone `bounds` + baker-derived `connections` (the Euclidean map rework, #27).
 /// v3 added the zone `clear_flag` (the generalized gating model, #27).
-pub const VERSION: u16 = 3;
+/// v4 adds a per-instance `u8 kind` after `flags` (opaque, game-defined,
+/// role-scoped).
+pub const VERSION: u16 = 4;
 
 /// Per-space authored camera (issue #23 / #27). No free player-driven camera;
 /// the framing is chosen per space and the game's director reads this.
@@ -105,6 +108,11 @@ pub struct SceneInstanceData {
     pub material: Option<([u8; 3], [u8; 3])>,
     /// Opaque per-instance flags (objective bits, vuln-state, …; game-defined).
     pub flags: u32,
+    /// Opaque per-instance **kind** (v4): the authored sub-archetype within the
+    /// `role`, resolved host-side to a byte. Game-defined and role-scoped — this
+    /// crate never validates or interprets it (in *Kill the Serpent* the mapping
+    /// lives in `crates/kts_schema`).
+    pub kind: u8,
     /// Ground-plane (XZ) waypoints — an enemy patrol path, a rail, etc.
     pub path: Vec<[f32; 2]>,
 }
@@ -173,6 +181,7 @@ pub fn parse(bytes: &[u8]) -> Option<SceneData> {
         let ambient = [r.u8()?, r.u8()?, r.u8()?];
         let material = has_material.then_some((diffuse, ambient));
         let flags = r.u32()?;
+        let kind = r.u8()?;
         let path_len = r.u16()? as usize;
         let mut path = Vec::with_capacity(path_len.min(MAX_PREALLOC));
         for _ in 0..path_len {
@@ -186,6 +195,7 @@ pub fn parse(bytes: &[u8]) -> Option<SceneData> {
             scale,
             material,
             flags,
+            kind,
             path,
         });
     }
@@ -313,6 +323,7 @@ mod tests {
                     scale: [0.11, 0.11, 0.11],
                     material: Some(([110, 180, 235], [26, 40, 58])),
                     flags: 0,
+                    kind: 0,
                     path: alloc::vec![],
                 },
                 SceneInstanceData {
@@ -323,6 +334,7 @@ mod tests {
                     scale: [0.16, 0.16, 0.16],
                     material: None,
                     flags: 0x01,
+                    kind: 2,
                     path: alloc::vec![[1.2, 0.6], [1.2, -0.6]],
                 },
             ],
@@ -406,6 +418,7 @@ mod tests {
                 w.u8(v);
             }
             w.u32(inst.flags);
+            w.u8(inst.kind);
             w.u16(inst.path.len() as u16);
             for p in &inst.path {
                 w.f32(p[0]);
@@ -459,6 +472,39 @@ mod tests {
     }
 
     #[test]
+    fn parse_rejects_v3_blob() {
+        // A stale `build/nitrofs/` holding pre-v4 blobs must not half-parse: the
+        // kind byte shifts every following field, so the version gate is the
+        // only thing standing between a stale bake and a garbage world.
+        let mut blob = encode(&sample());
+        blob[4] = 3;
+        blob[5] = 0;
+        assert!(parse(&blob).is_none());
+    }
+
+    #[test]
+    fn rejects_truncation_inside_kind() {
+        // Cut exactly at instance 0's kind byte: magic(4) + version(2) +
+        // camera mode(2) + params(16) + count(4) + mesh("teapot") +
+        // role("avatar") + 9×f32 + has_material(1) + rgb×2(6) + flags(4).
+        let blob = encode(&sample());
+        let at_kind = 4 + 2 + 2 + 16 + 4 + (2 + 6) + (2 + 6) + 36 + 1 + 6 + 4;
+        assert_eq!(blob[at_kind], 0, "sample instance 0 has kind 0");
+        assert!(parse(&blob[..at_kind]).is_none());
+    }
+
+    #[test]
+    fn parse_of_unknown_kind_still_succeeds() {
+        // The loader never validates kind codes — `role`/`kind` are opaque, and
+        // the *game* decides what an unknown code means (fall back to its
+        // default). A newer level on an older build must still render.
+        let mut scene = sample();
+        scene.instances[1].kind = 200;
+        let parsed = parse(&encode(&scene)).expect("unknown kind still parses");
+        assert_eq!(parsed.instances[1].kind, 200);
+    }
+
+    #[test]
     fn empty_mesh_becomes_none() {
         let scene = SceneData {
             camera: CameraMode::TopDown { height: 3.2 },
@@ -470,6 +516,7 @@ mod tests {
                 scale: [1.0; 3],
                 material: None,
                 flags: 0,
+                kind: 0,
                 path: alloc::vec![],
             }],
             bounds: [-1.0, -1.0, 1.0, 1.0],

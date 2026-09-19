@@ -5,26 +5,14 @@
 use std::collections::BTreeMap;
 
 use eframe::egui;
-use scene2bin::{Camera, Instance, Material, Placement};
+use scene2bin::schema::Role;
+use scene2bin::{Camera, Instance, Issue, Material, Placement, Severity};
 
 use crate::app::{EditorApp, Prim, Sel, View, ViewMode};
 use crate::widgets::{
     MeshThumb, camera_tag, default_camera, default_prefab, drag_row, named_flags_ui, new_instance,
-    opt_named_flags_ui, opt_vec3_row, placement_label, thumb_widget, vec3_row,
+    opt_named_flags_ui, opt_vec3_row, placement_label, role_kind_ui, thumb_widget, vec3_row,
 };
-
-/// Common roles offered in the role picker for literal instances (free text
-/// still allowed). Prefab uses take their role from the prefab. `avatar` is
-/// **not** offered: since #27 (2026-06-28) the avatar is one per-level persistent
-/// entity seeded at the `entry` zone, never authored per-zone (#54).
-const ROLES: &[&str] = &["enemy", "landmark", "spawn", "prop", "block"];
-
-/// One entry in the live problems panel (#53): a message, optionally scoped to a
-/// zone (click-to-focus).
-struct Problem {
-    zone: Option<String>,
-    msg: String,
-}
 
 impl EditorApp {
     pub(crate) fn menu_bar(&mut self, ui: &mut egui::Ui) {
@@ -192,10 +180,9 @@ impl EditorApp {
                 ui.label("name:");
                 ui.text_edit_singleline(&mut name);
             });
-            ui.horizontal(|ui| {
-                ui.label("role:");
-                ui.text_edit_singleline(&mut prefab.role);
-            });
+            // No `avatar`: a prefab is a reusable template, the avatar is the
+            // level's single literal in its entry zone.
+            role_kind_ui(ui, "prefab", &mut prefab.role, &mut prefab.kind, false);
             ui.horizontal(|ui| {
                 let cur = prefab.mesh.as_deref().and_then(|m| self.mesh_thumbs.get(m));
                 thumb_widget(ui, cur, 34.0);
@@ -239,7 +226,15 @@ impl EditorApp {
                     ui.color_edit_button_srgb(&mut m.ambient);
                 });
             }
-            named_flags_ui(ui, "flags", &mut prefab.flags);
+            // Only the bits this role may carry. An unparsed role has no mask to
+            // apply, so the editor shows nothing rather than coercing it to some
+            // other role's rules (same as the `Use`-with-missing-prefab arm).
+            match Role::parse(&prefab.role) {
+                Some(r) => named_flags_ui(ui, "flags", &mut prefab.flags, r),
+                None => {
+                    ui.weak("flags unavailable — unknown role");
+                }
+            }
             ui.horizontal(|ui| {
                 ui.label(format!("path ({} pts)", prefab.path.len()));
                 if ui.button("+ wp").clicked() {
@@ -270,15 +265,24 @@ impl EditorApp {
         }
     }
 
-    /// Live problems panel (#53): re-runs `assemble` + `validate` +
-    /// `isolation_warnings` every frame (the same path `build.rs` bakes and the
-    /// overlay draws) and lists issues, each click-to-focus on its zone — so an
-    /// invalid state surfaces immediately, not only at save.
+    /// Live problems panel (#53): re-runs `assemble` + `validate_all` +
+    /// `isolation_warnings` every frame (the same validator `build.rs` bakes
+    /// against and `just check-levels` exits on) and lists every [`Issue`],
+    /// click-to-focus on its zone *and* its instance — so an invalid state
+    /// surfaces immediately, not only at save.
     fn problems_ui(&mut self, ui: &mut egui::Ui) {
         let problems = self.compute_problems();
+        let errors = problems
+            .iter()
+            .filter(|p| p.severity == Severity::Error)
+            .count();
         ui.horizontal(|ui| {
             ui.heading("Problems");
-            ui.weak(format!("({})", problems.len()));
+            if errors > 0 {
+                ui.weak(format!("({errors} error / {} total)", problems.len()));
+            } else {
+                ui.weak(format!("({})", problems.len()));
+            }
         });
         if problems.is_empty() {
             ui.weak("none — level is valid");
@@ -286,52 +290,61 @@ impl EditorApp {
         }
         let mut focus = None;
         for p in &problems {
-            let text = match &p.zone {
-                Some(z) => format!("⚠  {z}: {}", p.msg),
-                None => format!("⚠  {}", p.msg),
+            let (glyph, color) = match p.severity {
+                // Red blocks the bake; amber bakes but wants a look.
+                Severity::Error => ("✖", egui::Color32::from_rgb(232, 94, 82)),
+                Severity::Warning => ("⚠", egui::Color32::from_rgb(224, 150, 90)),
             };
-            let label = egui::Label::new(
-                egui::RichText::new(text).color(egui::Color32::from_rgb(224, 150, 90)),
-            )
-            .sense(egui::Sense::click())
-            .wrap();
+            let text = match &p.zone {
+                Some(_) => format!("{glyph}  {}: {}", p.scope(), p.msg),
+                None => format!("{glyph}  {}", p.msg),
+            };
+            let label = egui::Label::new(egui::RichText::new(text).color(color))
+                .sense(egui::Sense::click())
+                .wrap();
             if ui.add(label).clicked() {
-                focus = p.zone.clone();
+                focus = p.zone.clone().map(|z| (z, p.instance));
             }
         }
-        if let Some(z) = focus {
-            if self.level.zones.contains_key(&z) {
-                self.active = Some(z);
-                self.sel = Sel::none();
-            }
+        if let Some((z, inst)) = focus
+            && self.level.zones.contains_key(&z)
+        {
+            self.active = Some(z);
+            // Focus the offending instance too, not just its zone — an Issue
+            // carries the index, so a click lands on the thing that's wrong.
+            self.sel = match inst {
+                Some(i) => Sel::single(i),
+                None => Sel::none(),
+            };
         }
     }
 
     /// Collect the current validation / isolation problems (see [`Self::problems_ui`]).
-    fn compute_problems(&self) -> Vec<Problem> {
+    /// One `validate_all` pass — the same one the bake runs — plus the isolation
+    /// sweep, which is advisory and has no [`Issue`] of its own.
+    fn compute_problems(&self) -> Vec<Issue> {
         let mut out = Vec::new();
         match scene2bin::assemble(&self.level, &self.contents, &self.prefabs) {
             Ok(zones) => {
                 let mesh_exists = |name: &str| self.meshes.iter().any(|m| m == name);
-                for (stem, space) in &zones {
-                    if let Err(e) = scene2bin::validate(space, mesh_exists) {
-                        out.push(Problem {
-                            zone: Some(stem.clone()),
-                            msg: format!("{e}"),
-                        });
-                    }
-                }
+                out.extend(scene2bin::validate_all(&self.level, &zones, mesh_exists));
                 let conns = scene2bin::derive_connections(&zones);
                 for stem in scene2bin::isolation_warnings(&conns).keys() {
-                    out.push(Problem {
+                    out.push(Issue {
                         zone: Some(stem.clone()),
+                        instance: None,
+                        severity: Severity::Warning,
                         msg: "isolated zone (abuts no neighbour)".to_string(),
                     });
                 }
             }
-            Err(e) => out.push(Problem {
+            // A parse/assemble failure (unknown prefab, missing content file) has
+            // no zones to validate against — report it whole-level.
+            Err(e) => out.push(Issue {
                 zone: None,
-                msg: format!("{e}"),
+                instance: None,
+                severity: Severity::Error,
+                msg: e,
             }),
         }
         out
@@ -415,12 +428,15 @@ impl EditorApp {
             self.clone_active_zone();
             return;
         }
-        // The entry zone seeds the level's single persistent avatar (#27 / #54) —
-        // zones never author an avatar instance themselves.
+        // The entry zone authors the level's single persistent avatar; every
+        // other zone authors none (#27 / #54 — an amendment to #27's 2026-06-28
+        // "zones no longer author an avatar" line, pending design-sync).
         if self.level.entry == stem {
             ui.label(
-                egui::RichText::new("★ entry zone — the level's one persistent avatar seeds here")
-                    .color(egui::Color32::from_rgb(110, 180, 235)),
+                egui::RichText::new(
+                    "★ entry zone — authors the level's one avatar (other zones: none)",
+                )
+                .color(egui::Color32::from_rgb(110, 180, 235)),
             );
         }
         let Some(entry) = self.level.zones.get_mut(&stem) else {
@@ -598,6 +614,9 @@ impl EditorApp {
         let prefabs = &self.prefabs;
         let meshes = &self.meshes;
         let thumbs = &self.mesh_thumbs;
+        // Only the entry zone may author the level's one `avatar` (#27 / #54),
+        // so only its literals get that role in the picker.
+        let is_entry = stem == self.level.entry;
         let Some(zone) = self.contents.get_mut(&stem) else {
             return;
         };
@@ -607,7 +626,7 @@ impl EditorApp {
         }
 
         match &mut zone.instances[i] {
-            Placement::Lit(inst) => literal_instance_ui(ui, inst, meshes, thumbs),
+            Placement::Lit(inst) => literal_instance_ui(ui, inst, meshes, thumbs, is_entry),
             Placement::Use {
                 name,
                 pos,
@@ -618,16 +637,27 @@ impl EditorApp {
                 path,
             } => {
                 ui.heading("Selected · use");
-                let role = prefabs
-                    .get(name)
-                    .map(|p| p.role.clone())
-                    .unwrap_or_else(|| "?".into());
-                ui.label(format!("prefab: {name}  (role {role})"));
+                // Role *and* kind are prefab-owned and read-only here — the
+                // override surface is deliberately minimal (#27); a mixed
+                // encounter is authored by placing a different prefab.
+                let pf = prefabs.get(name);
+                let role = pf.map(|p| p.role.clone()).unwrap_or_else(|| "?".into());
+                let kind = pf
+                    .and_then(|p| p.kind.clone())
+                    .unwrap_or_else(|| "default".into());
+                ui.label(format!("prefab: {name}  ({role} · {kind})"));
                 ui.label("position (x, y, z)");
                 vec3_row(ui, "pos", pos, 0.01);
                 opt_vec3_row(ui, "rot override", rot, 0.01);
                 opt_vec3_row(ui, "scale override", scale, 0.005);
-                opt_named_flags_ui(ui, "flags override", flags);
+                // The flags override is masked to the *prefab's* role. A missing
+                // prefab has no effective role, so there's nothing to mask with.
+                match pf.and_then(|p| Role::parse(&p.role)) {
+                    Some(r) => opt_named_flags_ui(ui, "flags override", flags, r),
+                    None => {
+                        ui.weak("flags override unavailable — prefab missing or has a bad role");
+                    }
+                }
                 ui.horizontal(|ui| {
                     ui.label(format!("path override ({} pts)", path.len()));
                     if ui.button("+ wp").clicked() {
@@ -681,21 +711,16 @@ fn literal_instance_ui(
     inst: &mut Instance,
     meshes: &[String],
     thumbs: &BTreeMap<String, MeshThumb>,
+    is_entry: bool,
 ) {
     ui.heading("Selected · literal");
 
-    // role — common presets via combo, plus free text.
-    egui::ComboBox::from_id_salt("role")
-        .selected_text(&inst.role)
-        .show_ui(ui, |ui| {
-            for r in ROLES {
-                ui.selectable_value(&mut inst.role, r.to_string(), *r);
-            }
-        });
-    ui.horizontal(|ui| {
-        ui.label("role:");
-        ui.text_edit_singleline(&mut inst.role);
-    });
+    // role + kind — both picked from the shared `kts_schema` vocabulary. There
+    // is no free-text role any more: an unknown role is a hard bake Error, so
+    // letting one be typed only produced a level that wouldn't build. In the
+    // entry zone the picker also offers `avatar`, the one role a level is
+    // *required* to author exactly once.
+    role_kind_ui(ui, "lit", &mut inst.role, &mut inst.kind, is_entry);
 
     // mesh — a wireframe thumbnail of the current pick, then a combo whose rows
     // each carry their own preview (#52).
@@ -744,7 +769,14 @@ fn literal_instance_ui(
         });
     }
 
-    named_flags_ui(ui, "flags", &mut inst.flags);
+    // As in the prefab editor: an unparsed role (only reachable from RON edited
+    // outside the editor) gets no flag UI rather than another role's mask.
+    match Role::parse(&inst.role) {
+        Some(r) => named_flags_ui(ui, "flags", &mut inst.flags, r),
+        None => {
+            ui.weak("flags unavailable — unknown role");
+        }
+    }
 
     ui.horizontal(|ui| {
         ui.label(format!("path ({} pts)", inst.path.len()));
