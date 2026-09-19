@@ -89,6 +89,21 @@ test *args:
         --config 'profile.dev.panic="unwind"' \
         {{args}}
 
+# Run ONE crate's host tests with the group-2 flags (std from source +
+# panic=unwind). `just test <arg>` is a test-NAME filter, not a package filter,
+# so `just test my_crate` runs zero tests and reports green — use this instead.
+# Usage: `just test-crate bevy_nds_loop` or `just test-crate scene2bin encode`.
+test-crate crate *args:
+    cargo test -p {{crate}} \
+        --target "$(rustc -vV | sed -n 's/^host: //p')" \
+        --config 'unstable.build-std=["std","panic_unwind","proc_macro"]' \
+        --config 'profile.dev.panic="unwind"' \
+        {{args}}
+
+# Run the desktop editor's own unit tests (its detached host workspace).
+test-editor *args:
+    cd tools/scene-editor && cargo test {{args}}
+
 # Format the Rust sources.
 fmt:
     cargo fmt
