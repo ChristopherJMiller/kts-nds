@@ -5,13 +5,15 @@
 use std::collections::BTreeMap;
 
 use eframe::egui;
+use egui::Vec2;
 use scene2bin::schema::Role;
 use scene2bin::{Camera, Instance, Issue, Material, Placement, Severity};
 
 use crate::app::{EditorApp, Prim, Sel, View, ViewMode};
 use crate::widgets::{
-    MeshThumb, camera_tag, default_camera, default_prefab, drag_row, named_flags_ui, new_instance,
-    opt_named_flags_ui, opt_vec3_row, placement_label, role_kind_ui, thumb_widget, vec3_row,
+    Footprint, MeshThumb, camera_tag, default_camera, default_prefab, drag_row, footprint,
+    footprint_extent, inside_footprint, named_flags_ui, new_instance, opt_named_flags_ui,
+    opt_vec3_row, placement_label, role_kind_ui, thumb_widget, vec3_row,
 };
 
 impl EditorApp {
@@ -337,6 +339,7 @@ impl EditorApp {
                         msg: "isolated zone (abuts no neighbour)".to_string(),
                     });
                 }
+                self.solid_footprint_warnings(&zones, &mut out);
             }
             // A parse/assemble failure (unknown prefab, missing content file) has
             // no zones to validate against — report it whole-level.
@@ -348,6 +351,75 @@ impl EditorApp {
             }),
         }
         out
+    }
+
+    /// Editor-only spatial warnings about **blocking footprints** (#12).
+    ///
+    /// These can't live in `scene2bin::validate_all`: it has no mesh extents, so
+    /// it cannot know how big a collider actually is. The editor does (it has
+    /// the baked thumbnails), so it warns here instead — never an Error, since
+    /// both cases are judgement calls, not broken data.
+    ///
+    /// Runs every frame with the rest of `compute_problems`, so the scan is
+    /// capped at 64 solids × 64 waypoints per zone.
+    fn solid_footprint_warnings(&self, zones: &[(String, scene2bin::Space)], out: &mut Vec<Issue>) {
+        const SCAN_CAP: usize = 64;
+        for (stem, space) in zones {
+            // One pass: collect this zone's solid footprints (capped), and warn
+            // about any that spill outside the zone the avatar is clamped to.
+            let mut solids: Vec<Footprint> = Vec::new();
+            for (i, inst) in space.instances.iter().enumerate() {
+                if solids.len() >= SCAN_CAP {
+                    break;
+                }
+                let thumb = inst.mesh.as_deref().and_then(|m| self.mesh_thumbs.get(m));
+                let Some(f) = footprint(inst, thumb) else {
+                    continue;
+                };
+                // The yaw-turned rectangle's *actual* reach on each world axis,
+                // not its circumradius: an axis-aligned box that sits inside the
+                // bounds must not be reported just because its diagonal would
+                // poke out if it were turned 45°.
+                let reach = footprint_extent(&f);
+                let b = &space.bounds;
+                if f.center.x - reach.x < b.min[0]
+                    || f.center.x + reach.x > b.max[0]
+                    || f.center.y - reach.y < b.min[1]
+                    || f.center.y + reach.y > b.max[1]
+                {
+                    out.push(Issue {
+                        zone: Some(stem.clone()),
+                        instance: Some(i),
+                        severity: Severity::Warning,
+                        msg: "solid footprint overhangs zone bounds".to_string(),
+                    });
+                }
+                solids.push(f);
+            }
+            if solids.is_empty() {
+                continue;
+            }
+            // Enemies do not collide in this slice (#26, OQ-10 open), so a patrol
+            // route through a wall walks through it. Flag it where it is authored.
+            for (i, inst) in space.instances.iter().enumerate() {
+                if Role::parse(&inst.role) != Some(Role::Enemy) {
+                    continue;
+                }
+                for (k, w) in inst.path.iter().take(SCAN_CAP).enumerate() {
+                    let p = Vec2::new(w[0], w[1]);
+                    if solids.iter().any(|f| inside_footprint(f, p)) {
+                        out.push(Issue {
+                            zone: Some(stem.clone()),
+                            instance: Some(i),
+                            severity: Severity::Warning,
+                            msg: format!(
+                                "patrol waypoint #{k} lies inside a solid footprint (enemies do not collide — route around it)"
+                            ),
+                        });
+                    }
+                }
+            }
+        }
     }
 
     /// Level manifest: name, entry zone, and the zone list (pick the active one,

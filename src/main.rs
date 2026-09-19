@@ -50,6 +50,7 @@ use bevy_nds_scene::{CameraMode, LoadedScene, SceneInstance, ScenePath};
 use bevy_nds_sprite::prelude::*;
 
 mod capture;
+mod collide;
 mod control;
 mod flags;
 mod menu;
@@ -117,11 +118,6 @@ const CAM_TURN_SMOOTH: f32 = 0.07;
 const CAM_WARP_STEP: f32 = 0.02;
 
 const CURSOR_SCALE: f32 = 0.12;
-
-/// Avatar↔landmark separation enforced by collision (radii summed). The
-/// landmark *positions* now come from the loaded space (the `Landmarks`
-/// resource), not a const — only the collision radius is tuning.
-const LANDMARK_COLLIDE: f32 = 0.26;
 
 // Player locomotion tuning + the Stowed↔Deployed controller live in `player`.
 
@@ -339,11 +335,18 @@ fn spawn_zone_floor(commands: &mut Commands, bounds: [f32; 4], offset: (f32, f32
 }
 
 /// Spawn the **resident neighbour** zones' geometry (#27 seamless streaming):
-/// render-only, fogged entities placed at each neighbour's offset in the active
-/// frame, so the player sees into adjacent zones. A connection's `delta` is
-/// `place_active − place_neighbour`, so the neighbour's geometry sits at `−delta`
-/// in the active frame. Reuses the current zone's already-derived `conns`.
-fn spawn_resident_neighbours(commands: &mut Commands, zone: &Zone, snapshot: &ZoneCaptureState) {
+/// fogged entities placed at each neighbour's offset in the active frame, so
+/// the player sees into adjacent zones — and landmarks and blocks are solid at
+/// that offset (#12), so the seam is walkable, not a one-way pane of glass. A
+/// connection's `delta` is `place_active − place_neighbour`, so the neighbour's
+/// geometry sits at `−delta` in the active frame. Reuses the current zone's
+/// already-derived `conns`.
+fn spawn_resident_neighbours(
+    commands: &mut Commands,
+    zone: &Zone,
+    snapshot: &ZoneCaptureState,
+    colliders: &mut collide::Colliders,
+) {
     for c in &zone.conns {
         let path = bevy_nds_scene::level_space_path(&zone.level, &c.neighbour);
         let Some(scene) = bevy_nds_scene::load(&path) else {
@@ -351,7 +354,7 @@ fn spawn_resident_neighbours(commands: &mut Commands, zone: &Zone, snapshot: &Zo
         };
         let offset = (-c.delta[0], -c.delta[1]);
         spawn_zone_floor(commands, scene.bounds, offset); // neighbour's ground, abutting ours
-        spawn_neighbour(commands, &scene, offset, &c.neighbour, snapshot);
+        spawn_neighbour(commands, &scene, offset, &c.neighbour, snapshot, colliders);
     }
 }
 
@@ -361,15 +364,16 @@ fn spawn_resident_neighbours(commands: &mut Commands, zone: &Zone, snapshot: &Zo
 /// them; on top of that render shell, [`spawn::attach`] adds exactly the same
 /// gameplay components the active zone gets, with
 /// [`spawn::Residency::Neighbour`] as the one visible difference (enemies are
-/// live and capturable through the fog; landmarks stay render-only). The avatar
-/// instance is skipped by [`spawn::skip_spawn`] — it's the single persistent
-/// entity.
+/// live and capturable through the fog; the tactical-map blip is active-zone
+/// only). The avatar instance is skipped by [`spawn::skip_spawn`] — it's the
+/// single persistent entity.
 fn spawn_neighbour(
     commands: &mut Commands,
     scene: &bevy_nds_scene::SceneData,
     offset: (f32, f32),
     stem: &str,
     snapshot: &ZoneCaptureState,
+    colliders: &mut collide::Colliders,
 ) {
     let ctx = spawn::SpawnCtx {
         stem,
@@ -421,8 +425,9 @@ fn spawn_neighbour(
             e.insert(DsMaterial { diffuse, ambient });
         }
         if let Some(a) = &authored {
-            // `None`: a neighbour's landmarks aren't in the active collision set.
-            spawn::attach(&mut e, a, &ctx, snapshot, None);
+            // Solid at its offset: a neighbour's landmarks and blocks block
+            // where they are drawn (#12 / #27).
+            spawn::attach(&mut e, a, &ctx, snapshot, Some(colliders));
         }
     }
 }
@@ -489,24 +494,21 @@ struct Avatar;
 #[derive(Component)]
 struct Persistent;
 
-/// A **render-only** entity from a *resident neighbour* zone — mesh + transform
-/// + material at the neighbour's offset in the active frame, carrying no
-/// gameplay (no `SceneInstance`, no map sprite). Tagged so a crossing can clear
-/// the old resident set before spawning the new one (#27 seamless streaming).
+/// An entity from a *resident neighbour* zone — mesh + transform + material at
+/// the neighbour's offset in the active frame, carrying no `SceneInstance` and
+/// no map sprite (its solids still land in `collide::Colliders`, #12). Tagged so
+/// a crossing can clear the old resident set before spawning the new one (#27
+/// seamless streaming).
 #[derive(Component)]
 struct NeighbourInstance;
 
 /// A static landmark obstacle, attached by [`spawn::attach`] to every
 /// **active-zone** scene instance whose role parses as
-/// [`kts_schema::Role::Landmark`].
+/// [`kts_schema::Role::Landmark`]. The marker drives the tactical-map blip;
+/// the blocking itself lives in [`collide::Colliders`], which is harvested at
+/// both residencies.
 #[derive(Component)]
 struct Landmark;
-
-/// Landmark world positions, harvested from the loaded space by
-/// [`spawn::attach`] so avatar collision has a single source of truth (no
-/// duplicated const). Populated once when the space's instances first appear.
-#[derive(Resource, Default)]
-struct Landmarks(alloc::vec::Vec<FxVec2>);
 
 /// The enemy's patrol AI: current waypoint index + dwell timer. Capture state
 /// (progress / resolution) is a **separate** [`capture::Capture`] component on
@@ -654,7 +656,7 @@ impl Plugin for SpikePlugin {
         .init_resource::<CamWarp>()
         .init_resource::<EnemyFire>()
         .init_resource::<Stroke>()
-        .init_resource::<Landmarks>()
+        .init_resource::<collide::Colliders>()
         .init_resource::<Transition>()
         .init_resource::<Zone>()
         .init_resource::<flags::Flags>()
@@ -735,6 +737,7 @@ fn setup(
     mut level: ResMut<flags::LevelProgress>,
     snapshot: Res<ZoneCaptureState>,
     game_flags: Res<flags::Flags>,
+    mut colliders: ResMut<collide::Colliders>,
 ) {
     // The level exit needs every level-objective zone cleared (hardcoded total —
     // the deferred level-header's stand-in, #27).
@@ -779,18 +782,22 @@ fn setup(
     }
     // Walls at this zone's locked gated edges (#27): the in-world "gated in" tell.
     spawn_gate_barriers(&mut commands, &zone, &game_flags);
-    // Resident neighbours (#27 seamless streaming): render-only, fogged, each
-    // with its own floor at its offset, so you see into the next zone over
-    // continuous ground. Read from the just-set `zone.conns`.
-    spawn_resident_neighbours(&mut commands, &zone, &snapshot);
+    // Resident neighbours (#27 seamless streaming): fogged, each with its own
+    // floor at its offset, so you see into the next zone over continuous ground
+    // — and walk on it, since their solids are harvested too (#12). Read from
+    // the just-set `zone.conns`.
+    spawn_resident_neighbours(&mut commands, &zone, &snapshot, &mut colliders);
 
-    // Ground shadow — a flat dark quad (no `Height`) that stays at the avatar's
-    // ground position, so a jump's screen-Y lift opens a visible gap above it.
+    // Ground shadow — a flat dark quad that stays at the avatar's ground
+    // position, so a jump's screen-Y lift opens a visible gap above it.
     // Slightly wider than tall to read as a contact shadow; sits just in front
-    // of the floor. `sync_shadow` keeps it under the avatar.
+    // of the floor. `sync_shadow` keeps it under the avatar, and its `Height`
+    // carries the *support* height (`Height::ground`), so the shadow rides box
+    // and ramp tops instead of always lying on the floor (#12).
     commands.spawn((
         Shadow,
         WorldPos(FxVec2::ZERO),
+        Height::default(),
         flat_quad_xz(0.14, 0.1, [16, 18, 26]),
         Transform3d {
             translation: Vec3::ZERO,
@@ -874,7 +881,7 @@ fn setup(
 /// active zone *is* its local position.
 fn specialize_scene(
     mut commands: Commands,
-    mut landmarks: ResMut<Landmarks>,
+    mut colliders: ResMut<collide::Colliders>,
     zone: Res<Zone>,
     snapshot: Res<ZoneCaptureState>,
     q: Query<
@@ -931,7 +938,7 @@ fn specialize_scene(
             &authored,
             &ctx,
             &snapshot,
-            Some(&mut landmarks),
+            Some(&mut colliders),
         );
     }
 }
@@ -982,7 +989,7 @@ fn reset_enemy(
     mut device: ResMut<Device>,
     mut stroke: ResMut<Stroke>,
     mut loco: ResMut<Locomotion>,
-    mut landmarks: ResMut<Landmarks>,
+    mut colliders: ResMut<collide::Colliders>,
     despawnable: Query<
         Entity,
         Or<(
@@ -1015,7 +1022,7 @@ fn reset_enemy(
         &mut device,
         &mut stroke,
         &mut loco,
-        &mut landmarks,
+        &mut colliders,
         &despawnable,
     );
 }
@@ -1412,8 +1419,9 @@ fn orbit_camera(
 // --- Rendering ---------------------------------------------------------------
 
 /// WorldPos → 3D transform; toggle the captured enemy's mesh off via [`Hidden`].
-/// Entities carrying a [`Height`] (the avatar) are lifted on screen-Y by their
-/// jump height; everything else (incl. the ground [`Shadow`]) renders flat.
+/// Entities carrying a [`Height`] are lifted on screen-Y by it — the avatar by
+/// its jump height, the ground [`Shadow`] by the support height under the
+/// avatar (so it rides box and ramp tops). Everything else renders flat.
 fn sync_3d(
     mut commands: Commands,
     mut q: Query<(
@@ -1428,11 +1436,14 @@ fn sync_3d(
 ) {
     for (e, pos, mut t, cap, height, is_shadow, hidden) in &mut q {
         // Y-up world: the 2D ground `WorldPos(x, y)` lands on the XZ plane. The
-        // shadow rides the floor (`GROUND_Y`); other objects render centred at
-        // Y=0 (mesh-centred, so they rest on the floor); the avatar lifts on +Y.
+        // shadow rides whatever surface is under the avatar — `GROUND_Y` plus
+        // its `Height.z`, which `sync_shadow` sets to the support height, so it
+        // sits on a box top rather than under it (#12); other objects render
+        // centred at Y=0 (mesh-centred, so they rest on the floor); the avatar
+        // lifts on +Y.
         t.translation.x = pos.0.x.to_f32();
         t.translation.y = if is_shadow {
-            GROUND_Y
+            GROUND_Y + height.map_or(0.0, |h| h.z.to_f32())
         } else {
             height.map_or(0.0, |h| h.z.to_f32())
         };

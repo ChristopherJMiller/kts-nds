@@ -232,6 +232,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "bevy_nds_collide"
+version = "0.1.0"
+dependencies = [
+ "bevy_nds_math",
+]
+
+[[package]]
 name = "bevy_nds_cothread"
 version = "0.1.0"
 dependencies = [
@@ -752,6 +759,7 @@ dependencies = [
  "bevy_nds_3d",
  "bevy_nds_audio",
  "bevy_nds_bg",
+ "bevy_nds_collide",
  "bevy_nds_loop",
  "bevy_nds_math",
  "bevy_nds_scene",

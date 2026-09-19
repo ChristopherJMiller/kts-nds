@@ -63,6 +63,11 @@ depend on individual subcrates directly and opt out of whatever they don't need
 - **`bevy_nds_3d_macros`** (`crates/bevy_nds_3d_macros`) — `include_obj!` proc-macro.
 - **`bevy_nds_3d_cull`** (`crates/bevy_nds_3d_cull`) — pure, host-testable
   view-frustum culling math.
+- **`bevy_nds_collide`** (`crates/bevy_nds_collide`) — pure, host-testable
+  static blocking geometry: yawed boxes, ramps and round columns in 20.12
+  fixed point, with a sub-stepped push-out, a support-height lookup and the
+  step/land/fall rule. No Bevy and no plugin — a game depends on it directly
+  and keeps its own collider set.
 - **`bevy_nds_audio`** (`crates/bevy_nds_audio`) — maxmod-backed music + SFX.
 - **`bevy_nds_math`** (`crates/bevy_nds_math`) — 20.12 fixed-point (`Fx32` /
   `FxVec2` / `FxVec3`) and safe wrappers around the DS hardware divide/sqrt
@@ -276,6 +281,7 @@ crates/bevy_nds_3d/             hardware 3D backend (Transform3d, DsMesh, Camera
 crates/bevy_nds_3d_obj/         host OBJ -> display-list encoder (shared packing math)
 crates/bevy_nds_3d_macros/      include_obj! proc-macro (bakes a model into the ROM)
 crates/bevy_nds_3d_cull/        pure, host-testable view-frustum culling math
+crates/bevy_nds_collide/        pure, host-testable static blocking geometry (boxes/ramps/columns)
 crates/bevy_nds_math/           20.12 fixed-point + hardware divide/sqrt wrappers (host-testable)
 crates/bevy_nds_cothread/       libnds cooperative threads as Tasks/Task<T> (non-blocking IO)
 crates/bevy_nds_audio/          maxmod audio backend (Music resource, PlaySfx events)
@@ -291,6 +297,7 @@ crates/scene2bin/               host CLI/lib: assets/levels/<name>/ -> .scene bl
 crates/kts_schema/              the game's authored vocabulary: roles, role-scoped kinds, flag bits/ids
 tools/scene-editor/             desktop level editor (detached workspace; reads scene2bin's RON)
 src/spawn.rs                    the one authored-instance -> components dispatch (attach/skip_spawn)
+src/collide.rs                  Colliders resource + harvest: authored instance -> Collider
 assets/                         uncompiled source models (e.g. teapot.obj)
 assets/levels/<name>/           authored levels: level.ron manifest + one <zone>.ron per zone
 assets/prefabs/                 reusable instance templates resolved host-side at bake

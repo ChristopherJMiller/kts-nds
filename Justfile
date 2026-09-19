@@ -55,8 +55,9 @@ check-editor:
 # Crates split into two groups by dependency shape:
 # - `bevy_nds_3d_obj` / `obj2dl` / `bevy_nds_3d_macros` have no external deps, so
 #   they build cleanly against the prebuilt host std (plain `--target host`).
-# - The platform subcrates and `bevy_nds_3d_cull` pull in crates compiled
-#   against `core` (Bevy; `libm`), so the host test needs `std` built from
+# - The platform subcrates, `bevy_nds_3d_cull` and `bevy_nds_collide` pull in
+#   crates compiled against `core` (Bevy; `libm`; `bevy_nds_math`), so the host
+#   test needs `std` built from
 #   source to keep a single `core` (avoiding a duplicate-lang-item clash) and
 #   `panic = "unwind"` to match the test harness. `wav2bank` has no external
 #   deps, but a *clean* host build still trips the duplicate-`core` clash under
@@ -75,6 +76,7 @@ test *args:
         -p bevy_nds_sprite \
         -p bevy_nds_bg \
         -p bevy_nds_3d_cull \
+        -p bevy_nds_collide \
         -p bevy_nds_loop \
         -p wav2bank \
         -p bevy_nds_audio \

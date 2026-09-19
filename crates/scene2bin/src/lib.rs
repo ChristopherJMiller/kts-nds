@@ -653,7 +653,8 @@ fn validate_zone(
 ) {
     // Per-role tally of Scenery-consumption instances, aggregated into one
     // Warning at the end (never per instance — a gray-boxed zone would drown the
-    // panel in noise).
+    // panel in noise). Since the collide item promoted `block` to Gameplay
+    // (#12, 2026-09-18), `prop` is the only role that can land here.
     let mut scenery: std::collections::BTreeMap<&'static str, usize> =
         std::collections::BTreeMap::new();
 
@@ -730,6 +731,56 @@ fn validate_zone(
                     }
                 ),
             ));
+        }
+
+        // Solid roles (#12): a `landmark` or `block` is blocking geometry, and
+        // its collider is *derived*, never authored — from the mesh's baked
+        // AABB × the instance scale, turned by `rot.y` alone. All three facts
+        // have a hard authoring consequence, so all three are Errors rather than
+        // warnings: a meshless solid would silently block nothing, a tilted one
+        // would render at an angle its collider can't represent, and a
+        // non-positively-scaled one derives degenerate or inverted extents.
+        if matches!(role, Role::Landmark | Role::Block) {
+            if inst.mesh.is_none() {
+                out.push(Issue::error(
+                    stem,
+                    Some(i),
+                    format!(
+                        "role `{}` is solid and needs a mesh — its collider is derived from the mesh's baked AABB × scale",
+                        role.as_str()
+                    ),
+                ));
+            }
+            if inst.rot[0] != 0.0 || inst.rot[2] != 0.0 {
+                out.push(Issue::error(
+                    stem,
+                    Some(i),
+                    format!(
+                        "solid role `{}` is yaw-only — zero rot.x/rot.z (or use role `prop` for a tilted decoration)",
+                        role.as_str()
+                    ),
+                ));
+            }
+            // Non-positive scale. A zero component collapses the derived
+            // collider to nothing on that axis (it renders, but blocks a plane
+            // of zero thickness); a negative one *mirrors* the mesh, and the
+            // runtime's half extents would go negative with it. The runtime
+            // takes the magnitude so the ROM can't abort on old content, but
+            // mirroring a solid is not an authoring move we support: the yawed
+            // footprint and a ramp's rise direction stop matching what is drawn.
+            // Turn it with `rot.y` instead.
+            if let Some(k) = inst.scale.iter().position(|v| !v.is_finite() || *v <= 0.0) {
+                out.push(Issue::error(
+                    stem,
+                    Some(i),
+                    format!(
+                        "solid role `{}` has {} = {} — a solid's collider is derived from its mesh AABB × scale, so every scale component must be > 0 and finite (turn it with `rot.y`; mirror a decoration with role `prop`)",
+                        role.as_str(),
+                        ["scale.x", "scale.y", "scale.z"][k],
+                        inst.scale[k]
+                    ),
+                ));
+            }
         }
 
         if let Some(mesh) = &inst.mesh {
@@ -1422,6 +1473,14 @@ mod tests {
             Use(name: "patroller", pos: (-1.4, 0.0, 0.0), path: [(-1.4, 0.0), (1.4, 0.0)]),
             Use(name: "landmark_block", pos: (-1.25, 0.0, 0.95)),
             Use(name: "landmark_block", pos: (1.25, 0.0, -0.95), rot: Some((0.0, 0.3, 0.0))),
+            // A round block — the second kinded role (#12), wire byte 2.
+            Lit(Instance(
+                mesh: Some("prim_cylinder"),
+                role: "block",
+                kind: Some("round"),
+                pos: (0.6, 0.0, 0.6),
+                scale: (0.3, 0.3, 0.3),
+            )),
         ])
     "#;
 
@@ -1506,8 +1565,8 @@ mod tests {
         assert!(matches!(atrium.camera, Camera::Follow { .. }));
         assert_eq!(atrium.place, [0.0, 0.0]);
         assert_eq!(atrium.bounds.max, [2.0, 2.0]);
-        // …content (4 placements) resolved to 4 flat instances.
-        assert_eq!(atrium.instances.len(), 4);
+        // …content (5 placements) resolved to 5 flat instances.
+        assert_eq!(atrium.instances.len(), 5);
         let corridor = &assembled.iter().find(|(s, _)| s == "corridor").unwrap().1;
         assert!(matches!(corridor.camera, Camera::Rail2_5D { .. }));
     }
@@ -1545,7 +1604,7 @@ mod tests {
 
         // Walk the instance records and read each one's kind byte (the byte
         // immediately after `flags`). The avatar authors none → 0; the test
-        // `patroller` prefab is `shielded` → 1.
+        // `patroller` prefab is `shielded` → 1; the block is `round` → 2.
         let mut p = 24; // magic(4) + version(2) + camera mode(2) + params(16)
         let n = u32::from_le_bytes([blob[p], blob[p + 1], blob[p + 2], blob[p + 3]]) as usize;
         p += 4;
@@ -1566,8 +1625,9 @@ mod tests {
             let path_len = u16::from_le_bytes([blob[p], blob[p + 1]]) as usize;
             p += 2 + path_len * 8;
         }
-        // atrium.ron order: avatar (Lit), patroller (Use), 2× landmark_block.
-        assert_eq!(kinds, std::vec![0, 1, 0, 0]);
+        // atrium.ron order: avatar (Lit), patroller (Use), 2× landmark_block,
+        // then a `round` block — `BlockKind::Round.wire() == 2`.
+        assert_eq!(kinds, std::vec![0, 1, 0, 0, 2]);
     }
 
     #[test]
@@ -1829,6 +1889,15 @@ mod tests {
         }
     }
 
+    /// A **solid** instance (`landmark` / `block`). Solid roles must carry a
+    /// mesh (#12) — their collider is derived from it — so the bare [`inst`]
+    /// helper can't stand in for one.
+    fn solid(role: &str) -> Instance {
+        let mut i = inst(role);
+        i.mesh = Some("cube".to_string());
+        i
+    }
+
     /// A single-zone level (entry == `stem`) whose manifest mirrors `space`, so
     /// gate/clear_flag rules see a consistent world.
     fn one_zone_level(stem: &str, space: Space) -> (Level, Vec<(String, Space)>) {
@@ -1894,13 +1963,13 @@ mod tests {
 
     #[test]
     fn validate_all_rejects_kind_and_flag_misuse() {
-        let mut kind_on_landmark = inst("landmark");
+        let mut kind_on_landmark = solid("landmark");
         kind_on_landmark.kind = Some("shielded".to_string());
         let mut bogus_kind = inst("enemy");
         bogus_kind.kind = Some("bogus".to_string());
         let mut undefined_bit = inst("enemy");
         undefined_bit.flags = 0x8;
-        let mut objective_landmark = inst("landmark");
+        let mut objective_landmark = solid("landmark");
         objective_landmark.flags = 0x1;
 
         let space = with_instances(std::vec![
@@ -1962,12 +2031,14 @@ mod tests {
 
     #[test]
     fn validate_all_aggregates_scenery_into_one_warning_and_passes_facility_shape() {
-        // Several gray-box instances collapse into ONE per-zone Warning.
+        // Scenery instances collapse into ONE per-zone Warning. Since the
+        // collide item promoted `block` to Gameplay (#12), the three blocks are
+        // *not* in that tally any more — `prop` is the only role left in it.
         let space = with_instances(std::vec![
             inst("avatar"),
-            inst("block"),
-            inst("block"),
-            inst("block"),
+            solid("block"),
+            solid("block"),
+            solid("block"),
             inst("prop"),
         ]);
         let (level, zones) = one_zone_level("atrium", space);
@@ -1977,9 +2048,13 @@ mod tests {
         assert_eq!(warns.len(), 1, "{issues:#?}");
         assert_eq!(warns[0].zone.as_deref(), Some("atrium"));
         assert_eq!(warns[0].instance, None);
-        assert!(warns[0].msg.contains("4 instances"), "{}", warns[0].msg);
-        assert!(warns[0].msg.contains("block ×3"), "{}", warns[0].msg);
+        assert!(warns[0].msg.contains("1 instances"), "{}", warns[0].msg);
         assert!(warns[0].msg.contains("prop ×1"), "{}", warns[0].msg);
+        assert!(
+            !warns[0].msg.contains("block"),
+            "a solid block is no longer inert scenery: {}",
+            warns[0].msg
+        );
 
         // The shipped facility shape — avatar in the entry zone, two objective
         // enemies (one kind-carrying), two landmarks — is clean either way.
@@ -1992,13 +2067,168 @@ mod tests {
             inst("avatar"),
             objective,
             level_objective,
-            inst("landmark"),
-            inst("landmark"),
+            solid("landmark"),
+            solid("landmark"),
         ]);
         facility.clear_flag = 1;
         let (level, zones) = one_zone_level("atrium", facility);
         let issues = validate_all(&level, &zones, |_| true);
         assert!(issues.is_empty(), "{issues:#?}");
+    }
+
+    #[test]
+    fn validate_all_rejects_meshless_solid_and_tilted_solid() {
+        // A solid role derives its collider from the mesh, so a meshless one
+        // would block nothing; and the collider is yaw-only, so a pitched or
+        // rolled one would render at an angle it can't represent (#12).
+        let mut tilted_block = solid("block");
+        tilted_block.rot = [0.1, 0.0, 0.0];
+        let mut rolled_landmark = solid("landmark");
+        rolled_landmark.rot = [0.0, 0.7, -0.2]; // yaw is fine, roll is not
+        let space = with_instances(std::vec![
+            inst("avatar"),
+            inst("landmark"), // meshless solid
+            tilted_block,
+            rolled_landmark,
+        ]);
+        let (level, zones) = one_zone_level("atrium", space);
+        let issues = validate_all(&level, &zones, |_| true);
+        let errs = errors(&issues);
+        assert_eq!(errs.len(), 3, "{issues:#?}");
+
+        assert_eq!(errs[0].scope(), "atrium#1");
+        assert!(errs[0].msg.contains("needs a mesh"), "{}", errs[0].msg);
+        assert!(errs[0].msg.contains("landmark"), "{}", errs[0].msg);
+        assert_eq!(errs[1].scope(), "atrium#2");
+        assert!(errs[1].msg.contains("yaw-only"), "{}", errs[1].msg);
+        assert_eq!(errs[2].scope(), "atrium#3");
+        assert!(errs[2].msg.contains("yaw-only"), "{}", errs[2].msg);
+
+        // Non-solid roles are untouched: a tilted prop is a legitimate leaning
+        // decoration, a tilted enemy a legitimate pose, and neither needs a mesh.
+        let mut tilted_prop = inst("prop");
+        tilted_prop.rot = [0.3, 0.0, 0.2];
+        let mut tilted_enemy = inst("enemy");
+        tilted_enemy.rot = [0.3, 0.0, 0.2];
+        let (level, zones) = one_zone_level(
+            "atrium",
+            with_instances(std::vec![inst("avatar"), tilted_prop, tilted_enemy]),
+        );
+        assert!(errors(&validate_all(&level, &zones, |_| true)).is_empty());
+    }
+
+    #[test]
+    fn validate_all_rejects_non_positive_solid_scale() {
+        // A solid's collider is the mesh AABB × scale (#12). A zero component
+        // collapses it to nothing on that axis; a negative one mirrors the mesh
+        // and would hand the runtime negative half extents / an inverted span —
+        // which fed `Ord::clamp` with `min > max`, i.e. a `panic = "abort"` ROM
+        // death the first frame the avatar got near it. Mirroring is a normal
+        // authoring move, so the bake has to say no out loud.
+        let mut neg_x = solid("block");
+        neg_x.scale = [-0.4, 0.24, 0.4];
+        let mut neg_y = solid("landmark");
+        neg_y.scale = [0.16, -0.16, 0.16];
+        let mut zero_z = solid("block");
+        zero_z.scale = [0.4, 0.24, 0.0];
+        // RON parses `inf` and `NaN` literals, and neither is `<= 0.0`: an
+        // infinite half extent saturates `Fx32` and overflows the broad-reject
+        // bound (a debug-assert abort at zone load), so non-finite is rejected
+        // by the same rule.
+        let mut inf_x = solid("block");
+        inf_x.scale = [f32::INFINITY, 0.24, 0.4];
+        let mut nan_z = solid("landmark");
+        nan_z.scale = [0.16, 0.16, f32::NAN];
+        let space = with_instances(std::vec![
+            inst("avatar"),
+            neg_x,
+            neg_y,
+            zero_z,
+            inf_x,
+            nan_z
+        ]);
+        let (level, zones) = one_zone_level("atrium", space);
+        let issues = validate_all(&level, &zones, |_| true);
+        let errs = errors(&issues);
+        assert_eq!(errs.len(), 5, "{issues:#?}");
+        assert_eq!(errs[3].scope(), "atrium#4");
+        assert!(errs[3].msg.contains("scale.x = inf"), "{}", errs[3].msg);
+        assert_eq!(errs[4].scope(), "atrium#5");
+        assert!(errs[4].msg.contains("scale.z = NaN"), "{}", errs[4].msg);
+
+        assert_eq!(errs[0].scope(), "atrium#1");
+        assert!(errs[0].msg.contains("scale.x = -0.4"), "{}", errs[0].msg);
+        assert!(errs[0].msg.contains("must be > 0"), "{}", errs[0].msg);
+        assert_eq!(errs[1].scope(), "atrium#2");
+        assert!(errs[1].msg.contains("scale.y = -0.16"), "{}", errs[1].msg);
+        assert!(errs[1].msg.contains("landmark"), "{}", errs[1].msg);
+        assert_eq!(errs[2].scope(), "atrium#3");
+        assert!(errs[2].msg.contains("scale.z = 0"), "{}", errs[2].msg);
+
+        // Only the first offending axis is reported per instance — one Error
+        // per instance, not three for a uniformly mirrored one.
+        let mut all_neg = solid("block");
+        all_neg.scale = [-0.4, -0.24, -0.4];
+        let (level, zones) =
+            one_zone_level("atrium", with_instances(std::vec![inst("avatar"), all_neg]));
+        assert_eq!(errors(&validate_all(&level, &zones, |_| true)).len(), 1);
+
+        // Non-solid roles are untouched: mirroring a `prop` is just a mirrored
+        // decoration, and nothing derives a collider from it.
+        let mut mirrored_prop = inst("prop");
+        mirrored_prop.scale = [-0.3, 0.3, -0.3];
+        let (level, zones) = one_zone_level(
+            "atrium",
+            with_instances(std::vec![inst("avatar"), mirrored_prop]),
+        );
+        assert!(errors(&validate_all(&level, &zones, |_| true)).is_empty());
+
+        // …and a plain positive solid still bakes clean.
+        let (level, zones) = one_zone_level(
+            "atrium",
+            with_instances(std::vec![inst("avatar"), solid("block")]),
+        );
+        assert!(errors(&validate_all(&level, &zones, |_| true)).is_empty());
+    }
+
+    #[test]
+    fn validate_all_accepts_block_kinds() {
+        // `block` gained the shape table (#12) — all three spellings bake.
+        let mut ramp = solid("block");
+        ramp.kind = Some("ramp".to_string());
+        let mut round = solid("block");
+        round.kind = Some("round".to_string());
+        let (level, zones) = one_zone_level(
+            "atrium",
+            with_instances(std::vec![inst("avatar"), ramp, round, solid("block")]),
+        );
+        let issues = validate_all(&level, &zones, |_| true);
+        assert!(errors(&issues).is_empty(), "{issues:#?}");
+
+        // A `landmark` is still kindless — it is always a box — so the existing
+        // "role has no kinds" Error still fires for it.
+        let mut kinded_landmark = solid("landmark");
+        kinded_landmark.kind = Some("ramp".to_string());
+        let (level, zones) = one_zone_level(
+            "atrium",
+            with_instances(std::vec![inst("avatar"), kinded_landmark]),
+        );
+        let issues = validate_all(&level, &zones, |_| true);
+        let errs = errors(&issues);
+        assert_eq!(errs.len(), 1, "{errs:#?}");
+        assert!(errs[0].msg.contains("no kinds"), "{}", errs[0].msg);
+
+        // …and an unknown block shape is the existing unknown-kind Error, which
+        // now lists the block vocabulary.
+        let mut bogus = solid("block");
+        bogus.kind = Some("wedge".to_string());
+        let (level, zones) =
+            one_zone_level("atrium", with_instances(std::vec![inst("avatar"), bogus]));
+        let issues = validate_all(&level, &zones, |_| true);
+        let errs = errors(&issues);
+        assert_eq!(errs.len(), 1, "{errs:#?}");
+        assert!(errs[0].msg.contains("wedge"), "{}", errs[0].msg);
+        assert!(errs[0].msg.contains("box, ramp, round"), "{}", errs[0].msg);
     }
 
     #[test]

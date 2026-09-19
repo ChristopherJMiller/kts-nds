@@ -30,9 +30,9 @@
 //!
 //! A role's [`kinds`](Role::kinds) list is **positional**: the index *is* the
 //! `u8` baked into `.scene` v4. Extend a list only at the end — the same rule
-//! that governs `scene2bin::Camera`'s variant order. [`EnemyKind`]'s
-//! discriminants are that index, so the two must stay in lockstep (a test
-//! asserts it).
+//! that governs `scene2bin::Camera`'s variant order. [`EnemyKind`]'s and
+//! [`BlockKind`]'s discriminants are that index, so each must stay in lockstep
+//! with its row (a test asserts it).
 //!
 //! # One sub-archetype channel
 //!
@@ -41,6 +41,11 @@
 //! Nothing may add another instance-flag bit: [`flag_bits::ALL`] is frozen at
 //! `OBJECTIVE | LEVEL_OBJECTIVE`, which is what lets
 //! [`flag_bits::unknown_bits`] and [`Role::allowed_flags`] stay meaningful.
+//!
+//! Block kinds are the worked example: static blocking (#12) needed three
+//! shapes (`box` / `ramp` / `round`) and took a [`Role::kinds`] row rather than
+//! two flag bits or a `.scene` VERSION bump — no wire change at all, since v4
+//! already carries a kind byte per instance.
 //!
 //! # What is *not* decided here
 //!
@@ -66,8 +71,9 @@ pub enum Role {
     Enemy,
     /// A static obstacle the avatar collides with.
     Landmark,
-    /// Gray-box level geometry (#44). Scenery today — the collide item decides
-    /// how blocking attaches.
+    /// Gray-box level geometry (#44) the avatar collides with: its `kind`
+    /// picks the blocking shape (`box` / `ramp` / `round`), and its collider is
+    /// derived from the mesh AABB × the authored scale (#12).
     Block,
     /// Set dressing. Scenery by design.
     Prop,
@@ -75,14 +81,17 @@ pub enum Role {
 
 /// Whether a role has runtime behaviour yet, or only renders.
 ///
-/// `Scenery` is a *deliberate* state, not a bug: a block or prop is authored to
-/// be seen. The bake surfaces it as one aggregated per-zone Warning so an author
-/// knows the thing they placed does nothing yet, without it ever failing a bake.
+/// `Scenery` is a *deliberate* state, not a bug: a prop is authored to be seen
+/// and nothing more (since the collide item promoted `Block` to `Gameplay`,
+/// `prop` is the only role left in it). The bake surfaces it as one aggregated
+/// per-zone Warning so an author knows the thing they placed has no runtime
+/// behaviour, without it ever failing a bake.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Consumption {
     /// The game attaches components for this role.
     Gameplay,
-    /// Renders by design; no runtime behaviour **yet**.
+    /// Renders **by design**; no runtime behaviour, and `prop` is not waiting
+    /// for any — set dressing is the whole job.
     Scenery,
 }
 
@@ -129,10 +138,15 @@ impl Role {
     }
 
     /// Does this role have runtime behaviour, or does it only render?
+    ///
+    /// [`Block`](Role::Block) was promoted from `Scenery` to `Gameplay` by the
+    /// collide item, 2026-09-18 (#12): a block is now solid, so it is no longer
+    /// something the bake warns you is inert. [`Prop`](Role::Prop) is the only
+    /// deliberately-inert role left.
     pub const fn consumption(self) -> Consumption {
         match self {
-            Role::Avatar | Role::Enemy | Role::Landmark => Consumption::Gameplay,
-            Role::Block | Role::Prop => Consumption::Scenery,
+            Role::Avatar | Role::Enemy | Role::Landmark | Role::Block => Consumption::Gameplay,
+            Role::Prop => Consumption::Scenery,
         }
     }
 
@@ -145,7 +159,10 @@ impl Role {
     pub const fn kinds(self) -> &'static [&'static str] {
         match self {
             Role::Enemy => &["basic", "shielded", "advanced", "heavy"],
-            Role::Avatar | Role::Landmark | Role::Block | Role::Prop => &[],
+            // The blocking shape (#12). A `landmark` is deliberately kindless —
+            // it is always a box — so the two solid roles stay distinguishable.
+            Role::Block => &["box", "ramp", "round"],
+            Role::Avatar | Role::Landmark | Role::Prop => &[],
         }
     }
 
@@ -225,6 +242,56 @@ impl EnemyKind {
     }
 }
 
+/// The blocking shapes a [`Role::Block`] may take (#12).
+///
+/// The discriminants **are** the `.scene` wire bytes and must match
+/// `Role::Block.kinds()` position for position. `Box == 0` is load-bearing: an
+/// instance with no authored `kind` bakes to `0` and blocks as a plain box,
+/// which is what every gray-box primitive did before the kind table existed.
+///
+/// Shape, not behaviour: `Ramp` walks up along the mesh's local **+Z**, `Round`
+/// collides as a disc of the footprint's X half extent. The mapping onto
+/// `bevy_nds_collide::Collider` constructors lives in the game (`src/collide.rs`),
+/// not here.
+#[repr(u8)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum BlockKind {
+    /// A flat-topped box — what an absent `kind` means.
+    #[default]
+    Box = 0,
+    /// A wedge rising along the mesh's local `+Z`; `rot.y` aims it.
+    Ramp = 1,
+    /// A column that collides as a circle rather than its bounding rectangle.
+    Round = 2,
+}
+
+impl BlockKind {
+    /// The byte baked into `.scene`.
+    pub const fn wire(self) -> u8 {
+        self as u8
+    }
+
+    /// Decode a wire byte. `None` for a code this build doesn't know (the
+    /// runtime then falls back to [`BlockKind::default`]).
+    pub const fn from_wire(k: u8) -> Option<Self> {
+        match k {
+            0 => Some(BlockKind::Box),
+            1 => Some(BlockKind::Ramp),
+            2 => Some(BlockKind::Round),
+            _ => None,
+        }
+    }
+
+    /// The RON spelling — the same string as `Role::Block.kinds()[wire]`.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            BlockKind::Box => "box",
+            BlockKind::Ramp => "ramp",
+            BlockKind::Round => "round",
+        }
+    }
+}
+
 /// **Instance-flag bits** — the bitmask an author may set on an instance's
 /// `flags` field. Frozen for Milestone 2: new sub-archetypes go in
 /// [`Role::kinds`], never here. Distinct from [`flag_ids`] (see the crate docs).
@@ -297,12 +364,19 @@ mod tests {
 
     #[test]
     fn consumption_split() {
-        for r in [Role::Avatar, Role::Enemy, Role::Landmark] {
+        // `Block` joined Gameplay with the collide item (#12, 2026-09-18).
+        for r in [Role::Avatar, Role::Enemy, Role::Landmark, Role::Block] {
             assert_eq!(r.consumption(), Consumption::Gameplay, "{r:?}");
         }
-        for r in [Role::Block, Role::Prop] {
-            assert_eq!(r.consumption(), Consumption::Scenery, "{r:?}");
-        }
+        assert_eq!(Role::Prop.consumption(), Consumption::Scenery);
+        // …and it is the *only* Scenery role, so the bake's aggregated warning
+        // can only ever name `prop`.
+        let scenery: Vec<Role> = Role::ALL
+            .iter()
+            .copied()
+            .filter(|r| r.consumption() == Consumption::Scenery)
+            .collect();
+        assert_eq!(scenery, vec![Role::Prop]);
     }
 
     #[test]
@@ -318,12 +392,43 @@ mod tests {
         // Out of range / unknown.
         assert_eq!(kind_name(Role::Enemy, 4), None);
         assert_eq!(kind_from_str(Role::Enemy, "bogus"), None);
-        // Every non-enemy role has no kinds today, so nothing resolves for them.
-        for r in [Role::Avatar, Role::Landmark, Role::Block, Role::Prop] {
+
+        // `Block` is the second kinded role (#12) — the same index-is-the-wire
+        // contract, checked the same way.
+        let blocks = Role::Block.kinds();
+        assert_eq!(blocks, &["box", "ramp", "round"]);
+        for (i, name) in blocks.iter().enumerate() {
+            assert_eq!(kind_from_str(Role::Block, name), Some(i as u8));
+            assert_eq!(kind_name(Role::Block, i as u8), Some(*name));
+        }
+        assert_eq!(kind_name(Role::Block, 3), None);
+        assert_eq!(kind_from_str(Role::Block, "wedge"), None);
+
+        // The remaining roles have no kinds, so nothing resolves for them — a
+        // landmark in particular is *always* a box, never `kind: "ramp"`.
+        for r in [Role::Avatar, Role::Landmark, Role::Prop] {
             assert!(r.kinds().is_empty(), "{r:?}");
             assert_eq!(kind_from_str(r, "anything"), None, "{r:?}");
             assert_eq!(kind_name(r, 0), None, "{r:?}");
         }
+    }
+
+    #[test]
+    fn block_kind_wire_is_stable() {
+        let all = [BlockKind::Box, BlockKind::Ramp, BlockKind::Round];
+        for k in all {
+            assert_eq!(BlockKind::from_wire(k.wire()), Some(k), "{k:?}");
+            // The enum discriminant and the `kinds()` index are the same thing.
+            assert_eq!(Role::Block.kinds()[k.wire() as usize], k.as_str());
+        }
+        // The exact discriminants are the wire contract.
+        assert_eq!(BlockKind::Box.wire(), 0);
+        assert_eq!(BlockKind::Ramp.wire(), 1);
+        assert_eq!(BlockKind::Round.wire(), 2);
+        assert_eq!(BlockKind::from_wire(3), None);
+        // An absent RON kind bakes to 0 and blocks as a plain box.
+        assert_eq!(BlockKind::default(), BlockKind::Box);
+        assert_eq!(Role::Block.kinds().len(), all.len());
     }
 
     #[test]

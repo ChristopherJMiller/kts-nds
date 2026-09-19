@@ -32,11 +32,12 @@ use bevy_nds_sprite::prelude::Sprite;
 use kts_schema::{EnemyKind, Role};
 
 use crate::capture::{self, VulnerabilityShape};
+use crate::collide::{self, Colliders};
 use crate::flags;
 use crate::player::Height;
 use crate::{
-    Avatar, Enemy, Landmark, Landmarks, PARK_Y, Persistent, WorldPos, ZoneCaptureState, ZoneMember,
-    sprites, zone_key,
+    Avatar, Enemy, Landmark, PARK_Y, Persistent, WorldPos, ZoneCaptureState, ZoneMember, sprites,
+    zone_key,
 };
 
 /// Whether the instance belongs to the **active** zone or to a **resident
@@ -73,8 +74,8 @@ pub(crate) struct Authored<'a> {
     /// The instance's lit material, if it authored one.
     #[allow(dead_code)] // carried for the item/tint work; see the module docs
     pub material: Option<DsMaterial>,
-    /// The loaded mesh's local AABB (`min`, `max`), when it has one.
-    #[allow(dead_code)] // carried for the collision harvest; see the module docs
+    /// The loaded mesh's local AABB (`min`, `max`), when it has one. Read by
+    /// [`crate::collide::harvest`] — a solid instance's collider extents.
     pub aabb: Option<[Vec3; 2]>,
 }
 
@@ -125,8 +126,9 @@ pub(crate) fn skip_spawn(a: &Authored, ctx: &SpawnCtx, snap: &ZoneCaptureState) 
 
 /// Attach the gameplay components for one authored instance.
 ///
-/// `landmarks` is the active zone's obstacle set — `None` for a neighbour (whose
-/// landmarks are render-only) and for any caller that doesn't own it.
+/// `colliders` is the world's static blocking set — solid instances are
+/// harvested into it at **both** residencies (#12 / #27: geometry is solid
+/// across a seam). `None` only for a caller that doesn't own the resource.
 ///
 /// The `match` below is the single role dispatch; see the module docs for why it
 /// has no `_` arm.
@@ -135,7 +137,7 @@ pub(crate) fn attach(
     a: &Authored,
     ctx: &SpawnCtx,
     snap: &ZoneCaptureState,
-    landmarks: Option<&mut Landmarks>,
+    colliders: Option<&mut Colliders>,
 ) {
     match a.role {
         Role::Avatar => {
@@ -226,23 +228,43 @@ pub(crate) fn attach(
             }
         }
         Role::Landmark => {
-            // Neighbour landmarks are render-only: no cross-seam collision, since
-            // `Landmarks` is the *active* zone's obstacle set. Whether a seam
-            // should collide is still open — owner: the collide item. This one
-            // guard is the whole of that gap.
-            if ctx.residency == Residency::Active
-                && let Some(landmarks) = landmarks
+            // Solid at BOTH residencies (#12, pending design-sync): a landmark
+            // across a seam blocks where it is drawn, so you can't stand half
+            // inside a neighbour's wall and wedge yourself on the crossing. The
+            // `Residency::Active` collision guard this arm used to carry is gone.
+            if let Some(cs) = colliders
+                && let Some(c) = collide::harvest(a, ctx)
             {
-                let pos = WorldPos(FxVec2::from_f32(a.local[0], a.local[2]));
-                landmarks.0.push(pos.0);
-                ec.insert((Landmark, pos, Sprite::new(sprites::OBSTACLE).at(0, PARK_Y)));
+                cs.0.push(c);
+            }
+            if ctx.residency == Residency::Active {
+                // The tactical-map blip stays active-zone only (the map is
+                // origin-centric); whether solid footprints plot at all is open
+                // on #26.
+                ec.insert((
+                    Landmark,
+                    WorldPos(FxVec2::from_f32(a.local[0], a.local[2])),
+                    Sprite::new(sprites::OBSTACLE).at(0, PARK_Y),
+                ));
             }
         }
-        Role::Block | Role::Prop => {
+        Role::Block => {
+            // Gray-box blocking geometry (#44 + #12): a collider and nothing
+            // else. Deliberately **no `WorldPos`** — `sync_3d` pins every
+            // `WorldPos` without a `Height` to `y = 0`, which would drop a
+            // floor-resting or raised block onto the mesh-centred plane and
+            // undo its authored height. Its `Transform3d` from the loader is
+            // already correct, so leave it alone.
+            if let Some(cs) = colliders
+                && let Some(c) = collide::harvest(a, ctx)
+            {
+                cs.0.push(c);
+            }
+        }
+        Role::Prop => {
             // Scenery consumption (`kts_schema::Consumption::Scenery`): renders
-            // only. `Block` gains behaviour in the collide item; `Prop` stays
-            // scenery. The bake reports them as one per-zone Warning so an author
-            // is told, not stopped.
+            // only, by design. The bake reports props as one per-zone Warning so
+            // an author is told, not stopped.
         }
     }
 }

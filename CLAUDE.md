@@ -110,7 +110,7 @@ invocations split by dependency shape:
    `--target $host`.
 2. The platform subcrates (`bevy_nds_diagnostics`, `bevy_nds_time`,
    `bevy_nds_input`, `bevy_nds_gesture`, `bevy_nds_text`, `bevy_nds_bg`), `bevy_nds_3d_cull`,
-   `bevy_nds_math`, `bevy_nds_cothread`, `wav2bank`, `bevy_nds_audio`,
+   `bevy_nds_collide`, `bevy_nds_math`, `bevy_nds_cothread`, `wav2bank`, `bevy_nds_audio`,
    `bevy_nds_scene`, `scene2bin`, `kts_schema` — pull in code compiled against `core`, so they
    need `std` from source (`unstable.build-std=["std","panic_unwind","proc_macro"]`)
    and `panic = "unwind"` to avoid a duplicate-`core` lang-item clash and match
@@ -194,6 +194,16 @@ they don't need (e.g. drop `bevy_nds_text` for a sprite-only game).
 - **`crates/bevy_nds_3d_macros`** — `include_obj!` proc-macro that bakes a
   display list into the ARM9 binary at compile time.
 - **`crates/bevy_nds_3d_cull`** — pure, host-testable view-frustum math.
+- **`crates/bevy_nds_collide`** — pure fixed-point **static blocking geometry**
+  (#12): yawed boxes, ramps and round columns, a `Body` (radius/height/step),
+  sub-stepped `resolve_move` push-out, `ground_height` support lookup and
+  `settle_height` step/land/fall. No Bevy, no FFI, no plugin — **not** in
+  `DsPlugins`; the game depends on it directly and the ECS glue (the `Colliders`
+  resource + `harvest`) lives in `src/collide.rs`. Vertical values are in the
+  **Height frame** (floor = 0); `harvest` is the single site that converts out
+  of the render frame by subtracting `GROUND_Y`. Avatar-only: enemies and
+  projectiles are not collided (cover is open on #26; `blocks_point` is the
+  shipped hook).
 - **`crates/obj2dl`** — host CLI + library, used by `build.rs` to bake
   `assets/*.obj` into `build/nitrofs/*.dl`.
 - **`crates/bevy_nds_audio`** — maxmod (ARM7) audio backend: declarative
@@ -220,7 +230,9 @@ they don't need (e.g. drop `bevy_nds_text` for a sprite-only game).
 - **`crates/kts_schema`** — the **game-owned authored vocabulary** (not
   `bevy_nds_*` on purpose): `Role` (avatar/enemy/landmark/block/prop, a *closed*
   set), each role's `kinds()` (its sub-archetypes — `EnemyKind` =
-  basic/shielded/advanced/heavy today), `Consumption` (Gameplay vs Scenery),
+  basic/shielded/advanced/heavy, `BlockKind` = box/ramp/round), `Consumption`
+  (Gameplay vs Scenery — `Role::Block` was promoted to Gameplay by the collide
+  item, so `prop` is the only Scenery role left),
   the instance-`flag_bits` (`OBJECTIVE`/`LEVEL_OBJECTIVE`, **frozen**) and the
   reserved runtime `flag_ids` (`LEVEL_EXIT`, `RESERVED_MIN`). `no_std`, **zero
   dependencies**, fully host-tested. Shared by `kts`, by `scene2bin` (which
@@ -277,7 +289,9 @@ they don't need (e.g. drop `bevy_nds_text` for a sprite-only game).
   shared by the active zone (`specialize_scene`) and resident neighbours
   (`spawn_neighbour`). Its `match Role` is exhaustive with **no `_` arm** on
   purpose: a new role must fail to compile there rather than become silent
-  scenery.
+  scenery. `src/collide.rs` is the one place an authored instance becomes a
+  `bevy_nds_collide::Collider` — solid roles (`landmark`, `block`) are harvested
+  at **both** residencies, so geometry is solid across a zone seam.
 
 New game logic belongs in the root crate; new hardware capability gets its own
 crate (see "Adding a capability" below).
@@ -327,6 +341,7 @@ starting in its own crate.
 | Real-time clock          | `WallClock` resource (year/month/day + h/m/s + unix_secs) | `bevy_nds_rtc::RtcPlugin`                     |
 | Writable FAT/SD storage  | `SaveStorage` resource (blocking + async slot I/O) + `StorageStatus` | `bevy_nds_save::SavePlugin`              |
 | 2D background layers (BG) | `Backgrounds` resource (`set_tile` / `set_bitmap` / `set_tile_scroll`) | `bevy_nds_bg::BackgroundPlugin` |
+| Static blocking geometry | `Colliders` resource + `Collider` (box/ramp/round, avatar-only) | `bevy_nds_collide` (pure; depended on directly) |
 
 `DsPlugins` (in `bevy_nds`) bundles the platform-layer plugins;
 `bevy_nds::run(app)` (re-export from `bevy_nds_runtime`) installs the runner

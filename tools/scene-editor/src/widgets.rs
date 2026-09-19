@@ -99,6 +99,86 @@ pub(crate) fn thumb_widget(ui: &mut egui::Ui, thumb: Option<&MeshThumb>, px: f32
     }
 }
 
+/// A solid instance's **blocking footprint** in the zone's local XZ frame (#12)
+/// — what the runtime will actually collide, as opposed to the glyph that marks
+/// where the instance sits.
+///
+/// Derived, not authored: half extents are the baked mesh AABB × the authored
+/// scale, and the orientation is `rot.y` alone. That is exactly what
+/// `kts::collide::harvest` does at runtime, which is the point — the canvas
+/// draws the collider, not an approximation of it.
+pub(crate) struct Footprint {
+    pub center: Vec2,
+    pub half: Vec2,
+    pub yaw: f32,
+    /// `kind: "round"` — collides as a disc of `half.x`, not a rectangle.
+    pub round: bool,
+    /// `kind: "ramp"` — rises along local +Z.
+    pub ramp: bool,
+}
+
+/// The blocking footprint of `inst`, or `None` when it isn't solid or its mesh
+/// has no thumbnail yet (an unparsed `.obj`, or one still being scanned).
+pub(crate) fn footprint(inst: &Instance, thumb: Option<&MeshThumb>) -> Option<Footprint> {
+    if !matches!(Role::parse(&inst.role), Some(Role::Landmark | Role::Block)) {
+        return None;
+    }
+    let t = thumb?;
+    let kind = inst.kind.as_deref().unwrap_or_default();
+    Some(Footprint {
+        center: Vec2::new(inst.pos[0], inst.pos[2]),
+        // Magnitudes, matching `kts::collide::harvest`: a mirrored mesh
+        // (negative `scale.x`/`scale.z`) occupies the same rectangle, and the
+        // runtime takes the `abs` too — so the overlay draws the box the avatar
+        // actually collides with rather than an inside-out one. (The bake rejects
+        // a non-positive solid scale outright; this keeps the canvas honest while
+        // the value is being dragged through zero.)
+        half: Vec2::new(
+            (t.size[0] * inst.scale[0] * 0.5).abs(),
+            (t.size[2] * inst.scale[2] * 0.5).abs(),
+        ),
+        yaw: inst.rot[1],
+        // A landmark is always a box, so its `kind` is always absent.
+        round: kind == "round",
+        ramp: kind == "ramp",
+    })
+}
+
+/// The footprint's **world-axis** half extents: how far it actually reaches
+/// along ±X and ±Z once `yaw` is applied.
+///
+/// Exact, not the circumradius. For a rectangle the reach along world X is
+/// `|hx·cos| + |hz·sin|` (and symmetrically for Z), which collapses to `(hx,
+/// hz)` for an axis-aligned box — whereas the circumradius reports
+/// `sqrt(hx² + hz²)` for *every* yaw and so over-states the reach of anything
+/// not turned 45°, flagging solids whose rectangle never leaves the zone. A
+/// disc reaches `half.x` on both axes.
+pub(crate) fn footprint_extent(f: &Footprint) -> Vec2 {
+    if f.round {
+        return Vec2::splat(f.half.x);
+    }
+    let (sin, cos) = (f.yaw.sin().abs(), f.yaw.cos().abs());
+    Vec2::new(
+        f.half.x * cos + f.half.y * sin,
+        f.half.y * cos + f.half.x * sin,
+    )
+}
+
+/// Is the zone-local point `p` inside `f`? The un-inflated footprint (no body
+/// radius) — the editor asks this about authored points, not about the avatar.
+pub(crate) fn inside_footprint(f: &Footprint, p: Vec2) -> bool {
+    let d = p - f.center;
+    if f.round {
+        return d.length() <= f.half.x;
+    }
+    let (sin, cos) = (f.yaw.sin(), f.yaw.cos());
+    // World → local: the inverse of the renderer's `R_y(+yaw)`, the same
+    // transform `bevy_nds_collide::local` uses (local +Z points at `(sin, cos)`).
+    let lx = d.x * cos - d.y * sin;
+    let lz = d.x * sin + d.y * cos;
+    lx.abs() <= f.half.x && lz.abs() <= f.half.y
+}
+
 pub(crate) fn empty_level() -> Level {
     Level {
         name: String::new(),
@@ -369,4 +449,160 @@ pub(crate) fn stems(dir: &str, ext: &str) -> Vec<String> {
         .collect();
     out.sort();
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn thumb(size: [f32; 3]) -> MeshThumb {
+        MeshThumb {
+            size,
+            edges: Vec::new(),
+        }
+    }
+
+    fn block(kind: Option<&str>) -> Instance {
+        let mut i = new_instance(Vec2::ZERO);
+        i.role = Role::Block.as_str().to_string();
+        i.mesh = Some("cube".to_string());
+        i.kind = kind.map(String::from);
+        i
+    }
+
+    /// The canvas overlay must draw the collider the runtime will build: half
+    /// extents are the **baked** mesh AABB × the authored scale, not the glyph
+    /// radius and not the raw mesh size.
+    #[test]
+    fn footprint_matches_baked_extents() {
+        // A unit `cube` at the shipped landmark scale: half extent 0.08, which
+        // is exactly what `LANDMARK_COLLIDE = 0.26` minus the 0.18 body radius
+        // used to encode.
+        let unit = thumb([1.0, 1.0, 1.0]);
+        let mut inst = block(None);
+        inst.scale = [0.16, 0.16, 0.16];
+        inst.pos = [1.25, 0.0, -0.95];
+        inst.rot = [0.0, 0.3, 0.0];
+        let f = footprint(&inst, Some(&unit)).expect("a block with a thumb is solid");
+        assert!((f.half.x - 0.08).abs() < 1e-6, "{:?}", f.half);
+        assert!((f.half.y - 0.08).abs() < 1e-6, "{:?}", f.half);
+        assert_eq!(f.center, Vec2::new(1.25, -0.95));
+        assert!((f.yaw - 0.3).abs() < 1e-6);
+        assert!(!f.round && !f.ramp);
+
+        // Non-uniform scale on a non-unit mesh: X and Z are independent, and Y
+        // (the thumb's `size[1]`) never enters the ground-plane footprint.
+        let oblong = thumb([2.0, 9.0, 0.5]);
+        let mut inst = block(None);
+        inst.scale = [0.4, 0.24, 0.7];
+        let f = footprint(&inst, Some(&oblong)).unwrap();
+        assert!((f.half.x - 0.4).abs() < 1e-6, "{:?}", f.half);
+        assert!((f.half.y - 0.175).abs() < 1e-6, "{:?}", f.half);
+
+        // Kinds map onto the shape flags.
+        assert!(footprint(&block(Some("round")), Some(&unit)).unwrap().round);
+        assert!(footprint(&block(Some("ramp")), Some(&unit)).unwrap().ramp);
+        assert!(!footprint(&block(Some("ramp")), Some(&unit)).unwrap().round);
+
+        // A landmark is solid (and always a box); a prop and an enemy are not,
+        // and nothing without a loaded mesh thumbnail has a footprint at all.
+        let mut lm = block(None);
+        lm.role = Role::Landmark.as_str().to_string();
+        assert!(footprint(&lm, Some(&unit)).is_some());
+        for role in [Role::Prop, Role::Enemy, Role::Avatar] {
+            let mut i = block(None);
+            i.role = role.as_str().to_string();
+            assert!(footprint(&i, Some(&unit)).is_none(), "{role:?}");
+        }
+        assert!(footprint(&block(None), None).is_none());
+
+        // Mirroring (a negative scale) is a normal authoring drag, and the
+        // rectangle it makes is the same rectangle — the overlay must draw the
+        // box the runtime collides with, not an inside-out one. `harvest` takes
+        // the same `abs`.
+        let mut mirrored = block(None);
+        mirrored.scale = [-0.4, 0.24, -0.7];
+        let f = footprint(&mirrored, Some(&oblong)).unwrap();
+        assert!((f.half.x - 0.4).abs() < 1e-6, "{:?}", f.half);
+        assert!((f.half.y - 0.175).abs() < 1e-6, "{:?}", f.half);
+    }
+
+    /// The bounds-overhang warning tests the footprint's real reach on each
+    /// world axis; the circumradius it used to test over-states everything that
+    /// isn't turned 45°.
+    #[test]
+    fn footprint_extent_is_exact_per_axis() {
+        let oblong = thumb([1.0, 1.0, 1.0]);
+        let mut inst = block(None);
+        inst.scale = [0.8, 0.2, 0.4]; // half extents (0.4, 0.2)
+
+        // Axis aligned: exactly the half extents (circumradius would say 0.447).
+        let e = footprint_extent(&footprint(&inst, Some(&oblong)).unwrap());
+        assert!((e.x - 0.4).abs() < 1e-6, "{e:?}");
+        assert!((e.y - 0.2).abs() < 1e-6, "{e:?}");
+
+        // A quarter turn swaps the axes, still exact.
+        inst.rot = [0.0, std::f32::consts::FRAC_PI_2, 0.0];
+        let e = footprint_extent(&footprint(&inst, Some(&oblong)).unwrap());
+        assert!((e.x - 0.2).abs() < 1e-6, "{e:?}");
+        assert!((e.y - 0.4).abs() < 1e-6, "{e:?}");
+
+        // In between, the reach is |hx·cos| + |hz·sin| — never more than the
+        // circumradius of the *square* that bounds it, and never less than the
+        // larger half extent.
+        inst.rot = [0.0, 0.6, 0.0];
+        let e = footprint_extent(&footprint(&inst, Some(&oblong)).unwrap());
+        let (s, c) = (0.6_f32.sin(), 0.6_f32.cos());
+        assert!((e.x - (0.4 * c + 0.2 * s)).abs() < 1e-6, "{e:?}");
+        assert!((e.y - (0.2 * c + 0.4 * s)).abs() < 1e-6, "{e:?}");
+        assert!(e.x >= 0.4 && e.y >= 0.2, "{e:?}");
+
+        // A disc reaches its radius on both axes whatever the yaw.
+        let mut round = block(Some("round"));
+        round.scale = [0.8, 0.2, 0.4];
+        round.rot = [0.0, 0.6, 0.0];
+        let e = footprint_extent(&footprint(&round, Some(&oblong)).unwrap());
+        assert!(
+            (e.x - 0.4).abs() < 1e-6 && (e.y - 0.4).abs() < 1e-6,
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn inside_footprint_respects_yaw_and_shape() {
+        let unit = thumb([1.0, 1.0, 1.0]);
+        let mut inst = block(None);
+        inst.scale = [2.0, 1.0, 0.5]; // half extents (1.0, 0.25)
+        let f = footprint(&inst, Some(&unit)).unwrap();
+        assert!(inside_footprint(&f, Vec2::new(0.9, 0.2)));
+        assert!(!inside_footprint(&f, Vec2::new(0.9, 0.4)));
+
+        // Turned a quarter turn, the long axis is now Z.
+        inst.rot = [0.0, std::f32::consts::FRAC_PI_2, 0.0];
+        let f = footprint(&inst, Some(&unit)).unwrap();
+        assert!(inside_footprint(&f, Vec2::new(0.2, 0.9)));
+        assert!(!inside_footprint(&f, Vec2::new(0.9, 0.2)));
+
+        // A non-symmetric yaw, which a mirrored convention cannot fake (±90°
+        // and 180° are their own mirrors, so the quarter turn above passes
+        // either way). Local +X points at world `(cos, −sin)` — the renderer's
+        // `R_y(+yaw)`, the same heading the rotate gizmo's arrow draws — so a
+        // point 0.9 along the long axis is inside and its mirror is not.
+        let yaw = 0.5_f32;
+        inst.rot = [0.0, yaw, 0.0];
+        let f = footprint(&inst, Some(&unit)).unwrap();
+        let along = Vec2::new(0.9 * yaw.cos(), -0.9 * yaw.sin());
+        assert!(inside_footprint(&f, along), "{along:?}");
+        assert!(
+            !inside_footprint(&f, Vec2::new(along.x, -along.y)),
+            "the mirrored heading must be outside the long axis"
+        );
+
+        // A round block is a disc of `half.x`, so its corners are outside.
+        let mut r = block(Some("round"));
+        r.scale = [2.0, 1.0, 2.0]; // radius 1.0
+        let f = footprint(&r, Some(&unit)).unwrap();
+        assert!(inside_footprint(&f, Vec2::new(0.7, 0.7)));
+        assert!(!inside_footprint(&f, Vec2::new(0.8, 0.8)));
+    }
 }

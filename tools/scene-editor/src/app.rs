@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use bevy_nds_3d_obj::PreviewMesh;
 use eframe::egui;
 use egui::{Pos2, Rect, Vec2};
-use scene2bin::schema::Role;
+use scene2bin::schema::{BlockKind, Role};
 use scene2bin::{Camera, Instance, Level, Material, Placement, Prefab, PrefabLib, Zone, ZoneEntry};
 
 use crate::history::History;
@@ -536,37 +536,18 @@ impl EditorApp {
     /// `.scene` format change, runtime untouched. Resize with the scale
     /// gizmo/fields; rotate with the rotate gizmo.
     pub(crate) fn add_primitive(&mut self, kind: Prim) {
-        let mesh = match kind {
-            Prim::Box => "cube".to_string(),
-            Prim::Ramp => {
-                self.ensure_prim_asset("prim_ramp", RAMP_OBJ);
-                "prim_ramp".to_string()
-            }
-            Prim::Cylinder => {
-                let obj = cylinder_obj(12);
-                self.ensure_prim_asset("prim_cylinder", &obj);
-                "prim_cylinder".to_string()
-            }
-        };
+        // The generated `.obj`s are committed to `assets/`, so this is a no-op
+        // in this repo; it stays for an author pointing the editor at a fresh
+        // assets dir.
+        match kind {
+            Prim::Box => {}
+            Prim::Ramp => self.ensure_prim_asset("prim_ramp", RAMP_OBJ),
+            Prim::Cylinder => self.ensure_prim_asset("prim_cylinder", &cylinder_obj(12)),
+        }
         let Some(stem) = self.active.clone() else {
             return;
         };
-        let at = self.view.center;
-        let inst = Instance {
-            mesh: Some(mesh),
-            role: Role::Block.as_str().to_string(),
-            // `block` has no kinds yet (the collide item may add box/ramp/round).
-            kind: None,
-            pos: [at.x, 0.0, at.y],
-            rot: [0.0, 0.0, 0.0],
-            scale: [0.8, 0.8, 0.8],
-            material: Some(Material {
-                diffuse: [110, 116, 130],
-                ambient: [30, 32, 40],
-            }),
-            flags: 0,
-            path: Vec::new(),
-        };
+        let inst = primitive_instance(kind, self.view.center);
         if let Some(zone) = self.contents.get_mut(&stem) {
             let idx = zone.instances.len();
             zone.instances.push(Placement::Lit(inst));
@@ -957,11 +938,40 @@ impl eframe::App for EditorApp {
 
 /// The fixed gray-box primitive set (#44). Kept small and fixed on purpose — a
 /// blocking kit, not a CSG language.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Prim {
     Box,
     Ramp,
     Cylinder,
+}
+
+/// The `Instance` a gray-box primitive drops as (#44 + #12): role `block`, with
+/// the `kind` that tells the runtime **how to collide it** —
+/// `box`/`ramp`/`round` from `BlockKind`. `Prim::Box` authors no kind at all,
+/// because an absent kind already bakes to `BlockKind::Box`.
+///
+/// Pure (no `EditorApp`, no IO) so a test can pin the mesh↔kind pairing — get
+/// that wrong and a ramp becomes an invisible wall you can't climb.
+pub(crate) fn primitive_instance(kind: Prim, at: Vec2) -> Instance {
+    let (mesh, block_kind) = match kind {
+        Prim::Box => ("cube", None),
+        Prim::Ramp => ("prim_ramp", Some(BlockKind::Ramp)),
+        Prim::Cylinder => ("prim_cylinder", Some(BlockKind::Round)),
+    };
+    Instance {
+        mesh: Some(mesh.to_string()),
+        role: Role::Block.as_str().to_string(),
+        kind: block_kind.map(|k| k.as_str().to_string()),
+        pos: [at.x, 0.0, at.y],
+        rot: [0.0, 0.0, 0.0],
+        scale: [0.8, 0.8, 0.8],
+        material: Some(Material {
+            diffuse: [110, 116, 130],
+            ambient: [30, 32, 40],
+        }),
+        flags: 0,
+        path: Vec::new(),
+    }
 }
 
 /// A unit ramp wedge (1×1×1, sloping up along +Z). No `vn` records — the encoder
@@ -1113,6 +1123,38 @@ mod tests {
     #[test]
     fn cylinder_bakes() {
         assert_bakes(&cylinder_obj(12));
+    }
+
+    /// The gray-box palette stamps the `kind` that decides **how the runtime
+    /// collides the thing** (#12). Get the pairing wrong and a dropped ramp
+    /// becomes an unclimbable wall, or a column collides as a square.
+    #[test]
+    fn add_primitive_kind_matches_prim() {
+        let at = Vec2::new(1.5, -2.5);
+        for (prim, mesh, kind) in [
+            (Prim::Box, "cube", None),
+            (Prim::Ramp, "prim_ramp", Some("ramp")),
+            (Prim::Cylinder, "prim_cylinder", Some("round")),
+        ] {
+            let inst = primitive_instance(prim, at);
+            assert_eq!(inst.mesh.as_deref(), Some(mesh), "{prim:?}");
+            assert_eq!(inst.kind.as_deref(), kind, "{prim:?}");
+            // Always a `block` — the role that carries the shape table.
+            assert_eq!(inst.role, Role::Block.as_str());
+            // …and every stamped kind is one the bake accepts.
+            if let Some(k) = inst.kind.as_deref() {
+                assert!(
+                    Role::Block.kinds().contains(&k),
+                    "`{k}` is not a block kind"
+                );
+            }
+            assert_eq!(inst.pos, [at.x, 0.0, at.y], "{prim:?}");
+            assert_eq!(inst.rot, [0.0, 0.0, 0.0], "solid roles are yaw-only");
+        }
+        // An absent kind is not a gap: `BlockKind::Box` is wire 0, which is what
+        // `kind: None` bakes to.
+        assert_eq!(BlockKind::default(), BlockKind::Box);
+        assert_eq!(BlockKind::Box.wire(), 0);
     }
 
     /// `+ new` must produce a level the editor can immediately **save**.

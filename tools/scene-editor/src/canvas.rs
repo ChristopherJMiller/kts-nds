@@ -9,7 +9,7 @@ use scene2bin::schema::Role;
 use scene2bin::{Placement, Zone};
 
 use crate::app::{Drag, EditorApp, Sel};
-use crate::widgets::{diamond, placement_role, role_style};
+use crate::widgets::{diamond, footprint, placement_role, role_style};
 
 /// A placement's Y rotation (a `Use`'s `None` override reads as 0).
 fn placement_rot_y(pl: &Placement) -> f32 {
@@ -266,6 +266,59 @@ impl EditorApp {
             }
             for pt in &pts {
                 painter.circle_filled(*pt, 3.0, Color32::from_rgb(210, 170, 90));
+            }
+        }
+
+        // Blocking footprints (#12): what a solid instance actually collides —
+        // the yawed mesh-AABB × scale rectangle, a circle for `round`, with a
+        // chevron toward local +Z on a `ramp` to show which way it climbs.
+        // Drawn *under* the glyphs, which stay the thing you click.
+        for p in &zone.instances {
+            let Ok(inst) = scene2bin::resolve_placement(p, &self.prefabs) else {
+                continue; // an unknown prefab is already a panel Error
+            };
+            let thumb = inst.mesh.as_deref().and_then(|m| self.mesh_thumbs.get(m));
+            let Some(f) = footprint(&inst, thumb) else {
+                continue;
+            };
+            let (col, _) = role_style(&inst.role);
+            let mut col = col.gamma_multiply(0.6);
+            if !active {
+                col = col.gamma_multiply(0.5);
+            }
+            let stroke = Stroke::new(1.5_f32, col);
+            let c = self.world_to_screen(rect, place + f.center);
+            let (sin, cos) = (f.yaw.sin(), f.yaw.cos());
+            // Local (x, z) → world: `R_y(+yaw)`, the same rotation the runtime
+            // (`bevy_nds_collide::world`), the renderer (`model_matrix`) and the
+            // rotate gizmo below all use — local +Z points at `(sin, cos)`, so
+            // the ramp chevron and the heading arrow agree.
+            let turn = |x: f32, z: f32| {
+                self.world_to_screen(
+                    rect,
+                    place + f.center + Vec2::new(x * cos + z * sin, z * cos - x * sin),
+                )
+            };
+            if f.round {
+                painter.circle_stroke(c, f.half.x * self.view.scale, stroke);
+            } else {
+                let corners = [
+                    turn(-f.half.x, -f.half.y),
+                    turn(f.half.x, -f.half.y),
+                    turn(f.half.x, f.half.y),
+                    turn(-f.half.x, f.half.y),
+                ];
+                for k in 0..4 {
+                    painter.line_segment([corners[k], corners[(k + 1) % 4]], stroke);
+                }
+                if f.ramp {
+                    // Chevron pointing up-slope (local +Z), from the middle of
+                    // the footprint to its high edge.
+                    let tip = turn(0.0, f.half.y);
+                    for s in [-1.0_f32, 1.0] {
+                        painter.line_segment([tip, turn(s * f.half.x * 0.45, 0.0)], stroke);
+                    }
+                }
             }
         }
 
