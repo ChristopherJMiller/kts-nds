@@ -26,7 +26,7 @@ use bevy_nds_math::FxVec2;
 
 use crate::player::{Locomotion, PlayerState};
 use crate::{
-    Avatar, CamWarp, Device, Landmarks, NeighbourInstance, SpaceFloor, Stroke, WorldPos,
+    Avatar, CamWarp, Device, NeighbourInstance, SpaceFloor, Stroke, WorldPos,
     spawn_resident_neighbours, spawn_zone_floor,
 };
 
@@ -136,7 +136,7 @@ pub fn transition_spaces(
     mut device: ResMut<Device>,
     mut stroke: ResMut<Stroke>,
     mut loco: ResMut<Locomotion>,
-    mut landmarks: ResMut<Landmarks>,
+    mut colliders: ResMut<crate::collide::Colliders>,
     // One query over every kind of per-zone entity the crossing tears down
     // (kept as a single param — a function system caps at 16 params).
     despawnable: Query<
@@ -212,7 +212,7 @@ pub fn transition_spaces(
         &mut device,
         &mut stroke,
         &mut loco,
-        &mut landmarks,
+        &mut colliders,
         &despawnable,
     );
 
@@ -256,7 +256,7 @@ pub(crate) fn reload_zone(
     device: &mut Device,
     stroke: &mut Stroke,
     loco: &mut Locomotion,
-    landmarks: &mut Landmarks,
+    colliders: &mut crate::collide::Colliders,
     despawnable: &Query<
         Entity,
         Or<(
@@ -279,7 +279,7 @@ pub(crate) fn reload_zone(
         device,
         stroke,
         loco,
-        landmarks,
+        colliders,
         despawnable,
     );
 }
@@ -295,7 +295,7 @@ fn swap_zone(
     device: &mut Device,
     stroke: &mut Stroke,
     loco: &mut Locomotion,
-    landmarks: &mut Landmarks,
+    colliders: &mut crate::collide::Colliders,
     despawnable: &Query<
         Entity,
         Or<(
@@ -315,7 +315,9 @@ fn swap_zone(
     // The avatar is the single persistent entity, carried across by the caller —
     // never re-spawned. Strip the new active zone's avatar instance (only the
     // entry zone authors one, but it would otherwise re-specialize a duplicate).
-    scene.instances.retain(|i| i.role != "avatar");
+    scene
+        .instances
+        .retain(|i| kts_schema::Role::parse(&i.role) != Some(kts_schema::Role::Avatar));
 
     // Despawn the old active zone's instances, the previous resident neighbours,
     // all floors, and the old gate barriers (the persistent avatar + chrome carry
@@ -328,8 +330,12 @@ fn swap_zone(
     // Per-zone state that mustn't carry over. (Capture progress persists per-enemy
     // via the `ZoneCaptureState` snapshot — restored inline when the new zone's
     // enemies spawn — so only the device cooldown needs clearing here.)
-    landmarks.0.clear(); // `specialize_scene` re-harvests the new zone's set
-    stroke.0.clear();
+    // `specialize_scene` re-harvests the new active set; `spawn_resident_neighbours`
+    // below re-harvests the neighbours.
+    colliders.0.clear();
+    // EXIT-ITEM SEAM: a cross-level teardown must clear `Colliders` here too
+    // (RunState reset bundle).
+    stroke.clear();
     device.hit_cd = 0;
 
     // Movement feel + walkable bounds follow the new zone.
@@ -340,6 +346,7 @@ fn swap_zone(
     crate::spawn_gate_barriers(commands, zone, flags); // walls at the new zone's locked edges
 
     bevy_nds_scene::spawn(commands, scene); // new active zone (minus the avatar)
-    // …and its neighbours become resident (render-only, fogged) in turn.
-    spawn_resident_neighbours(commands, zone, snapshot);
+    // …and its neighbours become resident (fogged, and solid at their offset)
+    // in turn.
+    spawn_resident_neighbours(commands, zone, snapshot, colliders);
 }

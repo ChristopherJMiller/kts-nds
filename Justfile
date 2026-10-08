@@ -55,8 +55,9 @@ check-editor:
 # Crates split into two groups by dependency shape:
 # - `bevy_nds_3d_obj` / `obj2dl` / `bevy_nds_3d_macros` have no external deps, so
 #   they build cleanly against the prebuilt host std (plain `--target host`).
-# - The platform subcrates and `bevy_nds_3d_cull` pull in crates compiled
-#   against `core` (Bevy; `libm`), so the host test needs `std` built from
+# - The platform subcrates, `bevy_nds_3d_cull` and `bevy_nds_collide` pull in
+#   crates compiled against `core` (Bevy; `libm`; `bevy_nds_math`), so the host
+#   test needs `std` built from
 #   source to keep a single `core` (avoiding a duplicate-lang-item clash) and
 #   `panic = "unwind"` to match the test harness. `wav2bank` has no external
 #   deps, but a *clean* host build still trips the duplicate-`core` clash under
@@ -75,6 +76,7 @@ test *args:
         -p bevy_nds_sprite \
         -p bevy_nds_bg \
         -p bevy_nds_3d_cull \
+        -p bevy_nds_collide \
         -p bevy_nds_loop \
         -p wav2bank \
         -p bevy_nds_audio \
@@ -84,10 +86,35 @@ test *args:
         -p bevy_nds_save \
         -p bevy_nds_scene \
         -p scene2bin \
+        -p kts_schema \
         --target "$(rustc -vV | sed -n 's/^host: //p')" \
         --config 'unstable.build-std=["std","panic_unwind","proc_macro"]' \
         --config 'profile.dev.panic="unwind"' \
         {{args}}
+
+# Run ONE crate's host tests with the group-2 flags (std from source +
+# panic=unwind). `just test <arg>` is a test-NAME filter, not a package filter,
+# so `just test my_crate` runs zero tests and reports green — use this instead.
+# Usage: `just test-crate bevy_nds_loop` or `just test-crate scene2bin encode`.
+test-crate crate *args:
+    cargo test -p {{crate}} \
+        --target "$(rustc -vV | sed -n 's/^host: //p')" \
+        --config 'unstable.build-std=["std","panic_unwind","proc_macro"]' \
+        --config 'profile.dev.panic="unwind"' \
+        {{args}}
+
+# Run the desktop editor's own unit tests (its detached host workspace).
+test-editor *args:
+    cd tools/scene-editor && cargo test {{args}}
+
+# Parse + validate + derive every level under assets/levels with a NON-ZERO exit
+# on any validation Error (build.rs only warns and falls back to stale blobs).
+check-levels:
+    cargo run -p scene2bin \
+        --target "$(rustc -vV | sed -n 's/^host: //p')" \
+        --config 'unstable.build-std=["std","panic_unwind","proc_macro"]' \
+        --config 'profile.dev.panic="unwind"' \
+        -- --check assets/levels --assets assets --prefabs assets/prefabs
 
 # Format the Rust sources.
 fmt:

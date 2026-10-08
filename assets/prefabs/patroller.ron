@@ -6,6 +6,11 @@
 Prefab(
     mesh: Some("cube"),
     role: "enemy",
+    // The role-scoped sub-archetype axis (#27): which *kind* of enemy this is,
+    // from `kts_schema::Role::Enemy.kinds()` (basic/shielded/advanced/heavy).
+    // Prefab-owned like `role` — a `Use` places it, never re-kinds it. `basic`
+    // is also what an omitted `kind` bakes to, so this is explicit, not new.
+    kind: Some("basic"),
     rot: (0.0, 0.4, 0.0),
     scale: (0.16, 0.16, 0.16),
     material: Some((diffuse: (225, 80, 70), ambient: (56, 20, 18))),

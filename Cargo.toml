@@ -28,6 +28,8 @@ members = [
   "crates/png2bg",
   "crates/bevy_nds_scene",
   "crates/scene2bin",
+  "crates/kts_schema",
+  "crates/bevy_nds_collide",
 ]
 # The desktop scene editor is a standalone host GUI app, detached from this DS
 # workspace (it has its own `[workspace]` + `.cargo/config.toml`); excluded so
@@ -54,6 +56,14 @@ bevy_nds_sprite = { path = "crates/bevy_nds_sprite" }
 bevy_nds_bg = { path = "crates/bevy_nds_bg" }
 bevy_nds_math = { path = "crates/bevy_nds_math" }
 bevy_nds_loop = { path = "crates/bevy_nds_loop" }
+# Static blocking geometry (boxes / ramps / round columns) for avatar
+# locomotion — pure and Bevy-free, so it is depended on directly rather than
+# living in `DsPlugins`. The game glue is `src/collide.rs`.
+bevy_nds_collide = { path = "crates/bevy_nds_collide" }
+
+# The game-owned authored vocabulary (roles, role-scoped kinds, flag bits/ids)
+# shared with the `scene2bin` baker — see crates/kts_schema.
+kts_schema = { path = "crates/kts_schema" }
 
 # Soft-float trig for the orbit-camera yaw (no FPU; matches the engine crates).
 libm = "0.2"
@@ -182,6 +192,13 @@ opt-level = 3
 opt-level = 3
 
 [profile.dev.package.bevy_nds_scene]
+opt-level = 3
+
+[profile.dev.package.kts_schema]
+opt-level = 3
+
+# Static blocking geometry runs inside `move_player`, i.e. every frame.
+[profile.dev.package.bevy_nds_collide]
 opt-level = 3
 
 [profile.release]

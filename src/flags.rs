@@ -28,24 +28,38 @@ use crate::capture::Capture;
 use crate::transition::Zone;
 use crate::{Enemy, NeighbourInstance};
 
-/// **Gate-objective** bit in a scene instance's `flags`: set on an enemy that
-/// **counts toward its zone's clear flag** (#27, tier 1) — clearing all of a
-/// zone's gate objectives opens an *adjacent gate*. Freeform / optional enemies
-/// omit it and gate nothing. Authored in the level RON (`flags: 1`) and read by
-/// `specialize_scene`, which tags the entity with [`Objective`].
-pub const OBJECTIVE: u32 = 0x1;
+// The two namespaces below are **defined once** in `kts_schema` — the shared
+// authored vocabulary the host baker (`scene2bin`) validates against and the
+// desktop editor's checkboxes are generated from — and re-exported here so every
+// `flags::X` call site in the game reads the same constant the bake enforced.
+// The prose is the important half; keep it here, next to the systems that use it.
+//
+// **Instance-flag bits** (`kts_schema::flag_bits`) — a bitmask authored on a
+// scene instance:
+//
+// - `OBJECTIVE` (0x1): a **gate objective** — this enemy counts toward its
+//   zone's clear flag (#27, tier 1). Clearing all of a zone's gate objectives
+//   opens an *adjacent gate*. Freeform / optional enemies omit it and gate
+//   nothing. Authored in the level RON (`flags: 1`) and read by
+//   `spawn::attach`, which tags the entity with [`Objective`].
+// - `LEVEL_OBJECTIVE` (0x2): a **freeform** enemy that contributes to the
+//   **level-wide** objective — the one that opens the *level exit*
+//   ([`LEVEL_EXIT`]) — rather than any per-zone gate (#27, tier 2). Authored as
+//   `flags: 2` (or `3` for an enemy that is both); `spawn::attach` tags the
+//   entity with [`LevelObjectiveTag`].
+//
+// The bake rejects an undefined bit, and a bit on a role that can't carry it
+// (`Role::allowed_flags`), so an authoring typo never reaches the ROM as a
+// silently ignored field.
+pub use kts_schema::flag_bits::{LEVEL_OBJECTIVE, OBJECTIVE};
 
-/// **Level-objective** bit in a scene instance's `flags` (#27, tier 2): a
-/// **freeform** enemy that contributes to the **level-wide** objective — the one
-/// that opens the *level exit* ([`LEVEL_EXIT`]) — rather than any per-zone gate.
-/// Authored as `flags: 2` (or `3` for an enemy that is both). Read by
-/// `specialize_scene`, which tags the entity with [`LevelObjectiveTag`].
-pub const LEVEL_OBJECTIVE: u32 = 0x2;
-
-/// Reserved engine flag id raised when the **level objective** is met — the
-/// consumer for a future level-exit-as-location (#27). Authored *gate* flags stay
-/// small (1, 2, …); the engine reserves the high range so the two never collide.
-pub const LEVEL_EXIT: u32 = 0x1000_0000;
+// **Flag ids** (`kts_schema::flag_ids`) — ids raised in the [`Flags`] *set*, a
+// different space from the bits above. `LEVEL_EXIT` is raised when the **level
+// objective** is met: the consumer for a future level-exit-as-location (#27).
+// Authored *gate* flags stay small (1, 2, …) and the engine reserves the high
+// range (`flag_ids::RESERVED_MIN`) so the two never collide — the bake errors on
+// an authored `clear_flag` / `Gate.flag` inside it.
+pub use kts_schema::flag_ids::LEVEL_EXIT;
 
 /// The level's raised-flag set — **persists across zone crossings** (clearing an
 /// arena stays cleared; `swap_zone` deliberately doesn't touch it). `0` is never

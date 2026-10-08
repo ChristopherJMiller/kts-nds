@@ -17,15 +17,22 @@
 //! read is provisional — it lands better once a side-ish corridor camera exists
 //! (#23). Movement is tuned per [`Locomotion`] preset (Arena / Corridor); #27
 //! will pick the preset per space.
+//!
+//! Both axes are resolved against the zone's static geometry by
+//! `bevy_nds_collide` (#12): [`move_player`] pushes the horizontal move out of
+//! boxes, ramps and columns, and settles [`Height`] onto whatever surface ends
+//! up underfoot — the avatar walks up a ramp, steps a kerb, and falls off a
+//! ledge through one rule set. The body's dimensions live on [`Locomotion`].
 
 use bevy_ecs::prelude::*;
 use bevy_nds::prelude::*;
+use bevy_nds_collide::{Body, ground_height, resolve_move, settle_height};
 use bevy_nds_math::stick::{StickConfig, smooth as vel_smooth, stick_vector};
 
 use bevy_nds_scene::CameraMode;
 
 use crate::control::{self, Action};
-use crate::{Avatar, LANDMARK_COLLIDE, Landmarks, WorldPos};
+use crate::{Avatar, WorldPos};
 
 // --- Stylus conditioning (Spike A defaults, locked 2026-06-14) ---------------
 
@@ -54,11 +61,20 @@ impl PlayerState {
 
 /// Avatar height above the ground plane — the jump axis, separate from the
 /// `WorldPos` ground XY. Integrated under gravity each frame.
+///
+/// This is the **Height frame** `bevy_nds_collide` works in: `0` is the floor
+/// and `z` is the height of the avatar's feet above it, which is why
+/// `crate::collide::harvest` converts a collider's span out of the render frame
+/// by subtracting `GROUND_Y`.
 #[derive(Component, Default)]
 pub struct Height {
     pub z: Fx32,
     pub vz: Fx32,
     pub grounded: bool,
+    /// The support height under the avatar this frame — the floor (`0`) over
+    /// open ground, a box top or a point on a ramp over geometry. Read by
+    /// [`sync_shadow`] so the contact shadow rides the surface it belongs to.
+    pub ground: Fx32,
 }
 
 /// Marker for the flat ground shadow that tracks the avatar's ground position
@@ -170,7 +186,23 @@ pub struct Locomotion {
     pub roll_frames: u8,
     pub jump_impulse: Fx32,
     pub gravity: Fx32,
+    /// Collision radius of the avatar's body. `0.18` + a landmark's `0.08` half
+    /// extent is exactly the `0.26` the pre-#12 circle push-out enforced, so the
+    /// shipped landmark feel is preserved to the raw fixed-point unit.
+    pub radius: Fx32,
+    /// Body height — the ceiling for "is that an overhang I walk under?".
+    pub height: Fx32,
+    /// The tallest lip the avatar walks up instead of being stopped by.
+    pub step: Fx32,
 }
+
+/// Avatar body dimensions (#12, provisional pending a `playtest-log` verdict).
+/// **Identical in both presets on purpose**: this slice changes no corridor
+/// feel, and `Locomotion::for_camera` remains the per-space tuning seam if a
+/// later pass wants to differ them.
+const BODY_RADIUS: f32 = 0.18;
+const BODY_HEIGHT: f32 = 0.32;
+const BODY_STEP: f32 = 0.10;
 
 impl Locomotion {
     fn arena() -> Self {
@@ -183,6 +215,9 @@ impl Locomotion {
             roll_frames: 10,
             jump_impulse: Fx32::from_f32(2.2),
             gravity: Fx32::from_f32(9.0),
+            radius: Fx32::from_f32(BODY_RADIUS),
+            height: Fx32::from_f32(BODY_HEIGHT),
+            step: Fx32::from_f32(BODY_STEP),
         }
     }
 
@@ -196,6 +231,9 @@ impl Locomotion {
             roll_frames: 9,
             jump_impulse: Fx32::from_f32(2.0),
             gravity: Fx32::from_f32(10.0),
+            radius: Fx32::from_f32(BODY_RADIUS),
+            height: Fx32::from_f32(BODY_HEIGHT),
+            step: Fx32::from_f32(BODY_STEP),
         }
     }
 
@@ -232,9 +270,9 @@ pub fn toggle_tuning(input: Res<ButtonInput<DsButton>>, mut loco: ResMut<Locomot
 }
 
 /// The core controller: produce this frame's horizontal move (stowed stylus /
-/// deployed dodge / evasive burst), integrate the jump/height model, then apply
-/// the result to the avatar's [`WorldPos`] + [`Height`] with arena clamp and
-/// landmark push-out (the same collision the spike used).
+/// deployed dodge / evasive burst), resolve it against the zone's static
+/// blocking geometry (#12) and the zone bounds, then settle the jump/height
+/// model onto whatever surface ended up underfoot.
 pub fn move_player(
     time: Res<Time>,
     touches: Res<Touches>,
@@ -246,7 +284,7 @@ pub fn move_player(
     radial: Res<crate::radial::Radial>,
     mut stick: ResMut<StickState>,
     mut motion: ResMut<Motion>,
-    landmarks: Res<Landmarks>,
+    colliders: Res<crate::collide::Colliders>,
     mut q: Query<(&mut WorldPos, &mut Height), With<Avatar>>,
 ) {
     let dt = Fx32::from_f32(time.delta_secs());
@@ -284,33 +322,56 @@ pub fn move_player(
         motion.last_dir = delta.normalize_or_zero();
     }
 
-    // Gravity integration (the jump arc). Stays grounded at z = 0.
-    height.vz = height.vz - loco.gravity * dt;
-    height.z = height.z + height.vz * dt;
-    if height.z <= Fx32::ZERO {
-        height.z = Fx32::ZERO;
-        height.vz = Fx32::ZERO;
-        height.grounded = true;
-    } else {
-        height.grounded = false;
-    }
-
-    // Apply horizontal move: clamp to the current zone's bounds (the depth band
-    // is tight for a 2.5D corridor, so the avatar can't walk into the rail
-    // camera), push out of landmark obstacles. `WorldPos.y` is the world depth
-    // (Z) axis; `Zone.bounds` is `[min_x, min_z, max_x, max_z]`.
+    // Horizontal move, then the vertical settle — in that order, because what
+    // is underfoot depends on where the move ended up.
+    //
+    // `prev` is the height the avatar starts the frame at (its feet, in the
+    // Height frame the collide crate uses); `grounded` is read *after* input, so
+    // a jump armed this frame has already cleared it and nothing steps mid-hop.
+    let prev = height.z;
+    let grounded = height.grounded;
+    let body = Body {
+        radius: loco.radius,
+        height: loco.height,
+        step: loco.step,
+    };
+    // `WorldPos.y` is the world depth (Z) axis; `Zone.bounds` is
+    // `[min_x, min_z, max_x, max_z]`. The depth band is tight for a 2.5D
+    // corridor, so the avatar can't walk into the rail camera.
     let [min_x, min_z, max_x, max_z] = zone.bounds;
-    let mut np = pos.0 + delta;
-    np.x = np.x.clamp(Fx32::from_f32(min_x), Fx32::from_f32(max_x));
-    np.y = np.y.clamp(Fx32::from_f32(min_z), Fx32::from_f32(max_z));
-    let min = Fx32::from_f32(LANDMARK_COLLIDE);
-    for &c in &landmarks.0 {
-        let sep = np - c;
-        let d = sep.length();
-        if d > Fx32::ZERO && d < min {
-            np = c + sep.normalize_or_zero() * min;
-        }
-    }
+    let bounds = [
+        Fx32::from_f32(min_x),
+        Fx32::from_f32(min_z),
+        Fx32::from_f32(max_x),
+        Fx32::from_f32(max_z),
+    ];
+    // Grounded, a lip up to `step` tall is walked over; airborne, nothing is.
+    let step_allow = if grounded { loco.step } else { Fx32::ZERO };
+    let np = resolve_move(
+        &colliders.0,
+        pos.0,
+        pos.0 + delta,
+        &body,
+        prev,
+        step_allow,
+        bounds,
+    );
+    // The same split on the vertical axis: grounded you may rise onto a surface
+    // up to `step` above your feet, airborne only onto one you are over (the
+    // crate's own exception — landing up-slope) and only while descending, so
+    // there is no snap-up onto a pillar near the jump apex.
+    // `prev` goes in twice on purpose: as the feet (which decide whether a
+    // surface is a step *up*, and so needs the bare footprint rather than the
+    // forgiving skirt) and as the airborne ceiling.
+    let ceiling = if grounded { prev + loco.step } else { prev };
+    let ground = ground_height(&colliders.0, np, &body, prev, ceiling, Fx32::ZERO);
+    let vz = height.vz - loco.gravity * dt;
+    let z = prev + vz * dt;
+    let (z, vz, g) = settle_height(z, vz, prev, grounded, ground, loco.step);
+    height.z = z;
+    height.vz = vz;
+    height.grounded = g;
+    height.ground = ground;
     pos.0 = np;
 }
 
@@ -465,14 +526,18 @@ fn stowed_locomotion(
     stick.vel * (loco.stow_speed * dt)
 }
 
-/// Keep the ground [`Shadow`] under the avatar (it ignores [`Height`], so the
-/// jump lift reads against it). Mirrors the avatar's ground `WorldPos`.
+/// Keep the ground [`Shadow`] under the avatar: its ground `WorldPos`, and its
+/// [`Height::z`] set to the **support** height rather than the avatar's own, so
+/// the shadow rides box and ramp tops (#12) while a jump's lift still reads as a
+/// visible gap above it.
 pub fn sync_shadow(
-    avatar: Query<&WorldPos, (With<Avatar>, Without<Shadow>)>,
-    mut shadow: Query<&mut WorldPos, With<Shadow>>,
+    avatar: Query<(&WorldPos, &Height), (With<Avatar>, Without<Shadow>)>,
+    mut shadow: Query<(&mut WorldPos, &mut Height), With<Shadow>>,
 ) {
-    let (Some(a), Some(mut s)) = (avatar.iter().next(), shadow.iter_mut().next()) else {
+    let (Some((a, ah)), Some((mut s, mut sh))) = (avatar.iter().next(), shadow.iter_mut().next())
+    else {
         return;
     };
     s.0 = a.0;
+    sh.z = ah.ground;
 }

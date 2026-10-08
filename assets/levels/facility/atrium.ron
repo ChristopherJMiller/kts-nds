@@ -22,7 +22,56 @@ Zone(instances: [
     // patroller above), it contributes to the *level* objective / exit (#27 tier
     // 2). Demonstrates "not all encounters gate."
     Use(name: "patroller", pos: (-1.5, 0.0, -1.3), flags: Some(2), path: [(-1.5, -1.3), (-0.7, -1.3)]),
+    // --- Mixed encounter (#29 shape matrix; #27 "encounter composition") -----
+    // Both FREEFORM (no `flags`): they don't gate the atrium and don't roll up
+    // to the level exit, so the level-exit condition and the Basic regression
+    // baseline above are exactly unchanged. They are here to force adaptation —
+    // a loop that captures the patrollers does nothing to either of these.
+    //
+    // The SHIELDED slab answers only to a straight slash through it, paced along
+    // the south edge, clear of both patrol routes and of the north-east block
+    // geometry (x 0.65..1.65, z 0.7..1.8).
+    Use(name: "shielded", pos: (1.5, 0.0, -1.6), path: [(1.5, -1.6), (0.5, -1.6)]),
+    // The ADVANCED wedge answers only to a drawn triangle, pacing the west edge
+    // well clear of the east gate band.
+    Use(name: "advanced", pos: (-1.7, 0.0, 0.6), path: [(-1.7, 0.6), (-1.7, 1.6)]),
     // Two grey landmarks for sightlines / cover; the second is turned a touch.
     Use(name: "landmark_block", pos: (-1.25, 0.0, 0.95)),
     Use(name: "landmark_block", pos: (1.25, 0.0, -0.95), rot: Some((0.0, 0.3, 0.0))),
+    // --- Blocking proof geometry (#12) --------------------------------------
+    // Three solid `block` instances in the north-east quarter, clear of both
+    // patrol routes and of the east gate's crossing band. Each rests ON the
+    // floor: meshes render centred, so `pos.y = GROUND_Y + scale.y / 2` puts the
+    // base at GROUND_Y (-0.16) and the Height-frame span at [0, scale.y].
+    //
+    // A low box, 0.12 tall — just over the 0.10 step allowance, so it blocks on
+    // foot and is mounted with a jump (apex 2.2^2 / (2 * 9) = 0.269).
+    Lit(Instance(
+        mesh: Some("cube"),
+        role: "block",
+        pos: (0.85, -0.10, 1.30),
+        scale: (0.40, 0.12, 0.40),
+        material: Some((diffuse: (110, 116, 130), ambient: (30, 32, 40))),
+    )),
+    // The ramp: rises 0.24 over a 0.70 run (slope 0.34 — about 0.009 per frame
+    // at stow speed, so the climb reads as continuous rather than as a stair).
+    // Its high edge is at the mesh's local +Z, which with rot.y = 0 is world +Z
+    // (z = 1.40) — exactly the tall box's near face.
+    Lit(Instance(
+        mesh: Some("prim_ramp"),
+        role: "block",
+        kind: Some("ramp"),
+        pos: (1.45, -0.04, 1.05),
+        scale: (0.40, 0.24, 0.70),
+        material: Some((diffuse: (110, 116, 130), ambient: (30, 32, 40))),
+    )),
+    // The tall box: a 0.24 top, the same height as a landmark and barely inside
+    // the jump apex — the intended way up is the ramp it abuts.
+    Lit(Instance(
+        mesh: Some("cube"),
+        role: "block",
+        pos: (1.45, -0.04, 1.60),
+        scale: (0.40, 0.24, 0.40),
+        material: Some((diffuse: (110, 116, 130), ambient: (30, 32, 40))),
+    )),
 ])

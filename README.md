@@ -63,6 +63,18 @@ depend on individual subcrates directly and opt out of whatever they don't need
 - **`bevy_nds_3d_macros`** (`crates/bevy_nds_3d_macros`) — `include_obj!` proc-macro.
 - **`bevy_nds_3d_cull`** (`crates/bevy_nds_3d_cull`) — pure, host-testable
   view-frustum culling math.
+- **`bevy_nds_loop`** (`crates/bevy_nds_loop`) — pure, host-testable
+  capture-loop geometry: path smoothing, self-intersection loop closure,
+  point-in-polygon / enclosure tests, loop-quality metrics and the glowing
+  stroke rasterizer, plus a thin `LoopPlugin` that buffers the touch stream.
+  `shape.rs` classifies a finished stroke — a closed loop into circle /
+  triangle / square with a 0..=1 quality, an open one into a straight slash,
+  and `crosses_circle` for the through-cut. Game-agnostic and all fixed point.
+- **`bevy_nds_collide`** (`crates/bevy_nds_collide`) — pure, host-testable
+  static blocking geometry: yawed boxes, ramps and round columns in 20.12
+  fixed point, with a sub-stepped push-out, a support-height lookup and the
+  step/land/fall rule. No Bevy and no plugin — a game depends on it directly
+  and keeps its own collider set.
 - **`bevy_nds_audio`** (`crates/bevy_nds_audio`) — maxmod-backed music + SFX.
 - **`bevy_nds_math`** (`crates/bevy_nds_math`) — 20.12 fixed-point (`Fx32` /
   `FxVec2` / `FxVec3`) and safe wrappers around the DS hardware divide/sqrt
@@ -214,7 +226,10 @@ For the smaller, faster build, append `release`, e.g. `just run release`.
 | `just preview [profile]` | Build, package, boot in **desmume** headlessly, save `preview.png` and print frame-time stats (`samples=… min=… avg=… p95=… fps_avg=…`) read from the ROM's `PERF_BLOB` via the gdbstub. Override with `OUT=`, `WAIT=`, `DISP=`, `GDBPORT=`. |
 | `just snap [profile]`    | Like `preview`, but with a short default `WAIT` for grabbing the first stable frame (README banners, changelog snaps). Accepts fractional seconds. |
 | `just check`             | `cargo check`.                                             |
-| `just test [filter]`     | Run the `bevy_nds` host-side unit tests (builds for the host triple). |
+| `just test [filter]`     | Run the `bevy_nds` host-side unit tests (builds for the host triple). `filter` is a test-**name** filter, not a package filter. |
+| `just test-crate <crate> [filter]` | Run one crate's host tests (the per-crate form of `just test`). |
+| `just check-editor` / `just test-editor` | Type-check / test the detached desktop level editor. |
+| `just check-levels`      | Validate every level under `assets/levels/` — non-zero exit on any Error (`build.rs` can only warn). |
 | `just fmt`               | `cargo fmt`.                                               |
 | `just clean`             | Remove build artifacts and the ROM.                        |
 
@@ -273,6 +288,9 @@ crates/bevy_nds_3d/             hardware 3D backend (Transform3d, DsMesh, Camera
 crates/bevy_nds_3d_obj/         host OBJ -> display-list encoder (shared packing math)
 crates/bevy_nds_3d_macros/      include_obj! proc-macro (bakes a model into the ROM)
 crates/bevy_nds_3d_cull/        pure, host-testable view-frustum culling math
+crates/bevy_nds_collide/        pure, host-testable static blocking geometry (boxes/ramps/columns)
+crates/bevy_nds_loop/           capture-loop geometry + LoopPlugin
+  src/shape.rs                    stroke classifier: loop -> circle/triangle/square, open -> line
 crates/bevy_nds_math/           20.12 fixed-point + hardware divide/sqrt wrappers (host-testable)
 crates/bevy_nds_cothread/       libnds cooperative threads as Tasks/Task<T> (non-blocking IO)
 crates/bevy_nds_audio/          maxmod audio backend (Music resource, PlaySfx events)
@@ -283,7 +301,16 @@ crates/wav2bank/                host CLI/lib: WAV -> soundbank.bin via mmutil (u
 crates/obj2dl/                  host CLI/lib: OBJ -> .dl NitroFS asset (used by build.rs)
 crates/bevy_nds_bg/             tile + bitmap BG layers (BackgroundPlugin + Backgrounds resource)
 crates/png2bg/                  host CLI/lib: PNG -> .bg/.bbg NitroFS asset via grit (used by build.rs)
+crates/bevy_nds_scene/          game-agnostic .scene loader (opaque role string + kind byte)
+crates/scene2bin/               host CLI/lib: assets/levels/<name>/ -> .scene blobs + validate_all
+crates/kts_schema/              the game's authored vocabulary: roles, role-scoped kinds, flag bits/ids
+                                + the shape-vulnerability matrix (EnemyKind::required_shape, accepts)
+tools/scene-editor/             desktop level editor (detached workspace; reads scene2bin's RON)
+src/spawn.rs                    the one authored-instance -> components dispatch (attach/skip_spawn)
+src/collide.rs                  Colliders resource + harvest: authored instance -> Collider
 assets/                         uncompiled source models (e.g. teapot.obj)
+assets/levels/<name>/           authored levels: level.ron manifest + one <zone>.ron per zone
+assets/prefabs/                 reusable instance templates resolved host-side at bake
 audio/                          uncompiled source sounds (music/*.wav, sfx/*.wav)
 build/nitrofs/                  compiled .dl + soundbank.bin, packed into the ROM (gitignored)
 ```

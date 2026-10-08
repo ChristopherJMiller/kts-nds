@@ -5,19 +5,21 @@
 //! **runtime** half of the pipeline:
 //!
 //! ```text
-//! assets/spaces/*.ron  ──scene2bin──▶  build/nitrofs/spaces/*.scene  ──┐
-//!                       (host baker)                                    │
-//!                                                       this crate ◀────┘
+//! assets/levels/<name>/*.ron ──scene2bin──▶ build/nitrofs/levels/<name>/*.scene ──┐
+//!                             (host baker)                                        │
+//!                                                             this crate ◀────────┘
 //!                                          load() → parse() → spawn()
 //! ```
 //!
 //! It is deliberately **game-agnostic**: it spawns each authored instance as a
 //! rendered mesh entity tagged with a [`SceneInstance`] carrying an *opaque*
-//! `role` string (and any authored [`ScenePath`]). The game watches for those
-//! and attaches its own behaviour by role (`"enemy"` → its `Enemy` component,
-//! etc.), so engine code never learns game-specific names. The parsed data is
-//! also kept in a [`LoadedScene`] resource for graph-level needs (camera mode,
-//! exits).
+//! `role` string, an equally opaque `kind` byte, and any authored
+//! [`ScenePath`]. The game watches for those and attaches its own behaviour
+//! (`"enemy"` → its `Enemy` component, the `kind` → its sub-archetype), so
+//! engine code never learns game-specific names — in *Kill the Serpent* the
+//! whole vocabulary lives in its own `kts_schema` crate, which this one does not
+//! depend on. The parsed data is also kept in a [`LoadedScene`] resource for
+//! graph-level needs (camera mode, exits).
 //!
 //! It adds no allocator / panic handler; it composes [`bevy_nds_nitrofs`]
 //! (bytes) and [`bevy_nds_3d`] (meshes, transforms, materials).
@@ -49,6 +51,10 @@ pub struct SceneInstance {
     pub role: String,
     /// Opaque per-instance flags (game-defined; see [`SceneInstanceData`]).
     pub flags: u32,
+    /// The opaque authored **kind** byte (v4) — a second game-defined channel
+    /// alongside `role`/`flags`, scoped to the role. The game owns the mapping
+    /// (in *Kill the Serpent*, `crates/kts_schema`); this crate only carries it.
+    pub kind: u8,
 }
 
 /// Ground-plane (XZ) waypoints authored on an instance (an enemy patrol path, a
@@ -89,6 +95,7 @@ pub fn spawn(commands: &mut Commands, scene: SceneData) {
             SceneInstance {
                 role: inst.role.clone(),
                 flags: inst.flags,
+                kind: inst.kind,
             },
         ));
         if let Some(name) = &inst.mesh {

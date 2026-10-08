@@ -5,10 +5,11 @@
 
 use eframe::egui;
 use egui::{Align2, Color32, FontId, Pos2, Rect, Sense, Shape, Stroke, Vec2};
+use scene2bin::schema::{CaptureShape, Role};
 use scene2bin::{Placement, Zone};
 
 use crate::app::{Drag, EditorApp, Sel};
-use crate::widgets::{diamond, placement_role, role_style};
+use crate::widgets::{diamond, footprint, placement_kind, placement_role, role_style, triangle};
 
 /// A placement's Y rotation (a `Use`'s `None` override reads as 0).
 fn placement_rot_y(pl: &Placement) -> f32 {
@@ -268,6 +269,59 @@ impl EditorApp {
             }
         }
 
+        // Blocking footprints (#12): what a solid instance actually collides —
+        // the yawed mesh-AABB × scale rectangle, a circle for `round`, with a
+        // chevron toward local +Z on a `ramp` to show which way it climbs.
+        // Drawn *under* the glyphs, which stay the thing you click.
+        for p in &zone.instances {
+            let Ok(inst) = scene2bin::resolve_placement(p, &self.prefabs) else {
+                continue; // an unknown prefab is already a panel Error
+            };
+            let thumb = inst.mesh.as_deref().and_then(|m| self.mesh_thumbs.get(m));
+            let Some(f) = footprint(&inst, thumb) else {
+                continue;
+            };
+            let (col, _) = role_style(&inst.role);
+            let mut col = col.gamma_multiply(0.6);
+            if !active {
+                col = col.gamma_multiply(0.5);
+            }
+            let stroke = Stroke::new(1.5_f32, col);
+            let c = self.world_to_screen(rect, place + f.center);
+            let (sin, cos) = (f.yaw.sin(), f.yaw.cos());
+            // Local (x, z) → world: `R_y(+yaw)`, the same rotation the runtime
+            // (`bevy_nds_collide::world`), the renderer (`model_matrix`) and the
+            // rotate gizmo below all use — local +Z points at `(sin, cos)`, so
+            // the ramp chevron and the heading arrow agree.
+            let turn = |x: f32, z: f32| {
+                self.world_to_screen(
+                    rect,
+                    place + f.center + Vec2::new(x * cos + z * sin, z * cos - x * sin),
+                )
+            };
+            if f.round {
+                painter.circle_stroke(c, f.half.x * self.view.scale, stroke);
+            } else {
+                let corners = [
+                    turn(-f.half.x, -f.half.y),
+                    turn(f.half.x, -f.half.y),
+                    turn(f.half.x, f.half.y),
+                    turn(-f.half.x, f.half.y),
+                ];
+                for k in 0..4 {
+                    painter.line_segment([corners[k], corners[(k + 1) % 4]], stroke);
+                }
+                if f.ramp {
+                    // Chevron pointing up-slope (local +Z), from the middle of
+                    // the footprint to its high edge.
+                    let tip = turn(0.0, f.half.y);
+                    for s in [-1.0_f32, 1.0] {
+                        painter.line_segment([tip, turn(s * f.half.x * 0.45, 0.0)], stroke);
+                    }
+                }
+            }
+        }
+
         // instance markers.
         for (i, p) in zone.instances.iter().enumerate() {
             let lpos = p.pos();
@@ -283,11 +337,48 @@ impl EditorApp {
             } else {
                 Stroke::new(1.0_f32, Color32::from_black_alpha(160))
             };
-            match role.as_str() {
-                "enemy" => {
-                    painter.add(Shape::convex_polygon(diamond(sp, r), col, outline));
+            // Glyph by role: static geometry reads as rects and the avatar as a
+            // circle, while an **enemy draws the gesture that captures it**
+            // (#29) — circle / bar / triangle / square, straight off
+            // `EnemyKind::required_shape`, so encounter composition is legible
+            // on the canvas without reading every prefab. Colour still keys on
+            // role (`role_style`); the shape is the information. An enemy whose
+            // kind can't be resolved (unknown spelling, missing prefab) keeps
+            // the old neutral diamond, and an unparseable *role* falls through
+            // to a circle in the error tint.
+            match Role::parse(&role) {
+                Some(Role::Enemy) => {
+                    match placement_kind(p, &self.prefabs).map(|k| k.required_shape()) {
+                        Some(CaptureShape::Circle) => {
+                            painter.circle(sp, r, col, outline);
+                        }
+                        Some(CaptureShape::Line) => {
+                            painter.rect(
+                                Rect::from_center_size(sp, Vec2::new(r * 2.2, r * 0.7)),
+                                0.0,
+                                col,
+                                outline,
+                                egui::StrokeKind::Inside,
+                            );
+                        }
+                        Some(CaptureShape::Triangle) => {
+                            painter.add(Shape::convex_polygon(triangle(sp, r), col, outline));
+                        }
+                        Some(CaptureShape::Square) => {
+                            painter.rect(
+                                Rect::from_center_size(sp, Vec2::splat(r * 1.6)),
+                                0.0,
+                                col,
+                                outline,
+                                egui::StrokeKind::Inside,
+                            );
+                        }
+                        None => {
+                            painter.add(Shape::convex_polygon(diamond(sp, r), col, outline));
+                        }
+                    }
                 }
-                "landmark" | "prop" => {
+                Some(Role::Landmark | Role::Prop | Role::Block) => {
                     painter.rect(
                         Rect::from_center_size(sp, Vec2::splat(r * 1.7)),
                         0.0,
@@ -296,7 +387,7 @@ impl EditorApp {
                         egui::StrokeKind::Inside,
                     );
                 }
-                _ => {
+                Some(Role::Avatar) | None => {
                     painter.circle(sp, r, col, outline);
                 }
             }

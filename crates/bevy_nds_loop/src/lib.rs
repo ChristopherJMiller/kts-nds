@@ -14,10 +14,12 @@
 //!    even-odd ray cast against the closed polygon.
 //!
 //! Plus [`smooth`] to tame the ~60 Hz, jitter-prone touch stream, and
-//! [`area`] / [`perimeter`] / [`regularity`] loop-quality metrics (the hook for
-//! shape-based scoring, #29). The geometry is all fixed-point
-//! ([`bevy_nds_math`]) and FFI-free, so it links into the ROM but is unit-tested
-//! on the host.
+//! [`area`] / [`perimeter`] / [`regularity`] loop-quality metrics, which the
+//! [`shape`] module turns into an answer to **which shape was drawn**
+//! ([`shape::classify_loop`] for a closed stroke, [`shape::classify_open`] +
+//! [`shape::crosses_circle`] for a straight slash — the #29 vocabulary). The
+//! geometry is all fixed-point ([`bevy_nds_math`]) and FFI-free, so it links
+//! into the ROM but is unit-tested on the host.
 //!
 //! On top of that pure core sits a thin Bevy layer ([`LoopPlugin`]), mirroring
 //! [`bevy_nds_gesture`]: it gates the [`Touches`] stream into a [`StrokePath`]
@@ -32,6 +34,9 @@
 #![cfg_attr(not(test), no_std)]
 
 extern crate alloc;
+
+pub mod shape;
+pub use shape::*;
 
 use alloc::vec::Vec;
 
@@ -209,7 +214,7 @@ pub fn enclosed(poly: &[FxVec2], points: &[FxVec2]) -> Vec<usize> {
 /// segment, clamping the parameter to `[0, 1]` so it measures to the nearer
 /// endpoint when the foot of the perpendicular falls outside the span.
 /// Degenerate (`a == b`) segments reduce to the distance to `a`.
-fn dist_point_segment(p: FxVec2, a: FxVec2, b: FxVec2) -> Fx32 {
+pub fn dist_point_segment(p: FxVec2, a: FxVec2, b: FxVec2) -> Fx32 {
     let ab = b - a;
     let denom = ab.dot(ab);
     if denom == Fx32::ZERO {
@@ -306,8 +311,9 @@ pub fn perimeter(poly: &[FxVec2]) -> Fx32 {
 /// Loop "regularity" — the isoperimetric quotient `4π·A / P²`, in `[0, 1]`.
 ///
 /// `1.0` is a perfect circle; a square is ≈ `0.79`; a thin sliver or a jagged
-/// scribble trends toward `0`. This is the shape-quality hook for later scoring
-/// (#29) — "how clean was that capture loop." Returns `0` for a degenerate loop.
+/// scribble trends toward `0`. It is both the scribble gate and the quality
+/// numerator of [`shape::classify_loop`] (#29) — "how clean was that capture
+/// loop." Returns `0` for a degenerate loop.
 ///
 /// Computed as `((A / P) / P) · 4π` so the intermediates stay inside the 20.12
 /// range (a raw `P²` would overflow for a large loop).

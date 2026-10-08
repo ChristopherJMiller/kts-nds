@@ -61,10 +61,35 @@ fn run() -> Result<(), String> {
         out.ok_or("missing --out <dir>")?
     };
 
+    // `--check` runs the validator itself first, so *every* Issue is printed
+    // with its zone[#instance] scope and its severity — richer than the single
+    // joined string `build_levels_dir` folds Errors into. Only an Error exits
+    // non-zero; Warnings are reported and the bake still runs (into the temp
+    // dir), which also exercises derive + encode.
+    if check_only {
+        let issues = scene2bin::validate_levels_dir(&levels, &assets, &prefabs)?;
+        for i in &issues {
+            let kind = match i.severity {
+                scene2bin::Severity::Error => "error",
+                scene2bin::Severity::Warning => "warning",
+            };
+            eprintln!("scene2bin: {kind}: {}: {}", i.scope(), i.msg);
+        }
+        let errors = issues
+            .iter()
+            .filter(|i| i.severity == scene2bin::Severity::Error)
+            .count();
+        if errors > 0 {
+            return Err(format!("{}: {errors} error(s)", levels.display()));
+        }
+    }
+
     let built = scene2bin::build_levels_dir(&levels, &dst, &assets, &prefabs)?;
-    for b in &built {
-        for w in &b.warnings {
-            eprintln!("scene2bin: warning: {w}");
+    if !check_only {
+        for b in &built {
+            for w in &b.warnings {
+                eprintln!("scene2bin: warning: {w}");
+            }
         }
     }
 

@@ -25,3 +25,13 @@ path = "src/main.rs"
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 ron = "0.8"
+# The shared authored vocabulary (roles, role-scoped kinds, flag bits/ids),
+# re-exported as `scene2bin::schema` — the single access edge the detached
+# desktop editor reads it through, so the editor adds no dependency of its own.
+kts_schema = { path = "../kts_schema" }
+
+[dev-dependencies]
+# The true writer<->reader cross-check: `encode` here must round-trip through
+# the runtime parser, so a drift in either direction fails a test rather than a
+# ROM. Both crates already ride Justfile test group 2.
+bevy_nds_scene = { path = "../bevy_nds_scene" }

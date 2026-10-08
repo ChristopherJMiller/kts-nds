@@ -77,7 +77,18 @@ The `Justfile` is the entry point (`just --list` for everything):
 
 - `just build` / `just build-release` — compile the ARM9 ELF.
 - `just check` — `cargo check` (fast feedback; no ROM).
-- `just test [filter]` — host-side unit tests (see "Testing" below).
+- `just test [filter]` — host-side unit tests (see "Testing" below). **`filter`
+  is a test-*name* filter, not a package filter** — `just test my_crate` matches
+  nothing and reports green.
+- `just test-crate <crate> [filter]` — one crate's host tests with the group-2
+  flags. Use this for per-crate verification (see the caveat above).
+- `just check-editor` / `just test-editor` — type-check / test the detached
+  desktop level editor. A `scene2bin` API change breaks it *without* breaking
+  `just check`, so run both after touching the authoring format.
+- `just check-levels` — parse + validate + derive every level under
+  `assets/levels/` with a **non-zero exit** on any validation Error. `build.rs`
+  can only `cargo:warning=` and then falls back to stale blobs, so this is the
+  gate that actually fails.
 - `just fmt` — `cargo fmt`. `clippy` is installed but not wired to a task; run
   `cargo clippy` manually.
 - `just rom [profile]` — package the ELF into `kts.nds` with `ndstool`,
@@ -99,7 +110,8 @@ invocations split by dependency shape:
    `--target $host`.
 2. The platform subcrates (`bevy_nds_diagnostics`, `bevy_nds_time`,
    `bevy_nds_input`, `bevy_nds_gesture`, `bevy_nds_text`, `bevy_nds_bg`), `bevy_nds_3d_cull`,
-   `bevy_nds_math`, `bevy_nds_cothread`, `wav2bank`, `bevy_nds_audio` — pull in code compiled against `core`, so they
+   `bevy_nds_collide`, `bevy_nds_math`, `bevy_nds_cothread`, `wav2bank`, `bevy_nds_audio`,
+   `bevy_nds_scene`, `scene2bin`, `kts_schema` — pull in code compiled against `core`, so they
    need `std` from source (`unstable.build-std=["std","panic_unwind","proc_macro"]`)
    and `panic = "unwind"` to avoid a duplicate-`core` lang-item clash and match
    the test harness. The first run is slow (builds `std`); later runs are fast.
@@ -182,6 +194,28 @@ they don't need (e.g. drop `bevy_nds_text` for a sprite-only game).
 - **`crates/bevy_nds_3d_macros`** — `include_obj!` proc-macro that bakes a
   display list into the ARM9 binary at compile time.
 - **`crates/bevy_nds_3d_cull`** — pure, host-testable view-frustum math.
+- **`crates/bevy_nds_loop`** — pure capture-loop geometry (smoothing,
+  self-intersection closure, point-in-polygon enclosure, quality metrics) plus
+  the `LoopPlugin` touch-stream buffer. Its **`shape` module** is the stroke
+  classifier behind the #29 matrix: `classify_loop` (closed stroke → circle /
+  triangle / square + a 0..=1 quality, via a 24-point arc-length resample,
+  gap-centred turning-angle corner counting **and a `regularity` ceiling per
+  shape** — the corner count alone reads an ordinary lumpy hand loop at capture
+  scale as a triangle/square, so compactness is the cross-check and circle-class
+  is always the fallthrough), `classify_open` (open stroke →
+  straight slash) and `crosses_circle` (the through-cut test). Game-agnostic —
+  it knows nothing of enemy kinds — and all fixed-point, called once per closure
+  or pen-up, never per frame. The policy that consumes it is `src/capture.rs`.
+- **`crates/bevy_nds_collide`** — pure fixed-point **static blocking geometry**
+  (#12): yawed boxes, ramps and round columns, a `Body` (radius/height/step),
+  sub-stepped `resolve_move` push-out, `ground_height` support lookup and
+  `settle_height` step/land/fall. No Bevy, no FFI, no plugin — **not** in
+  `DsPlugins`; the game depends on it directly and the ECS glue (the `Colliders`
+  resource + `harvest`) lives in `src/collide.rs`. Vertical values are in the
+  **Height frame** (floor = 0); `harvest` is the single site that converts out
+  of the render frame by subtracting `GROUND_Y`. Avatar-only: enemies and
+  projectiles are not collided (cover is open on #26; `blocks_point` is the
+  shipped hook).
 - **`crates/obj2dl`** — host CLI + library, used by `build.rs` to bake
   `assets/*.obj` into `build/nitrofs/*.dl`.
 - **`crates/bevy_nds_audio`** — maxmod (ARM7) audio backend: declarative
@@ -205,24 +239,53 @@ they don't need (e.g. drop `bevy_nds_text` for a sprite-only game).
   `assets/backgrounds/bitmap/**/*.png` into `.bbg`. Emits
   `$OUT_DIR/backgrounds.rs` (constants module of NitroFS paths,
   `backgrounds::tiled::*` / `backgrounds::bitmap::*`).
+- **`crates/kts_schema`** — the **game-owned authored vocabulary** (not
+  `bevy_nds_*` on purpose): `Role` (avatar/enemy/landmark/block/prop, a *closed*
+  set), each role's `kinds()` (its sub-archetypes — `EnemyKind` =
+  basic/shielded/advanced/heavy, `BlockKind` = box/ramp/round), `Consumption`
+  (Gameplay vs Scenery — `Role::Block` was promoted to Gameplay by the collide
+  item, so `prop` is the only Scenery role left),
+  `CaptureShape` + `EnemyKind::required_shape()` (**the #29 shape-vulnerability
+  matrix, declared once** — Basic→Circle, Shielded→Line, Advanced→Triangle,
+  Heavy→Square, guarded by a bijection test) + `accepts(required, drawn)` (exact
+  match, no hierarchy; the single site a hierarchy or overcharge would change)
+  — both **Locked on #29** (recorded 2026-10-07),
+  the instance-`flag_bits` (`OBJECTIVE`/`LEVEL_OBJECTIVE`, **frozen**) and the
+  reserved runtime `flag_ids` (`LEVEL_EXIT`, `RESERVED_MIN`). `no_std`, **zero
+  dependencies**, fully host-tested. Shared by `kts`, by `scene2bin` (which
+  validates against it and re-exports it as `scene2bin::schema`) and — through
+  that re-export — by the detached editor, so all three agree by construction.
+  Deliberately **not** in `bevy_nds_scene`, which keeps `role` an opaque string
+  and `kind` an opaque byte. `src/flags.rs` is now just re-exports of the bits
+  and ids. Two rules hold the milestone together: `Role::kinds()` is the **one**
+  sub-archetype channel (extend at the end — the index is the wire byte) and
+  **no new instance-flag bits**.
 - **`crates/bevy_nds_scene`** — *game-agnostic* space/scene loader (issue #27).
-  Loads a baked `.scene` blob from NitroFS and spawns each authored instance as
-  a rendered entity (mesh + `Transform3d` + `DsMaterial`) tagged with a
-  `SceneInstance { role }` — an **opaque** role string the game maps onto its
-  own components. Also exposes a `LoadedScene` resource (camera mode, exits) and
-  a `LoadSpace` event. No new FFI: it composes `bevy_nds_nitrofs` (bytes) +
-  `bevy_nds_3d` (meshes). Pure `asset::parse` host-tested. Depended on directly
-  (not in `DsPlugins`).
+  Loads a baked `.scene` blob (**v4**) from NitroFS and spawns each authored
+  instance as a rendered entity (mesh + `Transform3d` + `DsMaterial`) tagged with
+  a `SceneInstance { role, flags, kind }` — an **opaque** role string plus an
+  equally opaque `kind` byte (v4, one per instance after `flags`) that the game
+  maps onto its own components. Also exposes a `LoadedScene` resource (camera
+  mode, exits) and a `LoadSpace` event. No new FFI: it composes
+  `bevy_nds_nitrofs` (bytes) + `bevy_nds_3d` (meshes). Pure `asset::parse`
+  host-tested. Depended on directly (not in `DsPlugins`).
 - **`crates/scene2bin`** — host CLI + library: bakes a **level** directory
   (`assets/levels/<name>/` = a `level.ron` manifest of the zone-graph layout +
   one `<zone>.ron` content file per zone) into `build/nitrofs/levels/<name>/
   *.scene` (+ a nested `levels.rs` constants module the game `include!`s, e.g.
   `levels::facility::ATRIUM`). Resolves reusable **prefabs** (`assets/prefabs/
   *.ron`, instance templates) into flat instances host-side at bake — the
-  `.scene` blob never learns what a prefab is. Parse + validate (referenced
-  meshes/prefabs) + derive connections from zone abutment + encode; the
-  authoritative writer for the `.scene` format (`bevy_nds_scene` is the reader —
-  keep the two in sync). Also `to_{level,zone,prefab}_ron` for the editor. RON is
+  `.scene` blob never learns what a prefab is. Parse + `validate_all` + derive
+  connections from zone abutment + encode; the authoritative writer for the
+  `.scene` format (`bevy_nds_scene` is the reader — keep the two in sync;
+  `encode_round_trips_through_bevy_nds_scene_parse` is the test that holds them
+  together). **`validate_all(level, zones, mesh_exists) -> Vec<Issue>` is the one
+  validator** — non-short-circuiting, instance/zone/level-scoped
+  (`Severity::Error` fails the bake, `Warning` doesn't), shared by `build.rs`,
+  `scene2bin --check` / `just check-levels`, and the editor's problems panel +
+  save gate. Later work appends rules there rather than adding a second
+  validator. `Instance`/`Prefab` carry `kind: Option<String>`, resolved to the
+  `.scene` v4 `u8` at bake. Also `to_{level,zone,prefab}_ron` for the editor. RON is
   **host-only**; it never reaches the DS. *A level is the authoring/distribution
   unit; a zone is the runtime streaming unit — only the current zone is
   resident.*
@@ -238,6 +301,19 @@ they don't need (e.g. drop `bevy_nds_text` for a sprite-only game).
   is for fast spatial layout.
 - **`kts`** (root, `src/main.rs`) — *Kill the Serpent*, the game. A *pure-Bevy
   consumer*: only components and systems, **no FFI / allocator / panic handler**.
+  `src/spawn.rs` holds the **single** authored-instance → components dispatch
+  (`attach` + `skip_spawn`, over an `Authored` view and an explicit `Residency`),
+  shared by the active zone (`specialize_scene`) and resident neighbours
+  (`spawn_neighbour`). Its `match Role` is exhaustive with **no `_` arm** on
+  purpose: a new role must fail to compile there rather than become silent
+  scenery. `src/collide.rs` is the one place an authored instance becomes a
+  `bevy_nds_collide::Collider` — solid roles (`landmark`, `block`) are harvested
+  at **both** residencies, so geometry is solid across a zone seam.
+  `src/capture.rs` holds the shape-matrix **policy** (geometry lives in
+  `bevy_nds_loop::shape`, the table in `kts_schema`), and its
+  `update_enemy_tell` is the **single writer** of an enemy's map blip via the
+  per-enemy `Tell` component — later feedback (items' afflictions) extends
+  `Tell` and that system's precedence instead of adding a second writer.
 
 New game logic belongs in the root crate; new hardware capability gets its own
 crate (see "Adding a capability" below).
@@ -287,6 +363,8 @@ starting in its own crate.
 | Real-time clock          | `WallClock` resource (year/month/day + h/m/s + unix_secs) | `bevy_nds_rtc::RtcPlugin`                     |
 | Writable FAT/SD storage  | `SaveStorage` resource (blocking + async slot I/O) + `StorageStatus` | `bevy_nds_save::SavePlugin`              |
 | 2D background layers (BG) | `Backgrounds` resource (`set_tile` / `set_bitmap` / `set_tile_scroll`) | `bevy_nds_bg::BackgroundPlugin` |
+| Static blocking geometry | `Colliders` resource + `Collider` (box/ramp/round, avatar-only) | `bevy_nds_collide` (pure; depended on directly) |
+| Stylus stroke → shape    | `classify_loop` (circle/triangle/square + quality), `classify_open` (line), `crosses_circle` (through-cut) | `bevy_nds_loop::shape` (pure; depended on directly) |
 
 `DsPlugins` (in `bevy_nds`) bundles the platform-layer plugins;
 `bevy_nds::run(app)` (re-export from `bevy_nds_runtime`) installs the runner

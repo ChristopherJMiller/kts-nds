@@ -1,0 +1,14 @@
+[package]
+name = "kts_schema"
+version = "0.1.0"
+edition = "2024"
+description = "Kill the Serpent's authored vocabulary — roles, role-scoped kinds, instance-flag bits, reserved flag ids — shared by kts, scene2bin and (via scene2bin) the editor. Game-owned, so deliberately not bevy_nds_*."
+
+# Zero dependencies on purpose: the vocabulary is plain `const` data + pure
+# functions, so it drops into the `no_std` ARM9 game, the host baker, and the
+# desktop editor unchanged. RON keeps plain strings; conversion happens at the
+# `scene2bin` boundary, so no serde here either.
+
+[lib]
+
+[dependencies]

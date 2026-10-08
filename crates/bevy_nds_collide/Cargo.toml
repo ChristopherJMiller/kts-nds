@@ -1,0 +1,21 @@
+[package]
+name = "bevy_nds_collide"
+version = "0.1.0"
+edition = "2024"
+description = "Pure fixed-point static-blocking geometry (yawed boxes, ramps, round columns) for avatar locomotion; no_std, host-testable."
+
+# Dependency-light and `no_std` so it links into the DS ROM, yet its pure math
+# (no FFI/MMIO, no Bevy) runs under the normal host test harness — the DS-target
+# crates can't. Sibling of `bevy_nds_3d_cull`: that one answers "is this mesh
+# on screen?", this one answers "can the avatar be here, and how high is the
+# ground under it?". Neither knows what an entity is.
+
+[dependencies]
+# 20.12 fixed-point for the per-frame locomotion hot path (the ARM946E-S has no
+# FPU). Every public entry point is `Fx32`/`FxVec2`. Candidate rejection, the
+# footprint tests and every surface lookup are compares and raw-i64 squared
+# distances; the hot path reaches for the hardware sqrt only on an actual
+# overlap (the push-out's `normalize_or_zero`) and on a move longer than the
+# body radius (one `length` to count sub-steps). Footprint circumradii are one
+# sqrt each at zone load.
+bevy_nds_math = { path = "../bevy_nds_math" }

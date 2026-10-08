@@ -11,6 +11,11 @@ Zone(instances: [
     // this zone, it contributes to the *level* objective that opens the level exit
     // (#27 tier 2). path[0] == spawn.
     Use(name: "patroller", pos: (1.6, 0.0, 0.0), flags: Some(2), path: [(1.6, 0.0), (0.4, 0.0)]),
+    // The SQUARE-vulnerable heavy (#29 matrix), FREEFORM (no `flags`) so the
+    // level-exit condition is unchanged. Drawing a square under the Rail2.5D
+    // side-on framing is the tightest test in the matrix — the slowest gesture
+    // on the screen with the least room to back away.
+    Use(name: "heavy", pos: (-1.2, 0.0, 0.25), path: [(-1.2, 0.25), (-0.2, 0.25)]),
     // Walls / props lining the rail.
     Use(name: "landmark_block", pos: (-0.8, 0.0, -0.5)),
     Use(name: "landmark_block", pos: (0.6, 0.0, -0.5), rot: Some((0.0, 0.3, 0.0))),
