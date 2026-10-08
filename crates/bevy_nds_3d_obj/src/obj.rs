@@ -32,7 +32,8 @@ pub fn parse_obj(
 
     for (lineno, line) in source.lines().enumerate() {
         let at = |msg: &str| format!("line {}: {msg}", lineno + 1);
-        let mut it = line.trim().split_whitespace();
+        let trimmed = line.trim();
+        let mut it = trimmed.split_whitespace();
         match it.next() {
             Some("v") => positions.push(parse_vec3(&mut it).ok_or_else(|| at("malformed vertex"))?),
             Some("vn") => normals.push(parse_vec3(&mut it).ok_or_else(|| at("malformed normal"))?),
@@ -45,13 +46,18 @@ pub fn parse_obj(
                 uvs.push([u, 1.0 - v]); // OBJ is bottom-left; the IR is top-left
             }
             Some("mtllib") if opts.materials => {
-                for name in it {
+                // The rest of the line is ONE file name, trimmed (Blender
+                // writes a single mtllib, and names may contain spaces) —
+                // not one name per whitespace-split token.
+                let name = trimmed.strip_prefix("mtllib").unwrap().trim();
+                if !name.is_empty() {
                     let text = load_mtl(name).map_err(|e| at(&e))?;
                     library.extend(parse_mtl(&text).map_err(|e| at(&format!("{name}: {e}")))?);
                 }
             }
             Some("usemtl") if opts.materials => {
-                let name = it.next().unwrap_or("");
+                // Rest of the line, trimmed: a material name may contain spaces.
+                let name = trimmed.strip_prefix("usemtl").unwrap().trim();
                 current = Some(submesh_index(&mut subs, name, &library).map_err(|e| at(&e))?);
             }
             Some("f") => {
@@ -136,18 +142,23 @@ fn submesh_index(
     Ok(subs.len() - 1)
 }
 
-/// Parse the MTL subset the pipeline uses: `newmtl`, `Kd`, `map_Kd`. `map_Kd`'s
-/// **last** token is the path (options such as `-s 1 1 1` come first), so
-/// texture paths can't contain spaces. `Ka` is deliberately ignored — see
+/// Parse the MTL subset the pipeline uses: `newmtl`, `Kd`, `map_Kd`.
+/// `newmtl`'s name is the rest of the line, trimmed, so it may contain
+/// spaces. `map_Kd`'s path is likewise the rest of the line, trimmed —
+/// *unless* the line also carries option tokens (any token starting with
+/// `-`, e.g. `-s 1 1 1`), in which case the **last** token is the path
+/// instead (matching how options precede the path), so a path combined with
+/// options still can't contain spaces. `Ka` is deliberately ignored — see
 /// [`Material`].
 pub fn parse_mtl(source: &str) -> Result<Vec<Material>, String> {
     let mut out: Vec<Material> = Vec::new();
     for (lineno, line) in source.lines().enumerate() {
-        let mut it = line.trim().split_whitespace();
+        let trimmed = line.trim();
+        let mut it = trimmed.split_whitespace();
         let key = it.next();
         if key == Some("newmtl") {
             out.push(Material {
-                name: it.next().unwrap_or("").to_string(),
+                name: trimmed.strip_prefix("newmtl").unwrap().trim().to_string(),
                 ..Material::default()
             });
             continue;
@@ -160,9 +171,16 @@ pub fn parse_mtl(source: &str) -> Result<Vec<Material>, String> {
                     .ok_or_else(|| format!("line {}: malformed Kd", lineno + 1))?;
             }
             Some("map_Kd") => {
-                let path = it
-                    .last()
-                    .ok_or_else(|| format!("line {}: map_Kd has no path", lineno + 1))?;
+                let rest = trimmed.strip_prefix("map_Kd").unwrap().trim();
+                let has_options = rest.split_whitespace().any(|t| t.starts_with('-'));
+                let path = if has_options {
+                    it.last()
+                } else if rest.is_empty() {
+                    None
+                } else {
+                    Some(rest)
+                }
+                .ok_or_else(|| format!("line {}: map_Kd has no path", lineno + 1))?;
                 m.texture = Some(TextureSrc::File(path.to_string()));
             }
             _ => {}
@@ -260,6 +278,41 @@ mod tests {
             }
         );
         assert_eq!(mats[1].texture, None);
+    }
+
+    #[test]
+    fn mtllib_name_may_contain_spaces() {
+        let src = "mtllib Wooden Crate.mtl\nv 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n";
+        let mut seen = None;
+        parse_obj(src, ObjOptions { materials: true }, |name| {
+            seen = Some(name.to_string());
+            Ok(String::new())
+        })
+        .unwrap();
+        assert_eq!(seen, Some("Wooden Crate.mtl".to_string()));
+    }
+
+    #[test]
+    fn map_kd_without_options_takes_rest_of_line() {
+        let mtl = "newmtl skin\nmap_Kd tex/Wooden Crate.png\n";
+        let mats = parse_mtl(mtl).unwrap();
+        assert_eq!(
+            mats[0].texture,
+            Some(TextureSrc::File("tex/Wooden Crate.png".into()))
+        );
+    }
+
+    #[test]
+    fn newmtl_and_usemtl_with_spaced_names_group_correctly() {
+        let src = "mtllib m.mtl\n\
+            v 0 0 0\nv 1 0 0\nv 0 1 0\n\
+            usemtl Wood Crate\nf 1 2 3\n\
+            usemtl Wood Crate\nf 1 2 3\n";
+        let mtl = "newmtl Wood Crate\nKd 1 0.5 0\n";
+        let m = parse_obj(src, ObjOptions { materials: true }, |_| Ok(mtl.to_string())).unwrap();
+        assert_eq!(m.submeshes.len(), 1);
+        assert_eq!(m.submeshes[0].material.name, "Wood Crate");
+        assert_eq!(m.submeshes[0].tris.len(), 2);
     }
 
     #[test]

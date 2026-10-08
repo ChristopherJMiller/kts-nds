@@ -44,7 +44,8 @@ impl Default for Wrap {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TextureSrc {
     /// A path as written in the source (MTL `map_Kd`, glTF image `uri`),
-    /// relative to the directory of the file that named it.
+    /// relative to the **model file's** directory (an MTL is expected
+    /// beside its OBJ), not to the file that happened to name it.
     File(String),
     /// Index into [`SourceModel::images`] (an image embedded in a `.glb`).
     Embedded(usize),
