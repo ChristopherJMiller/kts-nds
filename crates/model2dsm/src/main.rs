@@ -6,12 +6,19 @@ fn main() {
         eprintln!("usage: model2dsm <models-dir> <out-dir>");
         std::process::exit(2);
     }
-    match model2dsm::build_dir(std::path::Path::new(&args[1]), std::path::Path::new(&args[2])) {
+    match model2dsm::build_dir(
+        std::path::Path::new(&args[1]),
+        std::path::Path::new(&args[2]),
+    ) {
         Ok(built) => {
             for w in &built.warnings {
                 eprintln!("warning: {w}");
             }
-            println!("baked {} model(s), {} texture(s)", built.models.len(), built.textures.len());
+            println!(
+                "baked {} model(s), {} texture(s)",
+                built.models.len(),
+                built.textures.len()
+            );
         }
         Err(e) => {
             eprintln!("error: {e}");

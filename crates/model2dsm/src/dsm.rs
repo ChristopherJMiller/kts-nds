@@ -25,7 +25,10 @@ pub fn ambient(diffuse: [u8; 3]) -> [u8; 3] {
 
 /// `TEXIMAGE_PARAM`-ordered wrap bits: 0 repeat S, 1 repeat T, 2 flip S, 3 flip T.
 pub fn wrap_bits(w: Wrap) -> u8 {
-    (w.repeat_s as u8) | ((w.repeat_t as u8) << 1) | ((w.flip_s as u8) << 2) | ((w.flip_t as u8) << 3)
+    (w.repeat_s as u8)
+        | ((w.repeat_t as u8) << 1)
+        | ((w.flip_s as u8) << 2)
+        | ((w.flip_t as u8) << 3)
 }
 
 /// Serialise a model to the runtime `.dsm` format. `table` lists the model's
@@ -42,7 +45,11 @@ pub fn wrap_bits(w: Wrap) -> u8 {
 /// | 30 | `u16` | sub-mesh count S |
 /// | 32 | T × | `u16` path length incl. NUL, `u16` 0, path bytes + NUL, zero-pad to 4 |
 /// | … | S × | `u16` texture index ([`NO_TEXTURE`] = none), `u8` [`wrap_bits`], `u8` 0, `u8` × 3 diffuse, `u8` × 3 ambient, `u8` × 2 0, `u32` word count N, `u32` × N display list (leading body-length word included) |
-pub fn encode(model: &SourceModel, table: &[TexRef], sub_tex: &[Option<usize>]) -> Result<Vec<u8>, String> {
+pub fn encode(
+    model: &SourceModel,
+    table: &[TexRef],
+    sub_tex: &[Option<usize>],
+) -> Result<Vec<u8>, String> {
     if sub_tex.len() != model.submeshes.len() {
         return Err("internal: one texture slot per sub-mesh expected".into());
     }
@@ -79,7 +86,8 @@ pub fn encode(model: &SourceModel, table: &[TexRef], sub_tex: &[Option<usize>]) 
             }
             None => None,
         };
-        let words = submesh_display_list(&s.tris, size).map_err(|e| format!("material `{}`: {e}", s.material.name))?;
+        let words = submesh_display_list(&s.tris, size)
+            .map_err(|e| format!("material `{}`: {e}", s.material.name))?;
         out.extend_from_slice(&tex.map_or(NO_TEXTURE, |i| i as u16).to_le_bytes());
         out.push(wrap_bits(s.material.wrap));
         out.push(0);
@@ -100,18 +108,33 @@ mod tests {
     use bevy_nds_3d_obj::ir::{Material, SubMesh, Vertex};
 
     fn tri(uv: bool) -> [Vertex; 3] {
-        let v = |p: [f32; 3], t: [f32; 2]| Vertex { pos: p, normal: [0.0, 0.0, 1.0], uv: uv.then_some(t) };
-        [v([0.0, 0.0, 0.0], [0.0, 0.0]), v([1.0, 0.0, 0.0], [1.0, 0.0]), v([0.0, 1.0, 0.0], [0.0, 1.0])]
+        let v = |p: [f32; 3], t: [f32; 2]| Vertex {
+            pos: p,
+            normal: [0.0, 0.0, 1.0],
+            uv: uv.then_some(t),
+        };
+        [
+            v([0.0, 0.0, 0.0], [0.0, 0.0]),
+            v([1.0, 0.0, 0.0], [1.0, 0.0]),
+            v([0.0, 1.0, 0.0], [0.0, 1.0]),
+        ]
     }
 
     fn model() -> SourceModel {
         SourceModel {
             submeshes: vec![
                 SubMesh {
-                    material: Material { name: "skin".into(), diffuse: [200, 100, 40], ..Material::default() },
+                    material: Material {
+                        name: "skin".into(),
+                        diffuse: [200, 100, 40],
+                        ..Material::default()
+                    },
                     tris: vec![tri(true)],
                 },
-                SubMesh { material: Material::default(), tris: vec![tri(false)] },
+                SubMesh {
+                    material: Material::default(),
+                    tris: vec![tri(false)],
+                },
             ],
             images: Vec::new(),
         }
@@ -126,7 +149,11 @@ mod tests {
 
     #[test]
     fn container_layout() {
-        let table = [TexRef { nitro_path: "nitro:/models/a.tex", width: 8, height: 8 }];
+        let table = [TexRef {
+            nitro_path: "nitro:/models/a.tex",
+            width: 8,
+            height: 8,
+        }];
         let b = encode(&model(), &table, &[Some(0), None]).unwrap();
         assert_eq!(&b[0..4], b"DSM1");
         assert_eq!(f32::from_le_bytes([b[16], b[17], b[18], b[19]]), 1.0); // aabb max.x
@@ -140,7 +167,8 @@ mod tests {
         assert_eq!(b[58], 0b0011); // default wrap: repeat S + T
         assert_eq!(&b[60..63], &[200, 100, 40]); // diffuse
         assert_eq!(&b[63..66], &[50, 25, 10]); // ambient = diffuse / 4
-        let words = bevy_nds_3d_obj::submesh_display_list(&model().submeshes[0].tris, Some([8, 8])).unwrap();
+        let words = bevy_nds_3d_obj::submesh_display_list(&model().submeshes[0].tris, Some([8, 8]))
+            .unwrap();
         assert_eq!(u32_at(&b, 68), words.len() as u32);
         let second = 72 + words.len() * 4;
         assert_eq!(u16_at(&b, second), NO_TEXTURE);
@@ -148,7 +176,11 @@ mod tests {
 
     #[test]
     fn textured_submesh_without_uvs_is_an_error() {
-        let table = [TexRef { nitro_path: "nitro:/models/a.tex", width: 8, height: 8 }];
+        let table = [TexRef {
+            nitro_path: "nitro:/models/a.tex",
+            width: 8,
+            height: 8,
+        }];
         let err = encode(&model(), &table, &[Some(0), Some(0)]).unwrap_err();
         assert!(err.contains("no UV"), "{err}");
     }

@@ -648,7 +648,11 @@ pub fn validate_all(
 
 /// [`validate_all`] plus the rules that need to know what meshes *contain* — the
 /// per-level texture budget (#66). The bake and `--check` use this.
-pub fn validate_all_with_catalog(level: &Level, zones: &[(String, Space)], catalog: &Catalog) -> Vec<Issue> {
+pub fn validate_all_with_catalog(
+    level: &Level,
+    zones: &[(String, Space)],
+    catalog: &Catalog,
+) -> Vec<Issue> {
     validate_with(level, zones, catalog)
 }
 
@@ -694,12 +698,7 @@ impl MeshLookup for Catalog {
 /// Instance- and zone-scoped rules for a single zone. Private so [`validate_all`]
 /// stays the only entry point that sees a whole level; [`validate`] wraps it for
 /// the first-error, single-zone callers.
-fn validate_zone(
-    stem: &str,
-    space: &Space,
-    meshes: &impl MeshLookup,
-    out: &mut Vec<Issue>,
-) {
+fn validate_zone(stem: &str, space: &Space, meshes: &impl MeshLookup, out: &mut Vec<Issue>) {
     // Per-role tally of Scenery-consumption instances, aggregated into one
     // Warning at the end (never per instance — a gray-boxed zone would drown the
     // panel in noise). Since the collide item promoted `block` to Gameplay
@@ -1012,7 +1011,11 @@ fn validate_textures(zones: &[(String, Space)], meshes: &impl MeshLookup, out: &
     if texels > model2dsm::TEXTURE_VRAM_BYTES {
         let mut largest: Vec<&TexUse> = seen.values().copied().collect();
         largest.sort_by(|a, b| b.texel_bytes.cmp(&a.texel_bytes).then(a.key.cmp(&b.key)));
-        let top: Vec<String> = largest.iter().take(3).map(|t| format!("{} ({})", t.key, kb(t.texel_bytes))).collect();
+        let top: Vec<String> = largest
+            .iter()
+            .take(3)
+            .map(|t| format!("{} ({})", t.key, kb(t.texel_bytes)))
+            .collect();
         out.push(Issue {
             zone: None,
             instance: None,
@@ -2457,7 +2460,10 @@ mod tests {
                 .map(|(n, t)| {
                     (
                         n.to_string(),
-                        MeshEntry { source: std::path::PathBuf::from(format!("{n}.obj")), textures: t.clone() },
+                        MeshEntry {
+                            source: std::path::PathBuf::from(format!("{n}.obj")),
+                            textures: t.clone(),
+                        },
                     )
                 })
                 .collect(),
@@ -2465,30 +2471,47 @@ mod tests {
     }
 
     fn tex(key: &str, kb: u32) -> TexUse {
-        TexUse { key: key.to_string(), texel_bytes: kb * 1024, palette_bytes: 32 }
+        TexUse {
+            key: key.to_string(),
+            texel_bytes: kb * 1024,
+            palette_bytes: 32,
+        }
     }
 
     fn texture_errors(issues: &[Issue]) -> Vec<&Issue> {
         issues
             .iter()
-            .filter(|i| i.severity == Severity::Error && (i.msg.contains("texture") || i.msg.contains("palette")))
+            .filter(|i| {
+                i.severity == Severity::Error
+                    && (i.msg.contains("texture") || i.msg.contains("palette"))
+            })
             .collect()
     }
 
     #[test]
     fn texture_budget_counts_shared_textures_once() {
-        let cat = catalog(&[("a", vec![tex("shared.png", 200)]), ("b", vec![tex("shared.png", 200)])]);
-        let (level, zones) =
-            one_zone_level("atrium", with_instances(std::vec![inst("avatar"), prop("a"), prop("b")]));
+        let cat = catalog(&[
+            ("a", vec![tex("shared.png", 200)]),
+            ("b", vec![tex("shared.png", 200)]),
+        ]);
+        let (level, zones) = one_zone_level(
+            "atrium",
+            with_instances(std::vec![inst("avatar"), prop("a"), prop("b")]),
+        );
         let issues = validate_all_with_catalog(&level, &zones, &cat);
         assert!(texture_errors(&issues).is_empty(), "{issues:#?}");
     }
 
     #[test]
     fn texture_budget_over_256_kb_is_a_level_error() {
-        let cat = catalog(&[("a", vec![tex("a.png", 200)]), ("b", vec![tex("b.png", 100)])]);
-        let (level, zones) =
-            one_zone_level("atrium", with_instances(std::vec![inst("avatar"), prop("a"), prop("b")]));
+        let cat = catalog(&[
+            ("a", vec![tex("a.png", 200)]),
+            ("b", vec![tex("b.png", 100)]),
+        ]);
+        let (level, zones) = one_zone_level(
+            "atrium",
+            with_instances(std::vec![inst("avatar"), prop("a"), prop("b")]),
+        );
         let issues = validate_all_with_catalog(&level, &zones, &cat);
         let errs = texture_errors(&issues);
         assert_eq!(errs.len(), 1, "{issues:#?}");
@@ -2503,11 +2526,18 @@ mod tests {
             .map(|i| {
                 (
                     format!("m{i}"),
-                    vec![TexUse { key: format!("t{i}.png"), texel_bytes: 64, palette_bytes: 512 }],
+                    vec![TexUse {
+                        key: format!("t{i}.png"),
+                        texel_bytes: 64,
+                        palette_bytes: 512,
+                    }],
                 )
             })
             .collect();
-        let refs: Vec<(&str, Vec<TexUse>)> = entries.iter().map(|(n, t)| (n.as_str(), t.clone())).collect();
+        let refs: Vec<(&str, Vec<TexUse>)> = entries
+            .iter()
+            .map(|(n, t)| (n.as_str(), t.clone()))
+            .collect();
         let cat = catalog(&refs);
         let mut instances = std::vec![inst("avatar")];
         instances.extend(entries.iter().map(|(n, _)| prop(n)));
@@ -2521,9 +2551,15 @@ mod tests {
     #[test]
     fn catalog_validation_reports_unknown_meshes() {
         let cat = catalog(&[]);
-        let (level, zones) = one_zone_level("atrium", with_instances(std::vec![inst("avatar"), prop("ghost")]));
+        let (level, zones) = one_zone_level(
+            "atrium",
+            with_instances(std::vec![inst("avatar"), prop("ghost")]),
+        );
         let issues = validate_all_with_catalog(&level, &zones, &cat);
-        assert!(errors(&issues).iter().any(|i| i.msg.contains("ghost.obj")), "{issues:#?}");
+        assert!(
+            errors(&issues).iter().any(|i| i.msg.contains("ghost.obj")),
+            "{issues:#?}"
+        );
     }
 
     #[test]

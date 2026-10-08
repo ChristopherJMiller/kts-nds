@@ -5,7 +5,9 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::{MODELS_SUBDIR, load_model, mesh_name, model_names, resolve_textures, texture, walk_models};
+use crate::{
+    MODELS_SUBDIR, load_model, mesh_name, model_names, resolve_textures, texture, walk_models,
+};
 
 /// One texture's VRAM cost, keyed so an image shared by two models counts once.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -47,7 +49,13 @@ impl Catalog {
     pub fn scan(assets_dir: &Path) -> Result<Catalog, String> {
         let mut meshes: BTreeMap<String, MeshEntry> = BTreeMap::new();
         for (name, source) in legacy_objs(assets_dir) {
-            meshes.insert(name, MeshEntry { source, textures: Vec::new() });
+            meshes.insert(
+                name,
+                MeshEntry {
+                    source,
+                    textures: Vec::new(),
+                },
+            );
         }
 
         let root = assets_dir.join(MODELS_SUBDIR);
@@ -63,7 +71,8 @@ impl Catalog {
             }
             let model = load_model(&source)?;
             let mut textures: Vec<TexUse> = Vec::new();
-            let resolved = resolve_textures(&root, &rel, &model).map_err(|e| format!("{}: {e}", source.display()))?;
+            let resolved = resolve_textures(&root, &rel, &model)
+                .map_err(|e| format!("{}: {e}", source.display()))?;
             for r in resolved.into_iter().flatten() {
                 if textures.iter().any(|t| t.key == r.key) {
                     continue;
@@ -71,13 +80,18 @@ impl Catalog {
                 let (texel_bytes, palette_bytes) = match sizes.get(&r.key) {
                     Some(&s) => s,
                     None => {
-                        let t = texture::encode_png(&r.png).map_err(|e| format!("{}: {e}", r.source.display()))?;
+                        let t = texture::encode_png(&r.png)
+                            .map_err(|e| format!("{}: {e}", r.source.display()))?;
                         let s = (t.texel_bytes(), t.palette_bytes());
                         sizes.insert(r.key.clone(), s);
                         s
                     }
                 };
-                textures.push(TexUse { key: r.key, texel_bytes, palette_bytes });
+                textures.push(TexUse {
+                    key: r.key,
+                    texel_bytes,
+                    palette_bytes,
+                });
             }
             meshes.insert(name, MeshEntry { source, textures });
         }
@@ -90,7 +104,10 @@ impl Catalog {
 
     /// The textures mesh `name` uses (empty when untextured or unknown).
     pub fn textures(&self, name: &str) -> &[TexUse] {
-        self.meshes.get(name).map(|m| m.textures.as_slice()).unwrap_or(&[])
+        self.meshes
+            .get(name)
+            .map(|m| m.textures.as_slice())
+            .unwrap_or(&[])
     }
 }
 
@@ -99,7 +116,10 @@ impl Catalog {
 /// directories and duplicates are skipped here; [`Catalog::scan`] (the bake)
 /// reports them.
 pub fn mesh_names(assets_dir: &Path) -> Vec<String> {
-    let mut out: Vec<String> = legacy_objs(assets_dir).into_iter().map(|(n, _)| n).collect();
+    let mut out: Vec<String> = legacy_objs(assets_dir)
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
     if let Ok(rels) = walk_models(&assets_dir.join(MODELS_SUBDIR)) {
         out.extend(rels.iter().map(|r| mesh_name(r)));
     }
@@ -120,7 +140,15 @@ mod tests {
     }
 
     fn png_8x8_two_colours() -> Vec<u8> {
-        let rgba: Vec<u8> = (0..64).flat_map(|i| if i % 2 == 0 { [255, 0, 0, 255] } else { [0, 0, 255, 255] }).collect();
+        let rgba: Vec<u8> = (0..64)
+            .flat_map(|i| {
+                if i % 2 == 0 {
+                    [255, 0, 0, 255]
+                } else {
+                    [0, 0, 255, 255]
+                }
+            })
+            .collect();
         let mut out = Vec::new();
         {
             let mut enc = png::Encoder::new(&mut out, 8, 8);
@@ -155,9 +183,16 @@ mod tests {
         assert!(cat.textures("cube").is_empty());
         assert_eq!(
             cat.textures("props/crate"),
-            &[TexUse { key: "props/crate.png".into(), texel_bytes: 16, palette_bytes: 16 }]
+            &[TexUse {
+                key: "props/crate.png".into(),
+                texel_bytes: 16,
+                palette_bytes: 16
+            }]
         );
-        assert_eq!(mesh_names(&assets), vec!["cube".to_string(), "props/crate".to_string()]);
+        assert_eq!(
+            mesh_names(&assets),
+            vec!["cube".to_string(), "props/crate".to_string()]
+        );
     }
 
     #[test]
@@ -167,7 +202,10 @@ mod tests {
         std::fs::create_dir_all(assets.join("models")).unwrap();
         std::fs::write(assets.join("models/crate.glb"), b"not read").unwrap();
         let err = Catalog::scan(&assets).unwrap_err();
-        assert!(err.contains("crate.obj") && err.contains("crate.glb"), "{err}");
+        assert!(
+            err.contains("crate.obj") && err.contains("crate.glb"),
+            "{err}"
+        );
     }
 
     #[test]

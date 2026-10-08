@@ -39,7 +39,8 @@ pub fn load_model(path: &Path) -> Result<SourceModel, String> {
             let src = std::fs::read_to_string(path).map_err(|e| ctx(e.to_string()))?;
             let dir = path.parent().unwrap_or(Path::new("."));
             parse_obj(&src, ObjOptions { materials: true }, |name| {
-                std::fs::read_to_string(dir.join(name)).map_err(|e| format!("could not read mtllib {name}: {e}"))
+                std::fs::read_to_string(dir.join(name))
+                    .map_err(|e| format!("could not read mtllib {name}: {e}"))
             })
             .map_err(ctx)
         }
@@ -52,13 +53,22 @@ pub fn load_model(path: &Path) -> Result<SourceModel, String> {
 /// missing `root` is simply empty.
 pub fn walk_models(root: &Path) -> Result<Vec<PathBuf>, String> {
     fn walk(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
-        let entries = std::fs::read_dir(dir).map_err(|e| format!("could not read {}: {e}", dir.display()))?;
+        let entries =
+            std::fs::read_dir(dir).map_err(|e| format!("could not read {}: {e}", dir.display()))?;
         for entry in entries {
             let path = entry.map_err(|e| format!("{}: {e}", dir.display()))?.path();
             if path.is_dir() {
                 walk(root, &path, out)?;
-            } else if path.extension().and_then(|e| e.to_str()).is_some_and(|e| MODEL_EXTS.contains(&e)) {
-                out.push(path.strip_prefix(root).map_err(|e| e.to_string())?.to_path_buf());
+            } else if path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| MODEL_EXTS.contains(&e))
+            {
+                out.push(
+                    path.strip_prefix(root)
+                        .map_err(|e| e.to_string())?
+                        .to_path_buf(),
+                );
             }
         }
         Ok(())
@@ -94,7 +104,11 @@ pub fn model_names(root: &Path) -> Result<Vec<(String, PathBuf)>, String> {
     for rel in walk_models(root)? {
         let name = mesh_name(&rel);
         if let Some(prev) = seen.get(&name) {
-            return Err(format!("mesh name `{name}` is defined twice: {} and {}", slash(prev), slash(&rel)));
+            return Err(format!(
+                "mesh name `{name}` is defined twice: {} and {}",
+                slash(prev),
+                slash(&rel)
+            ));
         }
         seen.insert(name, rel);
     }
@@ -114,7 +128,11 @@ pub struct ResolvedTexture {
 /// Resolve each sub-mesh's texture for model `rel` under `root` (one entry per
 /// sub-mesh, `None` when untextured). File textures are keyed by their path
 /// relative to `root`; embedded ones by `"<model rel path>#<image index>"`.
-pub fn resolve_textures(root: &Path, rel: &Path, model: &SourceModel) -> Result<Vec<Option<ResolvedTexture>>, String> {
+pub fn resolve_textures(
+    root: &Path,
+    rel: &Path,
+    model: &SourceModel,
+) -> Result<Vec<Option<ResolvedTexture>>, String> {
     model
         .submeshes
         .iter()
@@ -131,17 +149,34 @@ pub fn resolve_textures(root: &Path, rel: &Path, model: &SourceModel) -> Result<
                 })?;
                 let source = root.join(&key_rel);
                 let png = std::fs::read(&source).map_err(|e| {
-                    format!("material `{}`: could not read texture {}: {e}", s.material.name, source.display())
+                    format!(
+                        "material `{}`: could not read texture {}: {e}",
+                        s.material.name,
+                        source.display()
+                    )
                 })?;
-                Ok(Some(ResolvedTexture { key: slash(&key_rel), source, png }))
+                Ok(Some(ResolvedTexture {
+                    key: slash(&key_rel),
+                    source,
+                    png,
+                }))
             }
             Some(TextureSrc::Embedded(i)) => {
                 let png = model
                     .images
                     .get(*i)
-                    .ok_or_else(|| format!("material `{}`: embedded image {i} is missing", s.material.name))?
+                    .ok_or_else(|| {
+                        format!(
+                            "material `{}`: embedded image {i} is missing",
+                            s.material.name
+                        )
+                    })?
                     .clone();
-                Ok(Some(ResolvedTexture { key: format!("{}#{i}", slash(rel)), source: root.join(rel), png }))
+                Ok(Some(ResolvedTexture {
+                    key: format!("{}#{i}", slash(rel)),
+                    source: root.join(rel),
+                    png,
+                }))
             }
         })
         .collect()
@@ -225,7 +260,8 @@ pub fn build_dir(root: &Path, dst: &Path) -> Result<Built, String> {
             ));
         }
 
-        let resolved = resolve_textures(root, &rel, &model).map_err(|e| format!("{}: {e}", input.display()))?;
+        let resolved = resolve_textures(root, &rel, &model)
+            .map_err(|e| format!("{}: {e}", input.display()))?;
         let mut table_keys: Vec<String> = Vec::new();
         let mut sub_tex: Vec<Option<usize>> = Vec::new();
         for r in &resolved {
@@ -234,7 +270,8 @@ pub fn build_dir(root: &Path, dst: &Path) -> Result<Built, String> {
                 continue;
             };
             if !baked.contains_key(&r.key) {
-                let tex = texture::encode_png(&r.png).map_err(|e| format!("{}: {e}", r.source.display()))?;
+                let tex = texture::encode_png(&r.png)
+                    .map_err(|e| format!("{}: {e}", r.source.display()))?;
                 let output = dst.join(tex_out_rel(&r.key));
                 write_file(&output, &tex.to_le_bytes())?;
                 built.textures.push(BuiltTexture {
@@ -260,19 +297,31 @@ pub fn build_dir(root: &Path, dst: &Path) -> Result<Built, String> {
         let table: Vec<dsm::TexRef> = table_keys
             .iter()
             .zip(&paths)
-            .map(|(k, p)| dsm::TexRef { nitro_path: p.as_str(), width: baked[k].width, height: baked[k].height })
+            .map(|(k, p)| dsm::TexRef {
+                nitro_path: p.as_str(),
+                width: baked[k].width,
+                height: baked[k].height,
+            })
             .collect();
-        let bytes = dsm::encode(&model, &table, &sub_tex).map_err(|e| format!("{}: {e}", input.display()))?;
+        let bytes = dsm::encode(&model, &table, &sub_tex)
+            .map_err(|e| format!("{}: {e}", input.display()))?;
         let output = dst.join(rel.with_extension(MODEL_EXT));
         write_file(&output, &bytes)?;
-        built.models.push(BuiltModel { name, input, output, tris, textures: table_keys });
+        built.models.push(BuiltModel {
+            name,
+            input,
+            output,
+            tris,
+            textures: table_keys,
+        });
     }
     Ok(built)
 }
 
 fn write_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("could not create {}: {e}", parent.display()))?;
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("could not create {}: {e}", parent.display()))?;
     }
     std::fs::write(path, bytes).map_err(|e| format!("could not write {}: {e}", path.display()))
 }
@@ -291,7 +340,15 @@ mod tests {
 
     /// An 8×8 two-colour PNG.
     fn png_bytes() -> Vec<u8> {
-        let rgba: Vec<u8> = (0..64).flat_map(|i| if i % 2 == 0 { [255, 0, 0, 255] } else { [0, 0, 255, 255] }).collect();
+        let rgba: Vec<u8> = (0..64)
+            .flat_map(|i| {
+                if i % 2 == 0 {
+                    [255, 0, 0, 255]
+                } else {
+                    [0, 0, 255, 255]
+                }
+            })
+            .collect();
         let mut out = Vec::new();
         {
             let mut enc = png::Encoder::new(&mut out, 8, 8);
@@ -316,7 +373,11 @@ mod tests {
             ),
         )
         .unwrap();
-        std::fs::write(dir.join(format!("{stem}.mtl")), format!("newmtl skin\nKd 1 1 1\nmap_Kd {texture}\n")).unwrap();
+        std::fs::write(
+            dir.join(format!("{stem}.mtl")),
+            format!("newmtl skin\nKd 1 1 1\nmap_Kd {texture}\n"),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -329,7 +390,10 @@ mod tests {
     fn tex_out_paths() {
         assert_eq!(tex_out_rel("props/crate.png"), "props/crate.tex");
         assert_eq!(tex_out_rel("props/barrel.glb#0"), "props/barrel.glb.0.tex");
-        assert_eq!(nitro_tex_path("props/crate.png"), "nitro:/models/props/crate.tex");
+        assert_eq!(
+            nitro_tex_path("props/crate.png"),
+            "nitro:/models/props/crate.tex"
+        );
     }
 
     #[test]
@@ -349,7 +413,10 @@ mod tests {
         assert_eq!(built.textures[0].texel_bytes, 16); // 8×8 at 2bpp
         let dsm = std::fs::read(dst.join("props/crate.dsm")).unwrap();
         assert_eq!(&dsm[0..4], b"DSM1");
-        assert!(dsm.windows(29).any(|w| w == b"nitro:/models/props/crate.tex"));
+        assert!(
+            dsm.windows(29)
+                .any(|w| w == b"nitro:/models/props/crate.tex")
+        );
         let tex = std::fs::read(dst.join("props/crate.tex")).unwrap();
         assert_eq!(&tex[0..4], b"DST1");
         assert!(built.warnings.is_empty(), "{:?}", built.warnings);
@@ -367,8 +434,14 @@ mod tests {
         let built = build_dir(&src, &root.join("out")).unwrap();
         assert_eq!(built.models.len(), 2);
         assert_eq!(built.textures.len(), 1);
-        assert_eq!(built.models[0].textures, vec!["shared/skin.png".to_string()]);
-        assert_eq!(built.models[1].textures, vec!["shared/skin.png".to_string()]);
+        assert_eq!(
+            built.models[0].textures,
+            vec!["shared/skin.png".to_string()]
+        );
+        assert_eq!(
+            built.models[1].textures,
+            vec!["shared/skin.png".to_string()]
+        );
     }
 
     #[test]
@@ -377,7 +450,10 @@ mod tests {
         write_quad(&root, "crate", "crate.png");
         std::fs::write(root.join("crate.glb"), b"not read").unwrap();
         let err = model_names(&root).unwrap_err();
-        assert!(err.contains("crate.obj") && err.contains("crate.glb"), "{err}");
+        assert!(
+            err.contains("crate.obj") && err.contains("crate.glb"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -406,6 +482,10 @@ mod tests {
         std::fs::write(root.join("heavy.obj"), obj).unwrap();
         let built = build_dir(&root, &root.join("out")).unwrap();
         assert_eq!(built.warnings.len(), 1);
-        assert!(built.warnings[0].contains("501 triangles"), "{}", built.warnings[0]);
+        assert!(
+            built.warnings[0].contains("501 triangles"),
+            "{}",
+            built.warnings[0]
+        );
     }
 }

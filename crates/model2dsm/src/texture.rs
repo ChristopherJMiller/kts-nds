@@ -140,7 +140,13 @@ pub fn encode_rgba(width: u32, height: u32, rgba: &[u8]) -> Result<DsTexture, St
 
     let indices: Vec<u8> = rgba
         .chunks_exact(4)
-        .map(|p| if p[3] == 0 { 0 } else { lookup[&rgb15(p[0], p[1], p[2])] as u8 })
+        .map(|p| {
+            if p[3] == 0 {
+                0
+            } else {
+                lookup[&rgb15(p[0], p[1], p[2])] as u8
+            }
+        })
         .collect();
 
     let bits = format.bits_per_texel();
@@ -165,15 +171,27 @@ pub fn encode_rgba(width: u32, height: u32, rgba: &[u8]) -> Result<DsTexture, St
 pub fn decode_png_rgba(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>), String> {
     let mut dec = png::Decoder::new(std::io::Cursor::new(bytes));
     dec.set_transformations(png::Transformations::normalize_to_color8());
-    let mut reader = dec.read_info().map_err(|e| format!("not a readable PNG: {e}"))?;
-    let size = reader.output_buffer_size().ok_or("PNG is too large to decode")?;
+    let mut reader = dec
+        .read_info()
+        .map_err(|e| format!("not a readable PNG: {e}"))?;
+    let size = reader
+        .output_buffer_size()
+        .ok_or("PNG is too large to decode")?;
     let mut buf = vec![0u8; size];
-    let info = reader.next_frame(&mut buf).map_err(|e| format!("PNG decode failed: {e}"))?;
+    let info = reader
+        .next_frame(&mut buf)
+        .map_err(|e| format!("PNG decode failed: {e}"))?;
     let n = (info.width * info.height) as usize;
     let rgba: Vec<u8> = match info.color_type {
         png::ColorType::Rgba => buf[..n * 4].to_vec(),
-        png::ColorType::Rgb => buf[..n * 3].chunks_exact(3).flat_map(|p| [p[0], p[1], p[2], 255]).collect(),
-        png::ColorType::GrayscaleAlpha => buf[..n * 2].chunks_exact(2).flat_map(|p| [p[0], p[0], p[0], p[1]]).collect(),
+        png::ColorType::Rgb => buf[..n * 3]
+            .chunks_exact(3)
+            .flat_map(|p| [p[0], p[1], p[2], 255])
+            .collect(),
+        png::ColorType::GrayscaleAlpha => buf[..n * 2]
+            .chunks_exact(2)
+            .flat_map(|p| [p[0], p[0], p[0], p[1]])
+            .collect(),
         png::ColorType::Grayscale => buf[..n].iter().flat_map(|&g| [g, g, g, 255]).collect(),
         png::ColorType::Indexed => return Err("PNG is still indexed after expansion".into()),
     };
@@ -192,7 +210,10 @@ mod tests {
 
     /// RGBA for a `w`×`h` image filled by `f(x, y)`.
     fn img(w: u32, h: u32, f: impl Fn(u32, u32) -> [u8; 4]) -> Vec<u8> {
-        (0..h).flat_map(|y| (0..w).map(move |x| (x, y))).flat_map(|(x, y)| f(x, y)).collect()
+        (0..h)
+            .flat_map(|y| (0..w).map(move |x| (x, y)))
+            .flat_map(|(x, y)| f(x, y))
+            .collect()
     }
 
     /// `n` distinct opaque colours spread over an 8×8 (or 16×16 for n > 64) image.
@@ -205,7 +226,13 @@ mod tests {
         (side, rgba)
     }
 
-    fn png(w: u32, h: u32, color: ::png::ColorType, data: &[u8], palette: Option<&[u8]>) -> Vec<u8> {
+    fn png(
+        w: u32,
+        h: u32,
+        color: ::png::ColorType,
+        data: &[u8],
+        palette: Option<&[u8]>,
+    ) -> Vec<u8> {
         let mut out = Vec::new();
         {
             let mut enc = ::png::Encoder::new(&mut out, w, h);
@@ -268,7 +295,13 @@ mod tests {
 
     #[test]
     fn colours_merge_after_15_bit_conversion() {
-        let rgba = img(8, 8, |x, _| if x % 2 == 0 { [0, 0, 0, 255] } else { [7, 7, 7, 255] });
+        let rgba = img(8, 8, |x, _| {
+            if x % 2 == 0 {
+                [0, 0, 0, 255]
+            } else {
+                [7, 7, 7, 255]
+            }
+        });
         let t = encode_rgba(8, 8, &rgba).unwrap();
         assert_eq!(t.palette, vec![0]);
         assert_eq!(t.format, TexFormat::Pal4);
@@ -277,7 +310,13 @@ mod tests {
     #[test]
     fn texels_pack_low_bits_first() {
         // Row 0: A, B, A, A, ... → palette [A, B]; 2bpp byte 0 = 0 | 1<<2 = 0x04.
-        let rgba = img(8, 8, |x, y| if (x, y) == (1, 0) { [0, 0, 255, 255] } else { [255, 0, 0, 255] });
+        let rgba = img(8, 8, |x, y| {
+            if (x, y) == (1, 0) {
+                [0, 0, 255, 255]
+            } else {
+                [255, 0, 0, 255]
+            }
+        });
         let t = encode_rgba(8, 8, &rgba).unwrap();
         assert_eq!(t.format, TexFormat::Pal4);
         assert_eq!(t.palette, vec![0x001F, 0x7C00]);
@@ -297,18 +336,42 @@ mod tests {
 
     #[test]
     fn png_colour_types_decode_alike() {
-        let rgba = img(8, 8, |x, _| if x < 4 { [255, 0, 0, 255] } else { [0, 0, 255, 255] });
+        let rgba = img(8, 8, |x, _| {
+            if x < 4 {
+                [255, 0, 0, 255]
+            } else {
+                [0, 0, 255, 255]
+            }
+        });
         let want = encode_rgba(8, 8, &rgba).unwrap();
 
         let rgb: Vec<u8> = rgba.chunks(4).flat_map(|p| [p[0], p[1], p[2]]).collect();
-        assert_eq!(encode_png(&png(8, 8, ::png::ColorType::Rgb, &rgb, None)).unwrap(), want);
-        assert_eq!(encode_png(&png(8, 8, ::png::ColorType::Rgba, &rgba, None)).unwrap(), want);
+        assert_eq!(
+            encode_png(&png(8, 8, ::png::ColorType::Rgb, &rgb, None)).unwrap(),
+            want
+        );
+        assert_eq!(
+            encode_png(&png(8, 8, ::png::ColorType::Rgba, &rgba, None)).unwrap(),
+            want
+        );
 
-        let idx: Vec<u8> = rgba.chunks(4).map(|p| if p[0] == 255 { 0 } else { 1 }).collect();
+        let idx: Vec<u8> = rgba
+            .chunks(4)
+            .map(|p| if p[0] == 255 { 0 } else { 1 })
+            .collect();
         let pal = [255, 0, 0, 0, 0, 255];
-        assert_eq!(encode_png(&png(8, 8, ::png::ColorType::Indexed, &idx, Some(&pal))).unwrap(), want);
+        assert_eq!(
+            encode_png(&png(8, 8, ::png::ColorType::Indexed, &idx, Some(&pal))).unwrap(),
+            want
+        );
 
-        let grey = img(8, 8, |x, _| if x < 4 { [0, 0, 0, 255] } else { [255, 255, 255, 255] });
+        let grey = img(8, 8, |x, _| {
+            if x < 4 {
+                [0, 0, 0, 255]
+            } else {
+                [255, 255, 255, 255]
+            }
+        });
         let g: Vec<u8> = grey.chunks(4).map(|p| p[0]).collect();
         assert_eq!(
             encode_png(&png(8, 8, ::png::ColorType::Grayscale, &g, None)).unwrap(),

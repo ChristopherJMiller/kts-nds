@@ -59,14 +59,19 @@ pub fn parse_obj(
                 for tok in it {
                     let (vi, ti, ni) = parse_face_vertex(tok)
                         .ok_or_else(|| at(&format!("malformed face vertex {tok:?}")))?;
-                    let pos = *resolve(&positions, vi).ok_or_else(|| at("vertex index out of range"))?;
+                    let pos =
+                        *resolve(&positions, vi).ok_or_else(|| at("vertex index out of range"))?;
                     let nor = match ni {
-                        Some(ni) => Some(*resolve(&normals, ni).ok_or_else(|| at("normal index out of range"))?),
+                        Some(ni) => Some(
+                            *resolve(&normals, ni)
+                                .ok_or_else(|| at("normal index out of range"))?,
+                        ),
                         None => None,
                     };
                     let uv = match ti {
                         Some(ti) if opts.materials => Some(
-                            *resolve(&uvs, ti).ok_or_else(|| at("texture coordinate index out of range"))?,
+                            *resolve(&uvs, ti)
+                                .ok_or_else(|| at("texture coordinate index out of range"))?,
                         ),
                         _ => None,
                     };
@@ -107,7 +112,11 @@ pub fn parse_obj(
 
 /// The sub-mesh for material `name`, created on first use. `""` is the default
 /// material (faces before any `usemtl`); a named one must come from an MTL.
-fn submesh_index(subs: &mut Vec<SubMesh>, name: &str, library: &[Material]) -> Result<usize, String> {
+fn submesh_index(
+    subs: &mut Vec<SubMesh>,
+    name: &str,
+    library: &[Material],
+) -> Result<usize, String> {
     if let Some(i) = subs.iter().position(|s| s.material.name == name) {
         return Ok(i);
     }
@@ -151,7 +160,9 @@ pub fn parse_mtl(source: &str) -> Result<Vec<Material>, String> {
                     .ok_or_else(|| format!("line {}: malformed Kd", lineno + 1))?;
             }
             Some("map_Kd") => {
-                let path = it.last().ok_or_else(|| format!("line {}: map_Kd has no path", lineno + 1))?;
+                let path = it
+                    .last()
+                    .ok_or_else(|| format!("line {}: map_Kd has no path", lineno + 1))?;
                 m.texture = Some(TextureSrc::File(path.to_string()));
             }
             _ => {}
@@ -219,7 +230,11 @@ mod tests {
     #[test]
     fn faces_group_by_material_in_first_use_order() {
         let m = parse_obj(TWO_MATERIALS, ObjOptions { materials: true }, with_mtl).unwrap();
-        let names: Vec<&str> = m.submeshes.iter().map(|s| s.material.name.as_str()).collect();
+        let names: Vec<&str> = m
+            .submeshes
+            .iter()
+            .map(|s| s.material.name.as_str())
+            .collect();
         assert_eq!(names, ["a", "b"]);
         assert_eq!(m.submeshes[0].tris.len(), 2);
         assert_eq!(m.submeshes[1].tris.len(), 1);
@@ -250,7 +265,8 @@ mod tests {
     #[test]
     fn undefined_material_is_an_error() {
         let src = "v 0 0 0\nv 1 0 0\nv 0 1 0\nusemtl ghost\nf 1 2 3\n";
-        let err = parse_obj(src, ObjOptions { materials: true }, |_| Ok(String::new())).unwrap_err();
+        let err =
+            parse_obj(src, ObjOptions { materials: true }, |_| Ok(String::new())).unwrap_err();
         assert!(err.contains("ghost"), "{err}");
     }
 

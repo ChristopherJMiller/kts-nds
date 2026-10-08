@@ -25,7 +25,8 @@ const IDENTITY: Mat4 = [
 
 /// Read a `.gltf` / `.glb` file; external buffers resolve beside it.
 pub fn load_gltf(path: &Path) -> Result<SourceModel, String> {
-    let bytes = std::fs::read(path).map_err(|e| format!("could not read {}: {e}", path.display()))?;
+    let bytes =
+        std::fs::read(path).map_err(|e| format!("could not read {}: {e}", path.display()))?;
     let base = path.parent().unwrap_or(Path::new("."));
     parse_gltf(&bytes, &|uri| {
         let p = base.join(uri);
@@ -47,7 +48,9 @@ pub fn parse_gltf(
             gltf::buffer::Source::Bin => blob
                 .clone()
                 .ok_or("a buffer refers to the GLB binary chunk, but there is none")?,
-            gltf::buffer::Source::Uri(uri) if uri.starts_with("data:") => return Err(DATA_URI_ERR.into()),
+            gltf::buffer::Source::Uri(uri) if uri.starts_with("data:") => {
+                return Err(DATA_URI_ERR.into());
+            }
             gltf::buffer::Source::Uri(uri) => read_uri(uri)?,
         });
     }
@@ -58,16 +61,23 @@ pub fn parse_gltf(
         image_src.push(match img.source() {
             gltf::image::Source::View { view, mime_type } => {
                 if mime_type != "image/png" {
-                    return Err(format!("image {} is {mime_type}; only PNG textures are supported", img.index()));
+                    return Err(format!(
+                        "image {} is {mime_type}; only PNG textures are supported",
+                        img.index()
+                    ));
                 }
-                let data = buffers.get(view.buffer().index()).ok_or("image buffer missing")?;
+                let data = buffers
+                    .get(view.buffer().index())
+                    .ok_or("image buffer missing")?;
                 let bytes = data
                     .get(view.offset()..view.offset() + view.length())
                     .ok_or("image buffer view out of range")?;
                 images.push(bytes.to_vec());
                 TextureSrc::Embedded(images.len() - 1)
             }
-            gltf::image::Source::Uri { uri, .. } if uri.starts_with("data:") => return Err(DATA_URI_ERR.into()),
+            gltf::image::Source::Uri { uri, .. } if uri.starts_with("data:") => {
+                return Err(DATA_URI_ERR.into());
+            }
             gltf::image::Source::Uri { uri, .. } => TextureSrc::File(uri.to_string()),
         });
     }
@@ -97,7 +107,10 @@ fn visit(
     if let Some(mesh) = node.mesh() {
         let (normal_m, det) = normal_matrix(&world);
         if det.abs() < 1e-12 {
-            return Err(format!("node {} has a degenerate (zero-scale) transform", node.index()));
+            return Err(format!(
+                "node {} has a degenerate (zero-scale) transform",
+                node.index()
+            ));
         }
         for prim in mesh.primitives() {
             if prim.mode() != gltf::mesh::Mode::Triangles {
@@ -113,13 +126,18 @@ fn visit(
                 .ok_or_else(|| format!("mesh {} has a primitive with no POSITION", mesh.index()))?
                 .collect();
             let nor: Option<Vec<[f32; 3]>> = reader.read_normals().map(|i| i.collect());
-            let uv: Option<Vec<[f32; 2]>> = reader.read_tex_coords(0).map(|i| i.into_f32().collect());
+            let uv: Option<Vec<[f32; 2]>> =
+                reader.read_tex_coords(0).map(|i| i.into_f32().collect());
             let idx: Vec<u32> = match reader.read_indices() {
                 Some(i) => i.into_u32().collect(),
                 None => (0..pos.len() as u32).collect(),
             };
             if idx.len() % 3 != 0 {
-                return Err(format!("mesh {}: index count {} isn't a multiple of 3", mesh.index(), idx.len()));
+                return Err(format!(
+                    "mesh {}: index count {} isn't a multiple of 3",
+                    mesh.index(),
+                    idx.len()
+                ));
             }
 
             let key = prim.material().index();
@@ -127,17 +145,29 @@ fn visit(
                 Some(i) => i,
                 None => {
                     let material = material(&prim.material(), image_src)?;
-                    groups.push((key, SubMesh { material, tris: Vec::new() }));
+                    groups.push((
+                        key,
+                        SubMesh {
+                            material,
+                            tris: Vec::new(),
+                        },
+                    ));
                     groups.len() - 1
                 }
             };
 
             let corner = |i: u32| -> Result<Vertex, String> {
                 let i = i as usize;
-                let p = *pos.get(i).ok_or_else(|| format!("mesh {}: index {i} out of range", mesh.index()))?;
+                let p = *pos
+                    .get(i)
+                    .ok_or_else(|| format!("mesh {}: index {i} out of range", mesh.index()))?;
                 Ok(Vertex {
                     pos: transform_point(&world, p),
-                    normal: nor.as_ref().and_then(|n| n.get(i)).map(|n| apply3(&normal_m, *n)).unwrap_or([0.0; 3]),
+                    normal: nor
+                        .as_ref()
+                        .and_then(|n| n.get(i))
+                        .map(|n| apply3(&normal_m, *n))
+                        .unwrap_or([0.0; 3]),
                     uv: uv.as_ref().and_then(|u| u.get(i)).copied(),
                 })
             };
@@ -191,7 +221,12 @@ fn material(m: &gltf::Material, image_src: &[TextureSrc]) -> Result<Material, St
         let s = tex.sampler();
         let (repeat_s, flip_s) = wrap_bits(s.wrap_s());
         let (repeat_t, flip_t) = wrap_bits(s.wrap_t());
-        out.wrap = Wrap { repeat_s, repeat_t, flip_s, flip_t };
+        out.wrap = Wrap {
+            repeat_s,
+            repeat_t,
+            flip_s,
+            flip_t,
+        };
     }
     Ok(out)
 }
@@ -337,7 +372,11 @@ mod tests {
 
     #[test]
     fn reads_geometry_material_and_embedded_texture() {
-        let m = parse_gltf(&one_triangle_glb(r#""translation": [1.0, 0.0, 0.0]"#, true, FAKE_PNG), &no_files).unwrap();
+        let m = parse_gltf(
+            &one_triangle_glb(r#""translation": [1.0, 0.0, 0.0]"#, true, FAKE_PNG),
+            &no_files,
+        )
+        .unwrap();
         assert_eq!(m.submeshes.len(), 1);
         let s = &m.submeshes[0];
         assert_eq!(s.material.name, "crate");
@@ -345,7 +384,12 @@ mod tests {
         assert_eq!(s.material.texture, Some(TextureSrc::Embedded(0)));
         assert_eq!(
             s.material.wrap,
-            Wrap { repeat_s: true, repeat_t: false, flip_s: true, flip_t: false }
+            Wrap {
+                repeat_s: true,
+                repeat_t: false,
+                flip_s: true,
+                flip_t: false
+            }
         );
         assert_eq!(m.images, vec![FAKE_PNG.to_vec()]);
         let t = s.tris[0];
@@ -358,7 +402,11 @@ mod tests {
 
     #[test]
     fn mirrored_node_keeps_outward_winding() {
-        let m = parse_gltf(&one_triangle_glb(r#""scale": [-1.0, 1.0, 1.0]"#, true, FAKE_PNG), &no_files).unwrap();
+        let m = parse_gltf(
+            &one_triangle_glb(r#""scale": [-1.0, 1.0, 1.0]"#, true, FAKE_PNG),
+            &no_files,
+        )
+        .unwrap();
         let t = m.submeshes[0].tris[0];
         // Mirroring X reverses the winding; the front-end swaps corners 1 and 2.
         assert_eq!(t[1].pos, [0.0, 1.0, 0.0]);
@@ -370,8 +418,16 @@ mod tests {
 
     #[test]
     fn missing_normals_get_flat_normals() {
-        let m = parse_gltf(&one_triangle_glb(r#""name": "n""#, false, FAKE_PNG), &no_files).unwrap();
-        assert!(m.submeshes[0].tris[0].iter().all(|v| v.normal == [0.0, 0.0, 1.0]));
+        let m = parse_gltf(
+            &one_triangle_glb(r#""name": "n""#, false, FAKE_PNG),
+            &no_files,
+        )
+        .unwrap();
+        assert!(
+            m.submeshes[0].tris[0]
+                .iter()
+                .all(|v| v.normal == [0.0, 0.0, 1.0])
+        );
     }
 
     #[test]

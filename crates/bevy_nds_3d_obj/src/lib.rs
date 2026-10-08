@@ -291,16 +291,19 @@ pub const VERTEX_LIMIT: f32 = 32767.0 / 4096.0;
 ///
 /// Unlike the legacy encoder this rejects geometry the hardware can't represent
 /// (outside ±8 units, or texcoords beyond ±2048 texels) instead of wrapping it.
-pub fn submesh_display_list(tris: &[Triangle], tex_size: Option<[u16; 2]>) -> Result<Vec<u32>, String> {
+pub fn submesh_display_list(
+    tris: &[Triangle],
+    tex_size: Option<[u16; 2]>,
+) -> Result<Vec<u32>, String> {
     let mut ops: Vec<(u8, Vec<u32>)> = Vec::with_capacity(tris.len() * 9 + 2);
     ops.push((FIFO_BEGIN, vec![GL_TRIANGLES]));
     for (ti, tri) in tris.iter().enumerate() {
         for v in tri {
             check_range(v.pos).map_err(|e| format!("triangle {ti}: {e}"))?;
             if let Some([w, h]) = tex_size {
-                let uv = v
-                    .uv
-                    .ok_or_else(|| format!("triangle {ti}: textured material but a vertex has no UV"))?;
+                let uv = v.uv.ok_or_else(|| {
+                    format!("triangle {ti}: textured material but a vertex has no UV")
+                })?;
                 let word = texcoord_pack(uv[0] * w as f32, uv[1] * h as f32)
                     .map_err(|e| format!("triangle {ti}: {e}"))?;
                 ops.push((FIFO_TEX_COORD, vec![word]));
@@ -426,7 +429,8 @@ mod tests {
     /// a command word with their args interleaved, and a correct length header.
     #[test]
     fn single_triangle_display_list_layout() {
-        let tris = legacy_triangles("v 0 0 0\nv 1 0 0\nv 0 1 0\nvn 0 0 1\nf 1//1 2//1 3//1\n").unwrap();
+        let tris =
+            legacy_triangles("v 0 0 0\nv 1 0 0\nv 0 1 0\nvn 0 0 1\nf 1//1 2//1 3//1\n").unwrap();
         assert_eq!(tris.len(), 1);
 
         let (words, _aabb) = display_list(&tris, false);
@@ -613,9 +617,16 @@ mod tests {
     /// Untextured sub-meshes encode exactly like the legacy list.
     #[test]
     fn untextured_submesh_matches_legacy_list() {
-        let src = std::fs::read_to_string(format!("{}/../../assets/cube.obj", env!("CARGO_MANIFEST_DIR"))).unwrap();
+        let src = std::fs::read_to_string(format!(
+            "{}/../../assets/cube.obj",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap();
         let tris = legacy_triangles(&src).unwrap();
-        assert_eq!(submesh_display_list(&tris, None).unwrap(), display_list(&tris, false).0);
+        assert_eq!(
+            submesh_display_list(&tris, None).unwrap(),
+            display_list(&tris, false).0
+        );
     }
 
     #[test]
