@@ -13,6 +13,10 @@
 //! Keeping the encoder here means the packing math (which must match
 //! `bevy_nds_3d::ffi`) lives in exactly one place.
 
+pub mod ir;
+pub mod obj;
+
+use ir::{SourceModel, Triangle};
 use std::fmt::Write as _;
 
 /// Build-time origin adjustments for a model (applied to the baked geometry, so
@@ -41,13 +45,25 @@ pub struct Model {
 
 /// Parse a Wavefront OBJ and bake it into a hardware-lit display list.
 pub fn obj_to_display_list(source: &str, opts: &Options) -> Result<Model, String> {
-    let mut tris = parse_obj(source)?;
+    let mut tris = legacy_triangles(source)?;
     if tris.is_empty() {
         return Err("no triangles found".into());
     }
     apply_origin(&mut tris, opts);
     let (words, aabb) = display_list(&tris, opts.compress);
     Ok(Model { words, aabb })
+}
+
+/// Every triangle of an OBJ in file order, materials and UVs ignored — the
+/// legacy `.dl` / `include_obj!` / editor-preview reading.
+fn legacy_triangles(source: &str) -> Result<Vec<Triangle>, String> {
+    let model = obj::parse_obj(source, obj::ObjOptions::default(), |_| Ok(String::new()))?;
+    Ok(flatten(model))
+}
+
+/// Concatenate a model's sub-meshes, in order.
+fn flatten(model: SourceModel) -> Vec<Triangle> {
+    model.submeshes.into_iter().flat_map(|s| s.tris).collect()
 }
 
 /// Format the display list as a Rust `&[u32]` array body (hex, 12 per line),
@@ -127,7 +143,7 @@ pub struct PreviewMesh {
 /// baker, so OBJ support stays defined in one place (no origin adjustment is
 /// applied; previews draw the geometry as authored).
 pub fn obj_preview_mesh(source: &str) -> Result<PreviewMesh, String> {
-    let tris = parse_obj(source)?;
+    let tris = legacy_triangles(source)?;
     if tris.is_empty() {
         return Err("no triangles found".into());
     }
@@ -135,7 +151,7 @@ pub fn obj_preview_mesh(source: &str) -> Result<PreviewMesh, String> {
     let mut max = [f32::NEG_INFINITY; 3];
     let mut out = Vec::with_capacity(tris.len());
     for t in &tris {
-        let pos = [t.verts[0].0, t.verts[1].0, t.verts[2].0];
+        let pos = [t[0].pos, t[1].pos, t[2].pos];
         for p in &pos {
             for k in 0..3 {
                 min[k] = min[k].min(p[k]);
@@ -153,24 +169,17 @@ pub fn obj_preview_mesh(source: &str) -> Result<PreviewMesh, String> {
     })
 }
 
-/// One triangle's worth of baked vertex data: position + normal per corner.
-struct Tri {
-    verts: [([f32; 3], [f32; 3]); 3],
-}
-
 /// Shift the baked geometry's origin per the `center` / `offset` settings.
-fn apply_origin(tris: &mut [Tri], opts: &Options) {
+fn apply_origin(tris: &mut [Triangle], opts: &Options) {
     let mut shift = [0.0f32; 3];
 
     if opts.center {
         let mut min = [f32::INFINITY; 3];
         let mut max = [f32::NEG_INFINITY; 3];
-        for tri in tris.iter() {
-            for (pos, _) in &tri.verts {
-                for k in 0..3 {
-                    min[k] = min[k].min(pos[k]);
-                    max[k] = max[k].max(pos[k]);
-                }
+        for v in tris.iter().flatten() {
+            for k in 0..3 {
+                min[k] = min[k].min(v.pos[k]);
+                max[k] = max[k].max(v.pos[k]);
             }
         }
         for k in 0..3 {
@@ -184,113 +193,15 @@ fn apply_origin(tris: &mut [Tri], opts: &Options) {
     if shift == [0.0, 0.0, 0.0] {
         return;
     }
-    for tri in tris.iter_mut() {
-        for (pos, _) in &mut tri.verts {
-            for k in 0..3 {
-                pos[k] += shift[k];
-            }
+    for v in tris.iter_mut().flatten() {
+        for k in 0..3 {
+            v.pos[k] += shift[k];
         }
     }
-}
-
-/// Parse the subset of Wavefront OBJ we need: `v`, `vn`, `f`. Faces are
-/// fan-triangulated; missing per-vertex normals are filled with the triangle's
-/// flat (geometric) normal.
-fn parse_obj(source: &str) -> Result<Vec<Tri>, String> {
-    let mut positions: Vec<[f32; 3]> = Vec::new();
-    let mut normals: Vec<[f32; 3]> = Vec::new();
-    let mut tris: Vec<Tri> = Vec::new();
-
-    for (lineno, line) in source.lines().enumerate() {
-        let line = line.trim();
-        let mut it = line.split_whitespace();
-        match it.next() {
-            Some("v") => {
-                let v = parse_vec3(&mut it)
-                    .ok_or_else(|| format!("line {}: malformed vertex", lineno + 1))?;
-                positions.push(v);
-            }
-            Some("vn") => {
-                let n = parse_vec3(&mut it)
-                    .ok_or_else(|| format!("line {}: malformed normal", lineno + 1))?;
-                normals.push(n);
-            }
-            Some("f") => {
-                // Collect the face's (position, optional-normal) corner indices.
-                let mut corners: Vec<([f32; 3], Option<[f32; 3]>)> = Vec::new();
-                for tok in it {
-                    let (vi, ni) = parse_face_vertex(tok).ok_or_else(|| {
-                        format!("line {}: malformed face vertex {tok:?}", lineno + 1)
-                    })?;
-                    let pos = *resolve(&positions, vi)
-                        .ok_or_else(|| format!("line {}: vertex index out of range", lineno + 1))?;
-                    let nor = match ni {
-                        Some(ni) => Some(*resolve(&normals, ni).ok_or_else(|| {
-                            format!("line {}: normal index out of range", lineno + 1)
-                        })?),
-                        None => None,
-                    };
-                    corners.push((pos, nor));
-                }
-                if corners.len() < 3 {
-                    return Err(format!("line {}: face has < 3 vertices", lineno + 1));
-                }
-                // Fan-triangulate: (0, i, i+1) for i in 1..n-1.
-                for i in 1..corners.len() - 1 {
-                    let a = corners[0];
-                    let b = corners[i];
-                    let c = corners[i + 1];
-                    let flat = flat_normal(a.0, b.0, c.0);
-                    tris.push(Tri {
-                        verts: [
-                            (a.0, a.1.unwrap_or(flat)),
-                            (b.0, b.1.unwrap_or(flat)),
-                            (c.0, c.1.unwrap_or(flat)),
-                        ],
-                    });
-                }
-            }
-            _ => {} // comments, o/g/s/usemtl/mtllib, blanks, unsupported records
-        }
-    }
-
-    Ok(tris)
-}
-
-/// Resolve a 1-based OBJ index (negative = relative to the end) into a slice.
-fn resolve<T>(items: &[T], idx: i32) -> Option<&T> {
-    if idx > 0 {
-        items.get((idx - 1) as usize)
-    } else if idx < 0 {
-        let from_end = items.len() as i32 + idx;
-        usize::try_from(from_end).ok().and_then(|i| items.get(i))
-    } else {
-        None
-    }
-}
-
-fn parse_vec3<'a>(it: &mut impl Iterator<Item = &'a str>) -> Option<[f32; 3]> {
-    let x = it.next()?.parse().ok()?;
-    let y = it.next()?.parse().ok()?;
-    let z = it.next()?.parse().ok()?;
-    Some([x, y, z])
-}
-
-/// Parse one face vertex token (`v`, `v/t`, `v//n`, or `v/t/n`) into a vertex
-/// index and an optional normal index.
-fn parse_face_vertex(tok: &str) -> Option<(i32, Option<i32>)> {
-    let mut parts = tok.split('/');
-    let v: i32 = parts.next()?.parse().ok()?;
-    let _t = parts.next(); // texture coord index, ignored
-    let n = match parts.next() {
-        Some(s) if !s.is_empty() => Some(s.parse().ok()?),
-        _ => None,
-    };
-    Some((v, n))
 }
 
 /// Geometric (flat) normal of a triangle, normalised; zero if degenerate.
-fn flat_normal(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> [f32; 3] {
+pub fn flat_normal(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> [f32; 3] {
     let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
     let ac = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
     let n = [
@@ -301,7 +212,8 @@ fn flat_normal(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> [f32; 3] {
     normalize(n)
 }
 
-fn normalize(v: [f32; 3]) -> [f32; 3] {
+/// Normalise a vector; zero stays zero.
+pub fn normalize(v: [f32; 3]) -> [f32; 3] {
     let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
     if len > 1e-6 {
         [v[0] / len, v[1] / len, v[2] / len]
@@ -335,7 +247,7 @@ const GL_TRIANGLES: u32 = 0;
 /// when `compress` is set, a `GFX_VERTEX10` (1 word), then `GFX_END`.
 /// Lighting/material/poly-format are set by the renderer *outside* the list, so
 /// the same baked geometry honours the live material and lights.
-fn display_list(tris: &[Tri], compress: bool) -> (Vec<u32>, [[f32; 3]; 2]) {
+fn display_list(tris: &[Triangle], compress: bool) -> (Vec<u32>, [[f32; 3]; 2]) {
     let mut min = [f32::INFINITY; 3];
     let mut max = [f32::NEG_INFINITY; 3];
 
@@ -343,12 +255,13 @@ fn display_list(tris: &[Tri], compress: bool) -> (Vec<u32>, [[f32; 3]; 2]) {
     let mut ops: Vec<(u8, Vec<u32>)> = Vec::with_capacity(tris.len() * 6 + 2);
     ops.push((FIFO_BEGIN, vec![GL_TRIANGLES]));
     for tri in tris {
-        for (pos, nor) in &tri.verts {
+        for v in tri {
+            let pos = v.pos;
             for k in 0..3 {
                 min[k] = min[k].min(pos[k]);
                 max[k] = max[k].max(pos[k]);
             }
-            let n = normalize(*nor);
+            let n = normalize(v.normal);
             ops.push((FIFO_NORMAL, vec![normal_pack(n[0], n[1], n[2])]));
             if compress {
                 ops.push((FIFO_VERTEX10, vec![vertex10(pos[0], pos[1], pos[2])]));
@@ -445,7 +358,7 @@ mod tests {
     /// a command word with their args interleaved, and a correct length header.
     #[test]
     fn single_triangle_display_list_layout() {
-        let tris = parse_obj("v 0 0 0\nv 1 0 0\nv 0 1 0\nvn 0 0 1\nf 1//1 2//1 3//1\n").unwrap();
+        let tris = legacy_triangles("v 0 0 0\nv 1 0 0\nv 0 1 0\nvn 0 0 1\nf 1//1 2//1 3//1\n").unwrap();
         assert_eq!(tris.len(), 1);
 
         let (words, _aabb) = display_list(&tris, false);
@@ -491,7 +404,7 @@ mod tests {
     /// Quad faces are fan-triangulated into two triangles.
     #[test]
     fn quads_are_fan_triangulated() {
-        let tris = parse_obj("v 0 0 0\nv 1 0 0\nv 1 1 0\nv 0 1 0\nf 1 2 3 4\n").unwrap();
+        let tris = legacy_triangles("v 0 0 0\nv 1 0 0\nv 1 1 0\nv 0 1 0\nf 1 2 3 4\n").unwrap();
         assert_eq!(tris.len(), 2);
     }
 
@@ -544,5 +457,57 @@ mod tests {
         // One triangle = 3 vertices; compression saves one word per vertex.
         assert_eq!(plain.words.len() - packed.words.len(), 3);
         assert_eq!(plain.aabb, packed.aabb);
+    }
+
+    /// FNV-1a-64 over the display-list words (LE) then the AABB's f32 bits —
+    /// a compact fingerprint of everything the legacy encoder emits.
+    fn fnv(words: &[u32], aabb: &[[f32; 3]; 2]) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut eat = |b: u8| {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        };
+        for w in words {
+            for b in w.to_le_bytes() {
+                eat(b);
+            }
+        }
+        for v in aabb.iter().flatten() {
+            for b in v.to_bits().to_le_bytes() {
+                eat(b);
+            }
+        }
+        h
+    }
+
+    /// The #66 refactor (OBJ parsing moved onto the shared IR) must not change a
+    /// single byte of the legacy `.dl` / `include_obj!` output. Values captured
+    /// from the pre-refactor encoder on 2026-10-07.
+    #[test]
+    fn legacy_encoder_is_byte_identical_on_committed_assets() {
+        let cases: [(&str, bool, usize, u64); 8] = [
+            ("cube", false, 129, 0xA090_E6ED_B4C1_E052),
+            ("cube", true, 129, 0xA090_E6ED_B4C1_E052),
+            ("teapot", false, 5799, 0x704A_BDB1_6985_73AD),
+            ("teapot", true, 5799, 0xECF3_5A54_0E95_6C3C),
+            ("prim_ramp", false, 87, 0xAAF6_5470_1B0A_B47E),
+            ("prim_ramp", true, 87, 0xAAF6_5470_1B0A_B47E),
+            ("prim_cylinder", false, 507, 0x06EB_AC94_A57B_1947),
+            ("prim_cylinder", true, 507, 0x06EB_AC94_A57B_1947),
+        ];
+        for (name, center, len, hash) in cases {
+            let path = format!("{}/../../assets/{name}.obj", env!("CARGO_MANIFEST_DIR"));
+            let src = std::fs::read_to_string(&path).unwrap();
+            let m = obj_to_display_list(
+                &src,
+                &Options {
+                    center,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(m.words.len(), len, "{name} center={center}");
+            assert_eq!(fnv(&m.words, &m.aabb), hash, "{name} center={center}");
+        }
     }
 }
