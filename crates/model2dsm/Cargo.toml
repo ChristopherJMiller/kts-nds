@@ -11,6 +11,10 @@ description = "Bakes OBJ+MTL and glTF models (with PNG textures) into DS model (
 [lib]
 path = "src/lib.rs"
 
+[[bin]]
+name = "model2dsm"
+path = "src/main.rs"
+
 [dependencies]
 bevy_nds_3d_obj = { path = "../bevy_nds_3d_obj" }
 png = "0.18"
