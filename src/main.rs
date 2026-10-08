@@ -164,7 +164,12 @@ const RADIAL_HOVER_POP: f32 = 8.0; // extra px the hovered spoke pops outward
 // --- Loop draw (Spike B) -----------------------------------------------------
 
 const MIN_SPACING: f32 = 4.0;
-const MAX_POINTS: usize = 80;
+/// Stroke-buffer cap. Raised from 80 by the shape matrix (#29): a square drawn
+/// around a ~8 px blip needs noticeably more path than a circle of the same
+/// reach, and overflowing the buffer silently prevents closure. At
+/// [`MIN_SPACING`] that is ~512 px of travel. The `Vec::remove(0)` head-drop at
+/// the cap stays O(n) — a `VecDeque` is the cheap follow-up if it ever shows.
+const MAX_POINTS: usize = 128;
 const CLOSE_TOL: f32 = 2.0;
 
 /// Painted-stroke glow brush (#35), in **canvas** pixels (½ touch-res). A small
@@ -448,8 +453,40 @@ struct EnemyFire {
     cd: u8,
 }
 
+/// The stylus stroke in flight: the raw touch-screen points (`.0`), plus a latch
+/// saying **this pen-down already resolved as a closed loop** (`.1`).
+///
+/// The latch exists because a closure does *not* end the pen-down: `draw_capture`
+/// empties the point buffer when a loop resolves and the player, still holding
+/// the stylus, immediately starts refilling it with the overshoot tail. Without
+/// the latch that tail is re-read as a slash on release — which awards a Line to
+/// a Shielded enemy the player never aimed at, and clobbers [`capture::LastShape`]
+/// (the #29 playtest readout) for exactly the square gesture it is meant to
+/// measure. One stroke resolves once.
 #[derive(Resource, Default)]
-struct Stroke(Vec<FxVec2>);
+struct Stroke(Vec<FxVec2>, bool);
+
+impl Stroke {
+    /// Abort the stroke entirely — points *and* latch. Every cancel path (stow,
+    /// radial wheel, space transition, taking damage) goes through this: leaving
+    /// the latch set would make the *next* stroke's pen-up skip its slash.
+    fn clear(&mut self) {
+        self.0.clear();
+        self.1 = false;
+    }
+
+    /// A closure resolved: drop the points but remember that this pen-down is
+    /// spent, so the tail drawn before release cannot resolve a second time.
+    fn spend_closure(&mut self) {
+        self.0.clear();
+        self.1 = true;
+    }
+
+    /// Has a closure already resolved during this pen-down?
+    fn closure_spent(&self) -> bool {
+        self.1
+    }
+}
 
 /// The player's top-down camera toggle (cluster ▲, [`control::Action::CamTopDown`]).
 /// The *base* framing is now authored per-space (the loaded space's
@@ -627,6 +664,12 @@ struct InfoHud;
 #[derive(Component)]
 struct TallyHud;
 
+/// The shape line (#29): which gesture the nearest unresolved enemy answers to,
+/// and what the last stroke was read as. Row 4 of the bottom console — rows 2/3
+/// are reserved for the items and tether work.
+#[derive(Component)]
+struct ShapeHud;
+
 #[unsafe(no_mangle)]
 pub extern "C" fn main() -> core::ffi::c_int {
     let mut app = App::new();
@@ -663,6 +706,7 @@ impl Plugin for SpikePlugin {
         .init_resource::<flags::LevelProgress>()
         .init_resource::<ZoneCaptureState>()
         .init_resource::<capture::CaptureTally>()
+        .init_resource::<capture::LastShape>()
         .init_resource::<radial::Radial>()
         .init_resource::<Health>()
         .init_resource::<GlowBuffer>()
@@ -715,11 +759,15 @@ impl Plugin for SpikePlugin {
                 (
                     sync_3d,
                     update_cursor,
+                    // The single writer of an enemy's blip (#29) — it picks the
+                    // image, `sync_map_markers` then places it.
+                    capture::update_enemy_tell,
                     sync_map_markers,
                     paint_stroke,
                     update_radial_overlay,
                     update_gate_barriers,
                     update_hud,
+                    update_shape_hud,
                 )
                     .chain(),
             )
@@ -858,6 +906,11 @@ fn setup(
     let b = DsScreen::Bottom;
     commands.spawn((b, TilePos::new(1, 0), InfoHud, DsText::new("")));
     commands.spawn((b, TilePos::new(1, 1), TallyHud, DsText::new("")));
+    // Shape line (#29). Row 4 because row 0 already peaks at 28 of 32 columns
+    // ("BREAKABLE 100%  dash=destroy") and rows 2/3 are reserved for the items
+    // and tether work.
+    // EXIT-ITEM SEAM: blank this row with the other HUD rows when `!in_world`.
+    commands.spawn((b, TilePos::new(1, 4), ShapeHud, DsText::new("")));
     commands.spawn((
         b,
         TilePos::new(1, 22),
@@ -1158,7 +1211,7 @@ fn patrol_enemy(
 /// stroke. Shared by body contact and projectile hits.
 fn knock_device_offline(state: &mut PlayerState, stroke: &mut Stroke) {
     *state = PlayerState::Stowed;
-    stroke.0.clear();
+    stroke.clear();
 }
 
 // --- Camera director (#23 / #27) ---------------------------------------------
@@ -1768,6 +1821,66 @@ fn update_hud(
                         "stowed "
                     };
                     let _ = write!(text.0, "{label}  capture {pct:>3}%");
+                }
+            }
+        }
+    }
+}
+
+/// The shape line (#29): what the nearest unresolved enemy wants, and what the
+/// last stroke was read as.
+///
+/// `need A  drew O q78` — the required glyph of the **nearest** enemy (so the
+/// line tracks the one you are actually working on, not an arbitrary query
+/// order), then, for [`capture::LAST_SHAPE_TTL`] frames, the shape the last
+/// resolved stroke classified as plus its 0-99 quality. `drew ?` means the
+/// stroke closed but was not a shape (below the scribble floor).
+///
+/// Quality is **shown, not spent** — whether it should scale capture progress is
+/// still open on #29 / #32, and this readout is the instrumentation that
+/// playtest verdict needs. Blank while stowed. Stays inside 20 columns.
+fn update_shape_hud(
+    pstate: Res<PlayerState>,
+    last: Res<capture::LastShape>,
+    avatar: Query<&WorldPos, With<Avatar>>,
+    enemies: Query<(&WorldPos, &capture::VulnerabilityShape, &capture::Capture)>,
+    mut hud: Query<&mut DsText, With<ShapeHud>>,
+) {
+    for mut text in &mut hud {
+        // Reuse the String's capacity — no per-frame allocation.
+        text.0.clear();
+        if !pstate.is_deployed() {
+            continue;
+        }
+        // Nearest unresolved enemy, by *squared* distance in raw fixed-point:
+        // no sqrt, and the ordering is identical.
+        if let Some(a) = avatar.iter().next().map(|w| w.0) {
+            let mut best: Option<(i64, char)> = None;
+            for (pos, shape, cap) in &enemies {
+                if cap.is_resolved() {
+                    continue;
+                }
+                let d = pos.0 - a;
+                let (dx, dy) = (d.x.raw() as i64, d.y.raw() as i64);
+                let d2 = dx * dx + dy * dy;
+                if best.is_none_or(|(b, _)| d2 < b) {
+                    best = Some((d2, shape.glyph()));
+                }
+            }
+            if let Some((_, glyph)) = best {
+                let _ = write!(text.0, "need {glyph}");
+            }
+        }
+        if last.ttl > 0 {
+            match last.drawn {
+                // `raw * 100 >> 12` is the 0..=1 fixed-point quality as a
+                // percent, in integer arithmetic (no soft-float on the HUD).
+                Some(shape) => {
+                    let q = (last.quality.raw() * 100) >> 12;
+                    let _ = write!(text.0, "  drew {} q{:>2}", capture::shape_glyph(shape), q);
+                }
+                None => {
+                    let _ = write!(text.0, "  drew ?");
                 }
             }
         }

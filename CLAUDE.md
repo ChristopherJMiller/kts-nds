@@ -194,6 +194,18 @@ they don't need (e.g. drop `bevy_nds_text` for a sprite-only game).
 - **`crates/bevy_nds_3d_macros`** — `include_obj!` proc-macro that bakes a
   display list into the ARM9 binary at compile time.
 - **`crates/bevy_nds_3d_cull`** — pure, host-testable view-frustum math.
+- **`crates/bevy_nds_loop`** — pure capture-loop geometry (smoothing,
+  self-intersection closure, point-in-polygon enclosure, quality metrics) plus
+  the `LoopPlugin` touch-stream buffer. Its **`shape` module** is the stroke
+  classifier behind the #29 matrix: `classify_loop` (closed stroke → circle /
+  triangle / square + a 0..=1 quality, via a 24-point arc-length resample,
+  gap-centred turning-angle corner counting **and a `regularity` ceiling per
+  shape** — the corner count alone reads an ordinary lumpy hand loop at capture
+  scale as a triangle/square, so compactness is the cross-check and circle-class
+  is always the fallthrough), `classify_open` (open stroke →
+  straight slash) and `crosses_circle` (the through-cut test). Game-agnostic —
+  it knows nothing of enemy kinds — and all fixed-point, called once per closure
+  or pen-up, never per frame. The policy that consumes it is `src/capture.rs`.
 - **`crates/bevy_nds_collide`** — pure fixed-point **static blocking geometry**
   (#12): yawed boxes, ramps and round columns, a `Body` (radius/height/step),
   sub-stepped `resolve_move` push-out, `ground_height` support lookup and
@@ -233,6 +245,12 @@ they don't need (e.g. drop `bevy_nds_text` for a sprite-only game).
   basic/shielded/advanced/heavy, `BlockKind` = box/ramp/round), `Consumption`
   (Gameplay vs Scenery — `Role::Block` was promoted to Gameplay by the collide
   item, so `prop` is the only Scenery role left),
+  `CaptureShape` + `EnemyKind::required_shape()` (**the #29 shape-vulnerability
+  matrix, declared once** — Basic→Circle, Shielded→Line, Advanced→Triangle,
+  Heavy→Square, guarded by a bijection test) + `accepts(required, drawn)` (exact
+  match, no hierarchy; the single site a hierarchy or overcharge would change)
+  — both **the matrix as currently coded (#29 — pending design-sync)**, not yet
+  written to the issue's `## Locked` section,
   the instance-`flag_bits` (`OBJECTIVE`/`LEVEL_OBJECTIVE`, **frozen**) and the
   reserved runtime `flag_ids` (`LEVEL_EXIT`, `RESERVED_MIN`). `no_std`, **zero
   dependencies**, fully host-tested. Shared by `kts`, by `scene2bin` (which
@@ -292,6 +310,11 @@ they don't need (e.g. drop `bevy_nds_text` for a sprite-only game).
   scenery. `src/collide.rs` is the one place an authored instance becomes a
   `bevy_nds_collide::Collider` — solid roles (`landmark`, `block`) are harvested
   at **both** residencies, so geometry is solid across a zone seam.
+  `src/capture.rs` holds the shape-matrix **policy** (geometry lives in
+  `bevy_nds_loop::shape`, the table in `kts_schema`), and its
+  `update_enemy_tell` is the **single writer** of an enemy's map blip via the
+  per-enemy `Tell` component — later feedback (items' afflictions) extends
+  `Tell` and that system's precedence instead of adding a second writer.
 
 New game logic belongs in the root crate; new hardware capability gets its own
 crate (see "Adding a capability" below).
@@ -342,6 +365,7 @@ starting in its own crate.
 | Writable FAT/SD storage  | `SaveStorage` resource (blocking + async slot I/O) + `StorageStatus` | `bevy_nds_save::SavePlugin`              |
 | 2D background layers (BG) | `Backgrounds` resource (`set_tile` / `set_bitmap` / `set_tile_scroll`) | `bevy_nds_bg::BackgroundPlugin` |
 | Static blocking geometry | `Colliders` resource + `Collider` (box/ramp/round, avatar-only) | `bevy_nds_collide` (pure; depended on directly) |
+| Stylus stroke → shape    | `classify_loop` (circle/triangle/square + quality), `classify_open` (line), `crosses_circle` (through-cut) | `bevy_nds_loop::shape` (pure; depended on directly) |
 
 `DsPlugins` (in `bevy_nds`) bundles the platform-layer plugins;
 `bevy_nds::run(app)` (re-export from `bevy_nds_runtime`) installs the runner

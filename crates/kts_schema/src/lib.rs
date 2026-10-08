@@ -47,14 +47,32 @@
 //! two flag bits or a `.scene` VERSION bump — no wire change at all, since v4
 //! already carries a kind byte per instance.
 //!
+//! # The shape-vulnerability matrix
+//!
+//! Which stroke shape captures which enemy kind is **decided here, once**:
+//! [`EnemyKind::required_shape`] (#29, Locked 2026-09-18 — pending design-sync).
+//! It lives in this crate rather than in the game because the game, the baker
+//! and the editor canvas all draw on it, and a table restated three times drifts
+//! (the role strings already did). A bijection test guards it: four kinds, four
+//! distinct [`CaptureShape`]s.
+//!
+//! [`accepts`] is the matching **policy** — exact match only for Milestone 2, so
+//! a stronger shape does not also capture a weaker enemy. It is one `const fn`
+//! plus one 16-pair test, which is the whole cost of reversing the decision.
+//!
 //! # What is *not* decided here
 //!
-//! The kind → `VulnerabilityShape` pairing is **open on #29** and lives in the
-//! game (`src/capture.rs`'s `VulnerabilityShape::for_kind`), not in this crate.
-//! Today every kind is circle-vulnerable. The one load-bearing wire fact is that
-//! [`EnemyKind::Basic`]`.wire() == 0`: an instance that authors no `kind` bakes
-//! to `0` and specialises to exactly today's circle-vulnerable enemy, so v4 is
-//! behaviour-neutral for every existing level.
+//! The capture **geometry** is the game's: the footprint radius, the
+//! enclosure test and the through-cut test live in `src/capture.rs`
+//! (`VulnerabilityShape`, whose `for_kind` consults [`EnemyKind::required_shape`]
+//! for the required shape and nothing else). Still open on #29: a
+//! stronger-shape hierarchy (the [`accepts`] seam) and overcharge / overkill —
+//! [`accepts`] deliberately returns `bool`, not a multiplier.
+//!
+//! The one load-bearing wire fact is that [`EnemyKind::Basic`]`.wire() == 0`: an
+//! instance that authors no `kind` bakes to `0` and specialises to exactly
+//! today's circle-vulnerable enemy, so v4 is behaviour-neutral for every
+//! existing level.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -197,7 +215,8 @@ pub fn kind_name(role: Role, k: u8) -> Option<&'static str> {
     role.kinds().get(k as usize).copied()
 }
 
-/// The enemy sub-archetypes (#27 vocabulary; the shape pairing is open on #29).
+/// The enemy sub-archetypes (#27 vocabulary). Which stroke shape captures each
+/// is [`required_shape`](EnemyKind::required_shape) — the #29 matrix.
 ///
 /// The discriminants **are** the `.scene` wire bytes and must match
 /// `Role::Enemy.kinds()` position for position. `Basic == 0` is load-bearing: an
@@ -240,6 +259,97 @@ impl EnemyKind {
             EnemyKind::Heavy => "heavy",
         }
     }
+
+    /// **The shape-vulnerability matrix** (#29, Locked 2026-09-18 — pending
+    /// design-sync): the one stroke shape that captures this kind.
+    ///
+    /// Declared here, exactly once, so the game (`src/capture.rs`), the baker
+    /// and the editor canvas cannot drift. It is a **bijection** — four kinds
+    /// onto four distinct shapes — and a host test says so, because a matrix
+    /// that maps two kinds to one shape quietly deletes a gesture from the game.
+    ///
+    /// The *pairing* is what lives here; the *geometry* (footprint radius,
+    /// enclosure / through-cut tests) stays in the game.
+    pub const fn required_shape(self) -> CaptureShape {
+        match self {
+            EnemyKind::Basic => CaptureShape::Circle,
+            EnemyKind::Shielded => CaptureShape::Line,
+            EnemyKind::Advanced => CaptureShape::Triangle,
+            EnemyKind::Heavy => CaptureShape::Square,
+        }
+    }
+
+    /// Parse a RON / [`Role::kinds`] enemy spelling. The typed companion to
+    /// [`kind_from_str`]`(Role::Enemy, s)`, used by the editor canvas (which
+    /// holds kinds as authored strings) to reach [`required_shape`].
+    ///
+    /// [`required_shape`]: EnemyKind::required_shape
+    pub fn parse(s: &str) -> Option<EnemyKind> {
+        match kind_from_str(Role::Enemy, s) {
+            Some(w) => EnemyKind::from_wire(w),
+            None => None,
+        }
+    }
+}
+
+/// The stroke shapes the capture verb can be asked for (#29).
+///
+/// The pen draws one of these; [`EnemyKind::required_shape`] says which one an
+/// enemy answers to. How each is *recognised* from a touch path is the game's
+/// and `bevy_nds_loop::shape`'s business — this is only the vocabulary.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CaptureShape {
+    /// A closed loop that encloses the whole footprint — the original capture
+    /// gesture (#26), and what every enemy answered to before this matrix.
+    Circle,
+    /// An open, straight through-cut across the footprint, resolved on pen-up.
+    Line,
+    /// A closed loop with three corners.
+    Triangle,
+    /// A closed loop with four corners.
+    Square,
+}
+
+impl CaptureShape {
+    /// Every shape, in declaration order — the authoritative list for the
+    /// bijection test and for HUD / editor iteration.
+    pub const ALL: &'static [CaptureShape] = &[
+        CaptureShape::Circle,
+        CaptureShape::Line,
+        CaptureShape::Triangle,
+        CaptureShape::Square,
+    ];
+
+    /// The shape's stable lower-case name (HUD text, editor tooltips, logs).
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            CaptureShape::Circle => "circle",
+            CaptureShape::Line => "line",
+            CaptureShape::Triangle => "triangle",
+            CaptureShape::Square => "square",
+        }
+    }
+}
+
+/// Does a stroke drawn as `drawn` affect an enemy that requires `required`?
+///
+/// **Exact match only** (#29, Locked 2026-09-18 — pending design-sync): there is
+/// no strength hierarchy, so a Square does not also capture a Circle-vulnerable
+/// enemy. Any ordering collapses the matrix into "always draw the dominant
+/// shape" and turns the other three gestures into dead verbs.
+///
+/// This is **the single site** a hierarchy or an overcharge model would change:
+/// a hierarchy widens the match, and overcharge changes the return type from
+/// `bool` to something like `Option<Fx32>`. Both stay open on #29, so nothing
+/// else in the game may branch on shape equality.
+pub const fn accepts(required: CaptureShape, drawn: CaptureShape) -> bool {
+    matches!(
+        (required, drawn),
+        (CaptureShape::Circle, CaptureShape::Circle)
+            | (CaptureShape::Line, CaptureShape::Line)
+            | (CaptureShape::Triangle, CaptureShape::Triangle)
+            | (CaptureShape::Square, CaptureShape::Square)
+    )
 }
 
 /// The blocking shapes a [`Role::Block`] may take (#12).
@@ -453,6 +563,109 @@ mod tests {
         // An absent RON kind bakes to 0 and specialises to today's enemy.
         assert_eq!(EnemyKind::default(), EnemyKind::Basic);
         assert_eq!(Role::Enemy.kinds().len(), all.len());
+    }
+
+    /// **The #29 matrix must be a bijection.** Four kinds onto four *distinct*
+    /// shapes, and every [`CaptureShape`] hit exactly once — a matrix that maps
+    /// two kinds onto one shape silently deletes a gesture from the game, and
+    /// one that leaves a shape unused makes a drawable gesture a no-op.
+    #[test]
+    fn matrix_is_a_bijection() {
+        let kinds = [
+            EnemyKind::Basic,
+            EnemyKind::Shielded,
+            EnemyKind::Advanced,
+            EnemyKind::Heavy,
+        ];
+        assert_eq!(kinds.len(), CaptureShape::ALL.len());
+        assert_eq!(kinds.len(), Role::Enemy.kinds().len());
+
+        // The locked pairing, spelled out (#29, 2026-09-18).
+        assert_eq!(EnemyKind::Basic.required_shape(), CaptureShape::Circle);
+        assert_eq!(EnemyKind::Shielded.required_shape(), CaptureShape::Line);
+        assert_eq!(EnemyKind::Advanced.required_shape(), CaptureShape::Triangle);
+        assert_eq!(EnemyKind::Heavy.required_shape(), CaptureShape::Square);
+
+        // Injective: no two kinds share a shape.
+        for (i, a) in kinds.iter().enumerate() {
+            for b in &kinds[i + 1..] {
+                assert_ne!(
+                    a.required_shape(),
+                    b.required_shape(),
+                    "{a:?} and {b:?} share a shape"
+                );
+            }
+        }
+        // Surjective: every shape is required by exactly one kind.
+        for s in CaptureShape::ALL {
+            let hits = kinds.iter().filter(|k| k.required_shape() == *s).count();
+            assert_eq!(hits, 1, "{s:?} is required by {hits} kinds, want 1");
+        }
+    }
+
+    /// The executable form of the exact-match decision (#29): the 4 diagonal
+    /// pairs accept, all 12 off-diagonal pairs refuse. A hierarchy would turn
+    /// some of the 12 true — this test is what makes that a deliberate edit.
+    #[test]
+    fn accepts_is_exact_match() {
+        for req in CaptureShape::ALL {
+            for drawn in CaptureShape::ALL {
+                let want = req == drawn;
+                assert_eq!(
+                    accepts(*req, *drawn),
+                    want,
+                    "accepts({req:?}, {drawn:?}) should be {want}"
+                );
+            }
+        }
+        // …and the counts, so a rewrite that accidentally accepts everything
+        // (or nothing) fails loudly rather than on one pair.
+        let yes = CaptureShape::ALL
+            .iter()
+            .flat_map(|r| CaptureShape::ALL.iter().map(move |d| (r, d)))
+            .filter(|(r, d)| accepts(**r, **d))
+            .count();
+        assert_eq!(yes, 4, "exactly the diagonal");
+        assert_eq!(CaptureShape::ALL.len() * CaptureShape::ALL.len() - yes, 12);
+    }
+
+    /// `EnemyKind::parse` is the editor's door into the matrix: it must agree
+    /// with `Role::Enemy.kinds()` for every kind and reject anything else.
+    #[test]
+    fn enemy_kind_parse_round_trips() {
+        for k in [
+            EnemyKind::Basic,
+            EnemyKind::Shielded,
+            EnemyKind::Advanced,
+            EnemyKind::Heavy,
+        ] {
+            assert_eq!(EnemyKind::parse(k.as_str()), Some(k), "{k:?}");
+        }
+        for name in Role::Enemy.kinds() {
+            let k = EnemyKind::parse(name).unwrap_or_else(|| panic!("{name} parses"));
+            assert_eq!(k.as_str(), *name);
+        }
+        // Unknown / wrong-role / mis-cased spellings are None, never a default.
+        for bad in ["wedge", "Basic", "", "box", "ramp", " heavy"] {
+            assert_eq!(EnemyKind::parse(bad), None, "{bad} should not parse");
+        }
+    }
+
+    /// The shape names are HUD- and log-facing, so they are a stable contract:
+    /// lower-case, unique, and matching the enum order.
+    #[test]
+    fn capture_shape_names_are_stable() {
+        assert_eq!(CaptureShape::Circle.as_str(), "circle");
+        assert_eq!(CaptureShape::Line.as_str(), "line");
+        assert_eq!(CaptureShape::Triangle.as_str(), "triangle");
+        assert_eq!(CaptureShape::Square.as_str(), "square");
+        for (i, s) in CaptureShape::ALL.iter().enumerate() {
+            assert!(!s.as_str().is_empty());
+            assert_eq!(s.as_str(), s.as_str().to_lowercase());
+            for other in &CaptureShape::ALL[i + 1..] {
+                assert_ne!(s.as_str(), other.as_str());
+            }
+        }
     }
 
     #[test]

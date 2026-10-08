@@ -22,6 +22,19 @@ Zone(instances: [
     // patroller above), it contributes to the *level* objective / exit (#27 tier
     // 2). Demonstrates "not all encounters gate."
     Use(name: "patroller", pos: (-1.5, 0.0, -1.3), flags: Some(2), path: [(-1.5, -1.3), (-0.7, -1.3)]),
+    // --- Mixed encounter (#29 shape matrix; #27 "encounter composition") -----
+    // Both FREEFORM (no `flags`): they don't gate the atrium and don't roll up
+    // to the level exit, so the level-exit condition and the Basic regression
+    // baseline above are exactly unchanged. They are here to force adaptation —
+    // a loop that captures the patrollers does nothing to either of these.
+    //
+    // The SHIELDED slab answers only to a straight slash through it, paced along
+    // the south edge, clear of both patrol routes and of the north-east block
+    // geometry (x 0.65..1.65, z 0.7..1.8).
+    Use(name: "shielded", pos: (1.5, 0.0, -1.6), path: [(1.5, -1.6), (0.5, -1.6)]),
+    // The ADVANCED wedge answers only to a drawn triangle, pacing the west edge
+    // well clear of the east gate band.
+    Use(name: "advanced", pos: (-1.7, 0.0, 0.6), path: [(-1.7, 0.6), (-1.7, 1.6)]),
     // Two grey landmarks for sightlines / cover; the second is turned a touch.
     Use(name: "landmark_block", pos: (-1.25, 0.0, 0.95)),
     Use(name: "landmark_block", pos: (1.25, 0.0, -0.95), rot: Some((0.0, 0.3, 0.0))),

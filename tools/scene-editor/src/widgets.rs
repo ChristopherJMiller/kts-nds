@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use bevy_nds_3d_obj::PreviewMesh;
 use eframe::egui;
 use egui::{Color32, Pos2, Sense, Stroke, Vec2};
-use scene2bin::schema::Role;
+use scene2bin::schema::{EnemyKind, Role};
 use scene2bin::{Camera, Instance, Level, Material, Placement, Prefab, PrefabLib};
 
 /// A sensible starting prefab for the in-editor prefab editor (#51).
@@ -258,6 +258,18 @@ pub(crate) fn diamond(c: Pos2, r: f32) -> Vec<Pos2> {
     ]
 }
 
+/// An upward-pointing equilateral-ish triangle of circumradius `r` about `c` —
+/// the canvas glyph for a triangle-vulnerable enemy (#29).
+pub(crate) fn triangle(c: Pos2, r: f32) -> Vec<Pos2> {
+    // 0.866 = sin 60°, 0.5 = cos 60°: the two base corners of a regular
+    // triangle with its apex straight up.
+    vec![
+        Pos2::new(c.x, c.y - r),
+        Pos2::new(c.x + r * 0.866, c.y + r * 0.5),
+        Pos2::new(c.x - r * 0.866, c.y + r * 0.5),
+    ]
+}
+
 pub(crate) fn drag_row<N: egui::emath::Numeric>(
     ui: &mut egui::Ui,
     label: &str,
@@ -424,6 +436,24 @@ pub(crate) fn placement_role(p: &Placement, prefabs: &PrefabLib) -> String {
             .map(|pf| pf.role.clone())
             .unwrap_or_else(|| format!("?{name}")),
     }
+}
+
+/// A placement's effective **enemy kind**, the typed twin of [`placement_role`]:
+/// a literal's own `kind`, or the prefab's for a `Use`. `None` when the kind is
+/// absent, unparseable, or the prefab is missing — the canvas then falls back to
+/// its neutral glyph rather than guessing at a shape.
+///
+/// This is the editor's only door into the #29 matrix: `placement_kind(..)
+/// .map(EnemyKind::required_shape)` is how the canvas learns what to draw, so
+/// the table stays declared once in `kts_schema`.
+pub(crate) fn placement_kind(p: &Placement, prefabs: &PrefabLib) -> Option<EnemyKind> {
+    let kind = match p {
+        Placement::Lit(i) => i.kind.as_deref(),
+        // Kind is prefab-owned, exactly like `role` — a `Use` places a body, it
+        // never re-kinds one.
+        Placement::Use { name, .. } => prefabs.get(name).and_then(|pf| pf.kind.as_deref()),
+    };
+    kind.and_then(EnemyKind::parse)
 }
 
 /// A placement's one-line label for the instance list.
@@ -604,5 +634,84 @@ mod tests {
         let f = footprint(&r, Some(&unit)).unwrap();
         assert!(inside_footprint(&f, Vec2::new(0.7, 0.7)));
         assert!(!inside_footprint(&f, Vec2::new(0.8, 0.8)));
+    }
+
+    /// The canvas draws an enemy as the gesture that captures it (#29), which
+    /// only works if a `Use` resolves its kind through the prefab library the
+    /// way it resolves its role. An unknown prefab or an unparseable kind must
+    /// be `None` (the neutral diamond), never a silently-wrong shape.
+    #[test]
+    fn placement_kind_resolves_through_prefab_and_is_none_for_unknown() {
+        let mut prefabs = PrefabLib::new();
+        let mut heavy = default_prefab();
+        heavy.role = Role::Enemy.as_str().to_string();
+        heavy.kind = Some("heavy".to_string());
+        prefabs.insert("heavy".to_string(), heavy);
+        let mut kindless = default_prefab();
+        kindless.role = Role::Enemy.as_str().to_string();
+        kindless.kind = None;
+        prefabs.insert("plain".to_string(), kindless);
+        let mut bogus = default_prefab();
+        bogus.role = Role::Enemy.as_str().to_string();
+        bogus.kind = Some("wedge".to_string());
+        prefabs.insert("bogus".to_string(), bogus);
+
+        let use_of = |name: &str| Placement::Use {
+            name: name.to_string(),
+            pos: [0.0, 0.0, 0.0],
+            rot: None,
+            scale: None,
+            material: None,
+            flags: None,
+            path: Vec::new(),
+        };
+        assert_eq!(
+            placement_kind(&use_of("heavy"), &prefabs),
+            Some(EnemyKind::Heavy)
+        );
+        // No kind authored, an unknown kind spelling, and a missing prefab are
+        // all "don't know" — the canvas keeps its neutral glyph.
+        assert_eq!(placement_kind(&use_of("plain"), &prefabs), None);
+        assert_eq!(placement_kind(&use_of("bogus"), &prefabs), None);
+        assert_eq!(placement_kind(&use_of("nope"), &prefabs), None);
+
+        // A literal carries its own kind.
+        let mut lit = new_instance(Vec2::ZERO);
+        lit.role = Role::Enemy.as_str().to_string();
+        lit.kind = Some("advanced".to_string());
+        assert_eq!(
+            placement_kind(&Placement::Lit(lit.clone()), &prefabs),
+            Some(EnemyKind::Advanced)
+        );
+        lit.kind = None;
+        assert_eq!(placement_kind(&Placement::Lit(lit), &prefabs), None);
+    }
+
+    /// Pins the editor to the shared vocabulary: every spelling `Role::Enemy`
+    /// offers in its kind picker must parse and have a required shape, so a new
+    /// enemy kind cannot land in `kts_schema` without the canvas gaining a
+    /// glyph for it.
+    #[test]
+    fn every_enemy_kind_has_a_canvas_glyph() {
+        assert!(!Role::Enemy.kinds().is_empty());
+        for name in Role::Enemy.kinds() {
+            let kind = EnemyKind::parse(name)
+                .unwrap_or_else(|| panic!("`{name}` is offered but does not parse"));
+            // `required_shape` is total, so reaching it is the assertion; the
+            // canvas match on `CaptureShape` is exhaustive by construction.
+            let shape = kind.required_shape();
+            assert!(!shape.as_str().is_empty(), "{name} -> {shape:?}");
+        }
+        // …and the picker's list is exactly the typed set, in order.
+        let spelled: Vec<&str> = [
+            EnemyKind::Basic,
+            EnemyKind::Shielded,
+            EnemyKind::Advanced,
+            EnemyKind::Heavy,
+        ]
+        .iter()
+        .map(|k| k.as_str())
+        .collect();
+        assert_eq!(Role::Enemy.kinds(), spelled.as_slice());
     }
 }

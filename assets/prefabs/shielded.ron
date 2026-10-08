@@ -1,0 +1,16 @@
+// shielded — the LINE-vulnerable enemy (#29 matrix: Shielded → Line).
+//
+// The body IS the tell (#27's 2026-06-09 shape-based-not-colour-only lock): a
+// wide, thin slab reads as a linear shield you have to *cut across*, not
+// encircle. Slash it on pen-up — a closed loop around it scores nothing and
+// flashes its blip instead. Colour (cold cyan) only reinforces the silhouette.
+//
+// Gray-box art from an existing primitive: distinct modelled bodies per kind
+// stay deferred (#26).
+Prefab(
+    mesh: Some("cube"),
+    role: "enemy",
+    kind: Some("shielded"),
+    scale: (0.30, 0.17, 0.055),
+    material: Some((diffuse: (90, 170, 190), ambient: (22, 42, 48))),
+)

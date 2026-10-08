@@ -1,0 +1,18 @@
+// heavy — the SQUARE-vulnerable enemy (#29 matrix: Heavy → Square).
+//
+// The body IS the tell (#27's 2026-06-09 shape-based-not-colour-only lock): a
+// squat, axis-aligned block with a square footprint — the slowest gesture in
+// the matrix drawn around the bluntest silhouette. `rot` is deliberately zero
+// so the footprint stays square-on to the camera. Colour (amber) only
+// reinforces it.
+//
+// Gray-box art from an existing primitive: distinct modelled bodies per kind
+// stay deferred (#26).
+Prefab(
+    mesh: Some("cube"),
+    role: "enemy",
+    kind: Some("heavy"),
+    rot: (0.0, 0.0, 0.0),
+    scale: (0.26, 0.22, 0.26),
+    material: Some((diffuse: (200, 150, 60), ambient: (48, 36, 16))),
+)

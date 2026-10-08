@@ -185,17 +185,26 @@ pub(crate) fn attach(
                 a.local[1],
                 local_pos.1 + ctx.offset.1,
             );
+            // The kind→shape pairing is the #29 matrix, declared once in
+            // `kts_schema::EnemyKind::required_shape`; `for_kind` is the one
+            // site that reads it. An unknown wire byte (a blob from a newer
+            // build) falls back to `Basic`, i.e. circle-vulnerable.
+            let shape =
+                VulnerabilityShape::for_kind(EnemyKind::from_wire(a.kind).unwrap_or_default());
             ec.insert((
                 enemy,
                 cap,
-                // The kind→shape pairing is open on #29; `for_kind` is the one
-                // site that answers it (circle for every kind today).
-                VulnerabilityShape::for_kind(EnemyKind::from_wire(a.kind).unwrap_or_default()),
+                shape,
+                // Per-enemy feedback state; `capture::update_enemy_tell` is the
+                // single writer of the blip below (#29).
+                capture::Tell::default(),
                 WorldPos(FxVec2::from_f32(world.x, world.z)),
                 // Outlined + cel-shaded so the threat reads at a glance;
                 // terrain stays smooth (see `Stylized`).
                 Stylized,
-                Sprite::new(sprites::BLIP).at(0, PARK_Y),
+                // The blip advertises which gesture this machine answers to —
+                // the shape-based (not colour-only) tell #27 locked.
+                Sprite::new(shape.blip()).at(0, PARK_Y),
                 member,
                 // Correct the render transform now (not next frame via
                 // `sync_3d`): a restored enemy's crate-spawned transform sits at

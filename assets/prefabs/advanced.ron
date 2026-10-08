@@ -1,0 +1,18 @@
+// advanced — the TRIANGLE-vulnerable enemy (#29 matrix: Advanced → Triangle).
+//
+// The body IS the tell (#27's 2026-06-09 shape-based-not-colour-only lock): the
+// committed `prim_ramp` wedge, whose triangular faces sit at its local ±X. The
+// 90° yaw turns those faces toward the ±Z Follow / Capture camera, so what you
+// see from the playing angle is the triangle you have to draw. Colour (violet)
+// only reinforces it.
+//
+// Reuses the gray-box primitive the collide item already ships and bake-tests —
+// no new mesh. Distinct modelled bodies per kind stay deferred (#26).
+Prefab(
+    mesh: Some("prim_ramp"),
+    role: "enemy",
+    kind: Some("advanced"),
+    rot: (0.0, 1.5708, 0.0),
+    scale: (0.20, 0.20, 0.20),
+    material: Some((diffuse: (170, 110, 220), ambient: (40, 26, 52))),
+)

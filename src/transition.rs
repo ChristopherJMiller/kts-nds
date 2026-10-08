@@ -335,7 +335,7 @@ fn swap_zone(
     colliders.0.clear();
     // EXIT-ITEM SEAM: a cross-level teardown must clear `Colliders` here too
     // (RunState reset bundle).
-    stroke.0.clear();
+    stroke.clear();
     device.hit_cd = 0;
 
     // Movement feel + walkable bounds follow the new zone.

@@ -5,11 +5,11 @@
 
 use eframe::egui;
 use egui::{Align2, Color32, FontId, Pos2, Rect, Sense, Shape, Stroke, Vec2};
-use scene2bin::schema::Role;
+use scene2bin::schema::{CaptureShape, Role};
 use scene2bin::{Placement, Zone};
 
 use crate::app::{Drag, EditorApp, Sel};
-use crate::widgets::{diamond, footprint, placement_role, role_style};
+use crate::widgets::{diamond, footprint, placement_kind, placement_role, role_style, triangle};
 
 /// A placement's Y rotation (a `Use`'s `None` override reads as 0).
 fn placement_rot_y(pl: &Placement) -> f32 {
@@ -337,12 +337,46 @@ impl EditorApp {
             } else {
                 Stroke::new(1.0_f32, Color32::from_black_alpha(160))
             };
-            // Glyph by role: enemies read as diamonds, static geometry as rects,
-            // the avatar as a circle. An unparseable role falls through to a
-            // circle in the error tint (`role_style` already supplied it).
+            // Glyph by role: static geometry reads as rects and the avatar as a
+            // circle, while an **enemy draws the gesture that captures it**
+            // (#29) — circle / bar / triangle / square, straight off
+            // `EnemyKind::required_shape`, so encounter composition is legible
+            // on the canvas without reading every prefab. Colour still keys on
+            // role (`role_style`); the shape is the information. An enemy whose
+            // kind can't be resolved (unknown spelling, missing prefab) keeps
+            // the old neutral diamond, and an unparseable *role* falls through
+            // to a circle in the error tint.
             match Role::parse(&role) {
                 Some(Role::Enemy) => {
-                    painter.add(Shape::convex_polygon(diamond(sp, r), col, outline));
+                    match placement_kind(p, &self.prefabs).map(|k| k.required_shape()) {
+                        Some(CaptureShape::Circle) => {
+                            painter.circle(sp, r, col, outline);
+                        }
+                        Some(CaptureShape::Line) => {
+                            painter.rect(
+                                Rect::from_center_size(sp, Vec2::new(r * 2.2, r * 0.7)),
+                                0.0,
+                                col,
+                                outline,
+                                egui::StrokeKind::Inside,
+                            );
+                        }
+                        Some(CaptureShape::Triangle) => {
+                            painter.add(Shape::convex_polygon(triangle(sp, r), col, outline));
+                        }
+                        Some(CaptureShape::Square) => {
+                            painter.rect(
+                                Rect::from_center_size(sp, Vec2::splat(r * 1.6)),
+                                0.0,
+                                col,
+                                outline,
+                                egui::StrokeKind::Inside,
+                            );
+                        }
+                        None => {
+                            painter.add(Shape::convex_polygon(diamond(sp, r), col, outline));
+                        }
+                    }
                 }
                 Some(Role::Landmark | Role::Prop | Role::Block) => {
                     painter.rect(

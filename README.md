@@ -63,6 +63,13 @@ depend on individual subcrates directly and opt out of whatever they don't need
 - **`bevy_nds_3d_macros`** (`crates/bevy_nds_3d_macros`) — `include_obj!` proc-macro.
 - **`bevy_nds_3d_cull`** (`crates/bevy_nds_3d_cull`) — pure, host-testable
   view-frustum culling math.
+- **`bevy_nds_loop`** (`crates/bevy_nds_loop`) — pure, host-testable
+  capture-loop geometry: path smoothing, self-intersection loop closure,
+  point-in-polygon / enclosure tests, loop-quality metrics and the glowing
+  stroke rasterizer, plus a thin `LoopPlugin` that buffers the touch stream.
+  `shape.rs` classifies a finished stroke — a closed loop into circle /
+  triangle / square with a 0..=1 quality, an open one into a straight slash,
+  and `crosses_circle` for the through-cut. Game-agnostic and all fixed point.
 - **`bevy_nds_collide`** (`crates/bevy_nds_collide`) — pure, host-testable
   static blocking geometry: yawed boxes, ramps and round columns in 20.12
   fixed point, with a sub-stepped push-out, a support-height lookup and the
@@ -282,6 +289,8 @@ crates/bevy_nds_3d_obj/         host OBJ -> display-list encoder (shared packing
 crates/bevy_nds_3d_macros/      include_obj! proc-macro (bakes a model into the ROM)
 crates/bevy_nds_3d_cull/        pure, host-testable view-frustum culling math
 crates/bevy_nds_collide/        pure, host-testable static blocking geometry (boxes/ramps/columns)
+crates/bevy_nds_loop/           capture-loop geometry + LoopPlugin
+  src/shape.rs                    stroke classifier: loop -> circle/triangle/square, open -> line
 crates/bevy_nds_math/           20.12 fixed-point + hardware divide/sqrt wrappers (host-testable)
 crates/bevy_nds_cothread/       libnds cooperative threads as Tasks/Task<T> (non-blocking IO)
 crates/bevy_nds_audio/          maxmod audio backend (Music resource, PlaySfx events)
@@ -295,6 +304,7 @@ crates/png2bg/                  host CLI/lib: PNG -> .bg/.bbg NitroFS asset via 
 crates/bevy_nds_scene/          game-agnostic .scene loader (opaque role string + kind byte)
 crates/scene2bin/               host CLI/lib: assets/levels/<name>/ -> .scene blobs + validate_all
 crates/kts_schema/              the game's authored vocabulary: roles, role-scoped kinds, flag bits/ids
+                                + the shape-vulnerability matrix (EnemyKind::required_shape, accepts)
 tools/scene-editor/             desktop level editor (detached workspace; reads scene2bin's RON)
 src/spawn.rs                    the one authored-instance -> components dispatch (attach/skip_spawn)
 src/collide.rs                  Colliders resource + harvest: authored instance -> Collider

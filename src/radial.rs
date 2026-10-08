@@ -194,7 +194,7 @@ fn commit_shoulder(radial: &Radial, state: &mut PlayerState, stroke: &mut Stroke
     if radial.held_frames <= TAP_FRAMES {
         if *state != PlayerState::Stowed {
             *state = PlayerState::Stowed;
-            stroke.0.clear();
+            stroke.clear();
         }
         return;
     }
@@ -213,7 +213,7 @@ fn commit_spoke(spoke: Spoke, state: &mut PlayerState, stroke: &mut Stroke) {
             // "Throw it out" — ensure deployed. A fresh stroke starts clean.
             if *state != PlayerState::Deployed {
                 *state = PlayerState::Deployed;
-                stroke.0.clear();
+                stroke.clear();
             }
         }
         // Item spokes are a stubbed seam until the item economy (#30): no-op.
