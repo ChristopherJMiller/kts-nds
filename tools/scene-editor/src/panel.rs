@@ -502,7 +502,7 @@ impl EditorApp {
         }
         // The entry zone authors the level's single persistent avatar; every
         // other zone authors none (#27 / #54 — an amendment to #27's 2026-06-28
-        // "zones no longer author an avatar" line, pending design-sync).
+        // "zones no longer author an avatar" line, recorded 2026-09-18).
         if self.level.entry == stem {
             ui.label(
                 egui::RichText::new(

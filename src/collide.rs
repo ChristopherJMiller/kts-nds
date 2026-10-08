@@ -27,7 +27,7 @@
 //! a surprise at runtime; mirroring (a negative `scale.x`/`scale.z`) is handled
 //! here by taking the magnitude, since a mirrored box has the same footprint.
 //!
-//! Decisions here are recorded against #12 (pending design-sync).
+//! Decisions here are recorded on #12 (## Locked).
 
 use alloc::vec::Vec;
 

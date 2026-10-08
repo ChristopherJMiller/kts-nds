@@ -38,7 +38,7 @@ makes the creative calls.
    place them on a pacing curve (arena = tension peak, corridor = rest).
    Composition = picking prefabs — `patroller` (basic → circle loop),
    `shielded` (line → straight slash through it), `advanced` (triangle),
-   `heavy` (square), **as currently coded (#29 — pending design-sync)**. Kind is
+   `heavy` (square), **Locked on #29**. Kind is
    prefab-owned, so a mixed encounter is a mix of prefabs; mixing shapes is what
    forces adaptation (#29).
 5. **Wayfinding.** Landmarks / sightlines that *match the chosen camera framing*;

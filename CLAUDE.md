@@ -249,8 +249,7 @@ they don't need (e.g. drop `bevy_nds_text` for a sprite-only game).
   matrix, declared once** — Basic→Circle, Shielded→Line, Advanced→Triangle,
   Heavy→Square, guarded by a bijection test) + `accepts(required, drawn)` (exact
   match, no hierarchy; the single site a hierarchy or overcharge would change)
-  — both **the matrix as currently coded (#29 — pending design-sync)**, not yet
-  written to the issue's `## Locked` section,
+  — both **Locked on #29** (recorded 2026-10-07),
   the instance-`flag_bits` (`OBJECTIVE`/`LEVEL_OBJECTIVE`, **frozen**) and the
   reserved runtime `flag_ids` (`LEVEL_EXIT`, `RESERVED_MIN`). `no_std`, **zero
   dependencies**, fully host-tested. Shared by `kts`, by `scene2bin` (which

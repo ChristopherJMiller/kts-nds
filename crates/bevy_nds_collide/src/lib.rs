@@ -43,7 +43,7 @@
 //! zero. One [`surface`] function covers both, so the step / land / walk-up
 //! rules have a single implementation.
 //!
-//! # Scope (#12, 2026-09-18 — pending design-sync)
+//! # Scope (#12, Locked 2026-09-18)
 //!
 //! Avatar-only. Enemies and projectiles are not collided in this slice;
 //! [`blocks_point`] ships as the hook for that decision (does static geometry

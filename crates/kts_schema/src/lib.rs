@@ -50,7 +50,7 @@
 //! # The shape-vulnerability matrix
 //!
 //! Which stroke shape captures which enemy kind is **decided here, once**:
-//! [`EnemyKind::required_shape`] (#29, Locked 2026-09-18 — pending design-sync).
+//! [`EnemyKind::required_shape`] (#29, Locked 2026-09-18).
 //! It lives in this crate rather than in the game because the game, the baker
 //! and the editor canvas all draw on it, and a table restated three times drifts
 //! (the role strings already did). A bijection test guards it: four kinds, four
@@ -333,7 +333,7 @@ impl CaptureShape {
 
 /// Does a stroke drawn as `drawn` affect an enemy that requires `required`?
 ///
-/// **Exact match only** (#29, Locked 2026-09-18 — pending design-sync): there is
+/// **Exact match only** (#29, Locked 2026-09-18): there is
 /// no strength hierarchy, so a Square does not also capture a Circle-vulnerable
 /// enemy. Any ordering collapses the matrix into "always draw the dominant
 /// shape" and turns the other three gestures into dead verbs.

@@ -237,7 +237,7 @@ pub(crate) fn attach(
             }
         }
         Role::Landmark => {
-            // Solid at BOTH residencies (#12, pending design-sync): a landmark
+            // Solid at BOTH residencies (#12, Locked): a landmark
             // across a seam blocks where it is drawn, so you can't stand half
             // inside a neighbour's wall and wedge yourself on the crossing. The
             // `Residency::Active` collision guard this arm used to carry is gone.
