@@ -133,10 +133,16 @@ fn compile_models() {
     let src = manifest.join(ASSET_DIR).join(model2dsm::MODELS_SUBDIR);
     let dst = manifest.join(NITROFS_DIR).join(model2dsm::MODELS_SUBDIR);
 
-    println!("cargo:rerun-if-changed={}", src.display());
     if !src.is_dir() {
+        // `assets/models/` isn't tracked by git, so in a fresh checkout it's
+        // simply absent. Watching a path that doesn't exist makes Cargo treat
+        // it as perpetually stale, rerunning build.rs (and recompiling the
+        // game) on every invocation — so only watch it once we know it's
+        // there. `compile_assets` already watches `assets/` recursively, so a
+        // newly created `assets/models/` still triggers a rerun.
         return;
     }
+    println!("cargo:rerun-if-changed={}", src.display());
     match model2dsm::build_dir(&src, &dst) {
         Ok(built) => {
             for w in &built.warnings {
