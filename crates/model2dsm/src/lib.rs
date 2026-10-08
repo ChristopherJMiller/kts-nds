@@ -241,78 +241,127 @@ pub struct Built {
     pub warnings: Vec<String>,
 }
 
+/// One model, fully baked (geometry *and* texture-encoded) but not yet written
+/// to disk — the shared work between [`build_dir`] (which writes the files)
+/// and [`catalog::Catalog::scan`] (which discards the bytes but still forces
+/// every error `dsm::encode` can raise — a vertex outside the ±8 model-space
+/// range, a texcoord beyond ±2048 texels, a textured sub-mesh with no UVs —
+/// through the same gate as duplicate names and texture-path checks, #66).
+pub struct ModelBake {
+    pub tris: usize,
+    /// The encoded `.dsm` container bytes.
+    pub dsm_bytes: Vec<u8>,
+    /// Texture keys this model references, in its table order.
+    pub textures: Vec<String>,
+    /// `(key, source)` for each texture newly added to `cache` by this call —
+    /// i.e. not already baked by an earlier model sharing the image.
+    pub new_textures: Vec<(String, PathBuf)>,
+}
+
+/// Load, validate and encode one model (relative to `root`) into its `.dsm`
+/// bytes, encoding (and caching) each of its textures along the way. `cache`
+/// is shared across a whole directory bake so two models referencing one
+/// image encode it once. This is the single place that calls `dsm::encode`
+/// (and so the single place a geometry error — zero triangles, an
+/// out-of-range vertex/texcoord, a textured material with no UVs — can
+/// surface) so `build_dir` and `Catalog::scan` fail on exactly the same
+/// models.
+pub fn bake_model(
+    root: &Path,
+    rel: &Path,
+    cache: &mut BTreeMap<String, texture::DsTexture>,
+) -> Result<ModelBake, String> {
+    let input = root.join(rel);
+    let model = load_model(&input)?;
+    let tris = model.triangle_count();
+    if tris == 0 {
+        return Err(format!("{}: no triangles", input.display()));
+    }
+
+    let resolved =
+        resolve_textures(root, rel, &model).map_err(|e| format!("{}: {e}", input.display()))?;
+    let mut table_keys: Vec<String> = Vec::new();
+    let mut sub_tex: Vec<Option<usize>> = Vec::new();
+    let mut new_textures: Vec<(String, PathBuf)> = Vec::new();
+    for r in &resolved {
+        let Some(r) = r else {
+            sub_tex.push(None);
+            continue;
+        };
+        if !cache.contains_key(&r.key) {
+            let tex =
+                texture::encode_png(&r.png).map_err(|e| format!("{}: {e}", r.source.display()))?;
+            cache.insert(r.key.clone(), tex);
+            new_textures.push((r.key.clone(), r.source.clone()));
+        }
+        let slot = match table_keys.iter().position(|k| *k == r.key) {
+            Some(i) => i,
+            None => {
+                table_keys.push(r.key.clone());
+                table_keys.len() - 1
+            }
+        };
+        sub_tex.push(Some(slot));
+    }
+
+    let paths: Vec<String> = table_keys.iter().map(|k| nitro_tex_path(k)).collect();
+    let table: Vec<dsm::TexRef> = table_keys
+        .iter()
+        .zip(&paths)
+        .map(|(k, p)| dsm::TexRef {
+            nitro_path: p.as_str(),
+            width: cache[k].width,
+            height: cache[k].height,
+        })
+        .collect();
+    let dsm_bytes =
+        dsm::encode(&model, &table, &sub_tex).map_err(|e| format!("{}: {e}", input.display()))?;
+
+    Ok(ModelBake {
+        tris,
+        dsm_bytes,
+        textures: table_keys,
+        new_textures,
+    })
+}
+
 /// Bake every model under `root` into `<dst>/<rel>.dsm`, and every texture they
 /// use (once each) into `<dst>/<tex_out_rel(key)>`.
 pub fn build_dir(root: &Path, dst: &Path) -> Result<Built, String> {
     let mut built = Built::default();
-    let mut baked: BTreeMap<String, texture::DsTexture> = BTreeMap::new();
+    let mut cache: BTreeMap<String, texture::DsTexture> = BTreeMap::new();
     for (name, rel) in model_names(root)? {
         let input = root.join(&rel);
-        let model = load_model(&input)?;
-        let tris = model.triangle_count();
-        if tris == 0 {
-            return Err(format!("{}: no triangles", input.display()));
-        }
-        if tris > TRI_WARN {
+        let bake = bake_model(root, &rel, &mut cache)?;
+        if bake.tris > TRI_WARN {
             built.warnings.push(format!(
-                "{}: {tris} triangles — over the {TRI_WARN}-per-model guide (the DS draws ~2048 per frame for everything on screen)",
-                input.display()
+                "{}: {} triangles — over the {TRI_WARN}-per-model guide (the DS draws ~2048 per frame for everything on screen)",
+                input.display(),
+                bake.tris
             ));
         }
 
-        let resolved = resolve_textures(root, &rel, &model)
-            .map_err(|e| format!("{}: {e}", input.display()))?;
-        let mut table_keys: Vec<String> = Vec::new();
-        let mut sub_tex: Vec<Option<usize>> = Vec::new();
-        for r in &resolved {
-            let Some(r) = r else {
-                sub_tex.push(None);
-                continue;
-            };
-            if !baked.contains_key(&r.key) {
-                let tex = texture::encode_png(&r.png)
-                    .map_err(|e| format!("{}: {e}", r.source.display()))?;
-                let output = dst.join(tex_out_rel(&r.key));
-                write_file(&output, &tex.to_le_bytes())?;
-                built.textures.push(BuiltTexture {
-                    key: r.key.clone(),
-                    input: r.source.clone(),
-                    output,
-                    texel_bytes: tex.texel_bytes(),
-                    palette_bytes: tex.palette_bytes(),
-                });
-                baked.insert(r.key.clone(), tex);
-            }
-            let slot = match table_keys.iter().position(|k| *k == r.key) {
-                Some(i) => i,
-                None => {
-                    table_keys.push(r.key.clone());
-                    table_keys.len() - 1
-                }
-            };
-            sub_tex.push(Some(slot));
+        for (key, source) in &bake.new_textures {
+            let tex = &cache[key];
+            let output = dst.join(tex_out_rel(key));
+            write_file(&output, &tex.to_le_bytes())?;
+            built.textures.push(BuiltTexture {
+                key: key.clone(),
+                input: source.clone(),
+                output,
+                texel_bytes: tex.texel_bytes(),
+                palette_bytes: tex.palette_bytes(),
+            });
         }
 
-        let paths: Vec<String> = table_keys.iter().map(|k| nitro_tex_path(k)).collect();
-        let table: Vec<dsm::TexRef> = table_keys
-            .iter()
-            .zip(&paths)
-            .map(|(k, p)| dsm::TexRef {
-                nitro_path: p.as_str(),
-                width: baked[k].width,
-                height: baked[k].height,
-            })
-            .collect();
-        let bytes = dsm::encode(&model, &table, &sub_tex)
-            .map_err(|e| format!("{}: {e}", input.display()))?;
         let output = dst.join(rel.with_extension(MODEL_EXT));
-        write_file(&output, &bytes)?;
+        write_file(&output, &bake.dsm_bytes)?;
         built.models.push(BuiltModel {
             name,
             input,
             output,
-            tris,
-            textures: table_keys,
+            tris: bake.tris,
+            textures: bake.textures,
         });
     }
     Ok(built)

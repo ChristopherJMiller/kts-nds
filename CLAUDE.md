@@ -88,7 +88,10 @@ The `Justfile` is the entry point (`just --list` for everything):
 - `just check-levels` — parse + validate + derive every level under
   `assets/levels/` with a **non-zero exit** on any validation Error. `build.rs`
   can only `cargo:warning=` and then falls back to stale blobs, so this is the
-  gate that actually fails.
+  gate that actually fails. It also bakes every model under `assets/models/`
+  in memory (`Catalog::scan` → `model2dsm::bake_model`, #66 fix round 1), so a
+  model `build.rs` would fail to bake — bad geometry, not just a bad name or
+  texture path — fails this gate too.
 - `just fmt` — `cargo fmt`. `clippy` is installed but not wired to a task; run
   `cargo clippy` manually.
 - `just rom [profile]` — package the ELF into `kts.nds` with `ndstool`,

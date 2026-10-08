@@ -144,7 +144,7 @@ fn compile_models() {
             }
         }
         Err(e) => println!(
-            "cargo:warning=model baking FAILED — build/nitrofs/models holds STALE or MISSING blobs: {e}"
+            "cargo:warning=model baking FAILED — build/nitrofs/models holds STALE or MISSING blobs: {e} (run `just check-levels`)"
         ),
     }
 }

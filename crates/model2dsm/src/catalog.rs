@@ -5,9 +5,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::{
-    MODELS_SUBDIR, load_model, mesh_name, model_names, resolve_textures, texture, walk_models,
-};
+use crate::{MODELS_SUBDIR, bake_model, mesh_name, model_names, texture, walk_models};
 
 /// One texture's VRAM cost, keyed so an image shared by two models counts once.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -46,6 +44,15 @@ fn legacy_objs(assets_dir: &Path) -> Vec<(String, PathBuf)> {
 impl Catalog {
     /// Scan legacy `assets/*.obj` and every model under `assets/models/**`,
     /// measuring each model's textures. A name defined twice is an error.
+    ///
+    /// Each model is run through [`bake_model`] — the same load +
+    /// texture-resolve + `dsm::encode` path `build_dir` uses to write the
+    /// `.dsm`/`.tex` blobs — discarding the encoded bytes. That means `scan`
+    /// (and so `just check-levels`, which calls it) fails on exactly the
+    /// models a real bake would fail on: duplicate names and bad texture
+    /// paths, but also zero-triangle meshes and the geometry errors
+    /// `dsm::encode` raises (a vertex outside the DS ±8 model-space range, a
+    /// texcoord beyond ±2048 texels, a textured sub-mesh with no UVs, #66).
     pub fn scan(assets_dir: &Path) -> Result<Catalog, String> {
         let mut meshes: BTreeMap<String, MeshEntry> = BTreeMap::new();
         for (name, source) in legacy_objs(assets_dir) {
@@ -59,7 +66,7 @@ impl Catalog {
         }
 
         let root = assets_dir.join(MODELS_SUBDIR);
-        let mut sizes: BTreeMap<String, (u32, u32)> = BTreeMap::new();
+        let mut cache: BTreeMap<String, texture::DsTexture> = BTreeMap::new();
         for (name, rel) in model_names(&root)? {
             let source = root.join(&rel);
             if let Some(prev) = meshes.get(&name) {
@@ -69,30 +76,19 @@ impl Catalog {
                     source.display()
                 ));
             }
-            let model = load_model(&source)?;
-            let mut textures: Vec<TexUse> = Vec::new();
-            let resolved = resolve_textures(&root, &rel, &model)
-                .map_err(|e| format!("{}: {e}", source.display()))?;
-            for r in resolved.into_iter().flatten() {
-                if textures.iter().any(|t| t.key == r.key) {
-                    continue;
-                }
-                let (texel_bytes, palette_bytes) = match sizes.get(&r.key) {
-                    Some(&s) => s,
-                    None => {
-                        let t = texture::encode_png(&r.png)
-                            .map_err(|e| format!("{}: {e}", r.source.display()))?;
-                        let s = (t.texel_bytes(), t.palette_bytes());
-                        sizes.insert(r.key.clone(), s);
-                        s
+            let bake = bake_model(&root, &rel, &mut cache)?;
+            let textures: Vec<TexUse> = bake
+                .textures
+                .iter()
+                .map(|key| {
+                    let t = &cache[key];
+                    TexUse {
+                        key: key.clone(),
+                        texel_bytes: t.texel_bytes(),
+                        palette_bytes: t.palette_bytes(),
                     }
-                };
-                textures.push(TexUse {
-                    key: r.key,
-                    texel_bytes,
-                    palette_bytes,
-                });
-            }
+                })
+                .collect();
             meshes.insert(name, MeshEntry { source, textures });
         }
         Ok(Catalog { meshes })
@@ -212,5 +208,23 @@ mod tests {
     fn missing_assets_dir_is_empty() {
         let cat = Catalog::scan(Path::new("/nonexistent/kts-assets")).unwrap();
         assert!(cat.meshes.is_empty());
+    }
+
+    /// `scan` runs every model under `models/` through the same `dsm::encode`
+    /// path `build_dir` uses (#66 fix round 1) — a vertex outside the DS ±8
+    /// model-space range must fail `scan`, not just a real bake.
+    #[test]
+    fn out_of_range_vertex_is_an_error() {
+        let assets = temp_dir("badvert");
+        let models = assets.join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::write(
+            models.join("bad.obj"),
+            "v 9 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n",
+        )
+        .unwrap();
+
+        let err = Catalog::scan(&assets).unwrap_err();
+        assert!(err.contains("±8"), "{err}");
     }
 }
