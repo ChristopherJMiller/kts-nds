@@ -230,6 +230,7 @@ const FIFO_NOP: u8 = 0x00; // GFX_FIFO 0x04000400 — padding, no arguments
 const FIFO_NORMAL: u8 = 0x21; // GFX_NORMAL 0x04000484 — 1 argument
 const FIFO_VERTEX16: u8 = 0x23; // GFX_VERTEX16 0x0400048C — 2 arguments
 const FIFO_VERTEX10: u8 = 0x24; // GFX_VERTEX10 0x04000490 — 1 argument (compressed)
+const FIFO_TEX_COORD: u8 = 0x22; // GFX_TEX_COORD 0x04000488 — 1 argument
 const FIFO_BEGIN: u8 = 0x40; // GFX_BEGIN 0x04000500 — 1 argument (primitive type)
 const FIFO_END: u8 = 0x41; // GFX_END 0x04000504 — no arguments
 /// `GL_TRIANGLES` primitive selector for `GFX_BEGIN`.
@@ -274,6 +275,73 @@ fn display_list(tris: &[Triangle], compress: bool) -> (Vec<u32>, [[f32; 3]; 2]) 
     ops.push((FIFO_END, vec![]));
 
     (pack_display_list(&ops), [min, max])
+}
+
+/// Largest model-space coordinate a `VERTEX16` (4.12 fixed, `i16`) can hold;
+/// the smallest is −8.0.
+pub const VERTEX_LIMIT: f32 = 32767.0 / 4096.0;
+
+/// Encode **one sub-mesh** (one material) into a libnds display list (#66):
+/// `GFX_BEGIN(GL_TRIANGLES)`, then per vertex an optional `GFX_TEX_COORD`, a
+/// `GFX_NORMAL` and a `GFX_VERTEX16`, then `GFX_END`. With `tex_size = Some([w,
+/// h])` every vertex must carry a UV; it is emitted in **texels** (12.4 fixed),
+/// which is why the encoder needs the texture's size. Texture, material and
+/// polygon format are set by the renderer *before* calling the list, so the list
+/// never depends on where a texture lands in VRAM.
+///
+/// Unlike the legacy encoder this rejects geometry the hardware can't represent
+/// (outside ±8 units, or texcoords beyond ±2048 texels) instead of wrapping it.
+pub fn submesh_display_list(tris: &[Triangle], tex_size: Option<[u16; 2]>) -> Result<Vec<u32>, String> {
+    let mut ops: Vec<(u8, Vec<u32>)> = Vec::with_capacity(tris.len() * 9 + 2);
+    ops.push((FIFO_BEGIN, vec![GL_TRIANGLES]));
+    for (ti, tri) in tris.iter().enumerate() {
+        for v in tri {
+            check_range(v.pos).map_err(|e| format!("triangle {ti}: {e}"))?;
+            if let Some([w, h]) = tex_size {
+                let uv = v
+                    .uv
+                    .ok_or_else(|| format!("triangle {ti}: textured material but a vertex has no UV"))?;
+                let word = texcoord_pack(uv[0] * w as f32, uv[1] * h as f32)
+                    .map_err(|e| format!("triangle {ti}: {e}"))?;
+                ops.push((FIFO_TEX_COORD, vec![word]));
+            }
+            let n = normalize(v.normal);
+            ops.push((FIFO_NORMAL, vec![normal_pack(n[0], n[1], n[2])]));
+            let (xy, z) = vertex16(v.pos[0], v.pos[1], v.pos[2]);
+            ops.push((FIFO_VERTEX16, vec![xy, z]));
+        }
+    }
+    ops.push((FIFO_END, vec![]));
+    Ok(pack_display_list(&ops))
+}
+
+/// Reject a position the 4.12 `VERTEX16` format can't hold (authoring contract
+/// v1: a model fits within ±8 units of its origin).
+fn check_range(p: [f32; 3]) -> Result<(), String> {
+    for (k, c) in p.iter().enumerate() {
+        if !c.is_finite() || *c < -8.0 || *c > VERTEX_LIMIT {
+            return Err(format!(
+                "vertex {} = {c} is outside the DS ±8 model-space range (authoring contract v1, #66)",
+                ["x", "y", "z"][k]
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Pack texel-space `(s, t)` into a `GFX_TEX_COORD` word: each 12.4 fixed `i16`,
+/// `s` in the low half — libnds `TEXTURE_PACK`.
+fn texcoord_pack(s: f32, t: f32) -> Result<u32, String> {
+    let q = |v: f32| -> Result<u32, String> {
+        let r = (v * 16.0).round();
+        if !(-32768.0..=32767.0).contains(&r) {
+            return Err(format!(
+                "texture coordinate {v} texels is outside the DS ±2048-texel range"
+            ));
+        }
+        Ok(r as i32 as i16 as u16 as u32)
+    };
+    Ok(q(s)? | (q(t)? << 16))
 }
 
 /// Pack four FIFO command IDs into one little-endian word (`c0` in the low byte),
@@ -509,5 +577,64 @@ mod tests {
             assert_eq!(m.words.len(), len, "{name} center={center}");
             assert_eq!(fnv(&m.words, &m.aabb), hash, "{name} center={center}");
         }
+    }
+
+    use crate::ir::Vertex;
+
+    fn tri_uv(uv: Option<[f32; 2]>) -> [Vertex; 3] {
+        let v = |p: [f32; 3]| Vertex {
+            pos: p,
+            normal: [0.0, 0.0, 1.0],
+            uv,
+        };
+        [v([0.0, 0.0, 0.0]), v([1.0, 0.0, 0.0]), v([0.0, 1.0, 0.0])]
+    }
+
+    /// Textured: per vertex TEX_COORD, NORMAL, VERTEX16. `uv` (0.5, 0.25) on a
+    /// 32×16 texture is (16, 4) texels → 12.4 fixed (0x100, 0x40).
+    #[test]
+    fn texcoord_is_packed_in_texels() {
+        let words = submesh_display_list(&[tri_uv(Some([0.5, 0.25]))], Some([32, 16])).unwrap();
+        assert_eq!(
+            words[1],
+            fifo_pack([FIFO_BEGIN, FIFO_TEX_COORD, FIFO_NORMAL, FIFO_VERTEX16])
+        );
+        assert_eq!(words[2], GL_TRIANGLES);
+        assert_eq!(words[3], 0x0040_0100);
+    }
+
+    #[test]
+    fn negative_texcoords_are_twos_complement() {
+        let words = submesh_display_list(&[tri_uv(Some([-0.5, 0.0]))], Some([16, 16])).unwrap();
+        // -8 texels → -128 in 12.4 → 0xFF80 in the low half.
+        assert_eq!(words[3], 0x0000_FF80);
+    }
+
+    /// Untextured sub-meshes encode exactly like the legacy list.
+    #[test]
+    fn untextured_submesh_matches_legacy_list() {
+        let src = std::fs::read_to_string(format!("{}/../../assets/cube.obj", env!("CARGO_MANIFEST_DIR"))).unwrap();
+        let tris = legacy_triangles(&src).unwrap();
+        assert_eq!(submesh_display_list(&tris, None).unwrap(), display_list(&tris, false).0);
+    }
+
+    #[test]
+    fn textured_vertex_without_uv_is_an_error() {
+        let err = submesh_display_list(&[tri_uv(None)], Some([8, 8])).unwrap_err();
+        assert!(err.contains("no UV"), "{err}");
+    }
+
+    #[test]
+    fn vertex_outside_pm8_is_an_error() {
+        let mut t = tri_uv(None);
+        t[1].pos[0] = 9.0;
+        let err = submesh_display_list(&[t], None).unwrap_err();
+        assert!(err.contains("±8"), "{err}");
+    }
+
+    #[test]
+    fn uv_outside_texel_range_is_an_error() {
+        let err = submesh_display_list(&[tri_uv(Some([40.0, 0.0]))], Some([256, 256])).unwrap_err();
+        assert!(err.contains("2048"), "{err}");
     }
 }
