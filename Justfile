@@ -62,7 +62,8 @@ check-editor:
 #   `panic = "unwind"` to match the test harness. `wav2bank` has no external
 #   deps, but a *clean* host build still trips the duplicate-`core` clash under
 #   the project's global `build-std`, so it rides in this group too (building
-#   `std` from source fixes it).
+#   `std` from source fixes it). `model2dsm` depends on `png`/`gltf`, which pull
+#   in real `std` the same way, so it rides in this group too.
 test *args:
     host="$(rustc -vV | sed -n 's/^host: //p')"; \
     cargo test -p bevy_nds_3d_obj -p obj2dl -p bevy_nds_3d_macros -p png2sprite -p png2bg -p perfread \
@@ -79,6 +80,7 @@ test *args:
         -p bevy_nds_collide \
         -p bevy_nds_loop \
         -p wav2bank \
+        -p model2dsm \
         -p bevy_nds_audio \
         -p bevy_nds_math \
         -p bevy_nds_cothread \

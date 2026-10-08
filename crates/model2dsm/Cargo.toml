@@ -1,0 +1,19 @@
+[package]
+name = "model2dsm"
+version = "0.1.0"
+edition = "2024"
+description = "Bakes OBJ+MTL and glTF models (with PNG textures) into DS model (.dsm) and texture (.tex) assets for NitroFS (#66)."
+
+# Host-side tool, never shipped in the ROM. Shares the geometry encoder in
+# `bevy_nds_3d_obj` (one source of truth for display-list packing) and adds the
+# glTF front-end, the PNG -> DS texture encoder and the .dsm container.
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+bevy_nds_3d_obj = { path = "../bevy_nds_3d_obj" }
+png = "0.18"
+# Static-mesh reading only: no `import` (it drags in the `image` crate) — the
+# front-end resolves buffers and PNG bytes itself.
+gltf = { version = "1.4", default-features = false, features = ["utils", "names"] }

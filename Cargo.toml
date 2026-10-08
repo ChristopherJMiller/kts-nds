@@ -14,6 +14,7 @@ members = [
   "crates/bevy_nds_3d_macros",
   "crates/bevy_nds_3d_obj",
   "crates/obj2dl",
+  "crates/model2dsm",
   "crates/bevy_nds_3d_cull",
   "crates/bevy_nds_loop",
   "crates/wav2bank",
