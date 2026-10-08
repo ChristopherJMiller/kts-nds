@@ -13,6 +13,7 @@ use std::path::{Component, Path, PathBuf};
 use bevy_nds_3d_obj::ir::{SourceModel, TextureSrc};
 use bevy_nds_3d_obj::obj::{ObjOptions, parse_obj};
 
+pub mod catalog;
 pub mod dsm;
 pub mod gltf_src;
 pub mod texture;
