@@ -1087,6 +1087,7 @@ version = "0.1.0"
 dependencies = [
  "bevy_nds_scene",
  "kts_schema",
+ "model2dsm",
  "ron",
  "serde",
 ]

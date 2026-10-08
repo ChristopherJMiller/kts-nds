@@ -12,7 +12,7 @@ use scene2bin::{Camera, Instance, Level, Material, Placement, Prefab, PrefabLib,
 
 use crate::history::History;
 use crate::viewport::OrbitCam;
-use crate::widgets::{MeshThumb, build_thumb, empty_level, stems};
+use crate::widgets::{MeshThumb, build_thumb, empty_level};
 
 /// Which view fills the central panel: the top-down layout canvas or the 3D
 /// preview viewport (#40).
@@ -211,7 +211,8 @@ impl EditorApp {
 
     /// Refresh the mesh + prefab libraries from disk (for the pickers).
     pub(crate) fn rescan(&mut self) {
-        self.meshes = stems(&self.assets_dir, "obj");
+        // Legacy `assets/*.obj` + every `assets/models/**` model (#66).
+        self.meshes = scene2bin::mesh_names(std::path::Path::new(&self.assets_dir));
         self.prefabs =
             scene2bin::load_prefab_lib(std::path::Path::new(&self.prefabs_dir)).unwrap_or_default();
         // Drop cached previews so edited `.obj` files re-parse on next draw.

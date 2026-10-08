@@ -35,6 +35,14 @@ pub use kts_schema as schema;
 
 use kts_schema::{Consumption, Role, flag_bits, flag_ids, kind_from_str};
 
+pub use model2dsm::catalog::{Catalog, MeshEntry, TexUse};
+
+/// Every mesh name under `assets_dir` (legacy `assets/*.obj` + `assets/models/**`)
+/// without loading any model — for the editor's mesh picker (#66).
+pub fn mesh_names(assets_dir: &Path) -> Vec<String> {
+    model2dsm::catalog::mesh_names(assets_dir)
+}
+
 /// ASCII `"BSC1"` — magic prefix of a baked `.scene` file. Matches
 /// `bevy_nds_scene::asset::MAGIC`.
 pub const ASSET_MAGIC: u32 = u32::from_le_bytes(*b"BSC1");
@@ -626,7 +634,8 @@ fn role_names() -> String {
 /// refuses to save, `--check` exits non-zero).
 ///
 /// `zones` is the assembled level (see [`assemble`]); `mesh_exists` reports
-/// whether a referenced mesh has a source `.obj`.
+/// whether a referenced mesh exists (existence only — the texture budget needs
+/// [`validate_all_with_catalog`]).
 ///
 /// Later work appends rules here rather than adding a second validator.
 pub fn validate_all(
@@ -634,12 +643,52 @@ pub fn validate_all(
     zones: &[(String, Space)],
     mesh_exists: impl Fn(&str) -> bool,
 ) -> Vec<Issue> {
+    validate_with(level, zones, &ExistsOnly(mesh_exists))
+}
+
+/// [`validate_all`] plus the rules that need to know what meshes *contain* — the
+/// per-level texture budget (#66). The bake and `--check` use this.
+pub fn validate_all_with_catalog(level: &Level, zones: &[(String, Space)], catalog: &Catalog) -> Vec<Issue> {
+    validate_with(level, zones, catalog)
+}
+
+fn validate_with(level: &Level, zones: &[(String, Space)], meshes: &impl MeshLookup) -> Vec<Issue> {
     let mut out = Vec::new();
     for (stem, space) in zones {
-        validate_zone(stem, space, &mesh_exists, &mut out);
+        validate_zone(stem, space, meshes, &mut out);
     }
     validate_level(level, zones, &mut out);
+    validate_textures(zones, meshes, &mut out);
     out
+}
+
+/// What the validator needs to know about mesh names. Private: callers pick an
+/// entry point — [`validate_all`] (existence only) or
+/// [`validate_all_with_catalog`] (existence + texture costs).
+trait MeshLookup {
+    fn exists(&self, mesh: &str) -> bool;
+    fn textures(&self, mesh: &str) -> &[TexUse];
+}
+
+/// An existence-only lookup over a plain predicate (the editor's and the tests' form).
+struct ExistsOnly<F>(F);
+
+impl<F: Fn(&str) -> bool> MeshLookup for ExistsOnly<F> {
+    fn exists(&self, mesh: &str) -> bool {
+        (self.0)(mesh)
+    }
+    fn textures(&self, _mesh: &str) -> &[TexUse] {
+        &[]
+    }
+}
+
+impl MeshLookup for Catalog {
+    fn exists(&self, mesh: &str) -> bool {
+        self.contains(mesh)
+    }
+    fn textures(&self, mesh: &str) -> &[TexUse] {
+        Catalog::textures(self, mesh)
+    }
 }
 
 /// Instance- and zone-scoped rules for a single zone. Private so [`validate_all`]
@@ -648,7 +697,7 @@ pub fn validate_all(
 fn validate_zone(
     stem: &str,
     space: &Space,
-    mesh_exists: &impl Fn(&str) -> bool,
+    meshes: &impl MeshLookup,
     out: &mut Vec<Issue>,
 ) {
     // Per-role tally of Scenery-consumption instances, aggregated into one
@@ -784,12 +833,12 @@ fn validate_zone(
         }
 
         if let Some(mesh) = &inst.mesh {
-            if !mesh_exists(mesh) {
+            if !meshes.exists(mesh) {
                 out.push(Issue::error(
                     stem,
                     Some(i),
                     format!(
-                        "(role `{}`): mesh `{mesh}` has no source `{mesh}.obj`",
+                        "(role `{}`): mesh `{mesh}` has no source model — expected `assets/{mesh}.obj` or `assets/models/{mesh}.obj` / `.gltf` / `.glb`",
                         inst.role
                     ),
                 ));
@@ -943,6 +992,53 @@ fn validate_level(level: &Level, zones: &[(String, Space)], out: &mut Vec<Issue>
     }
 }
 
+/// Level-scope texture budget (#66): a level's whole texture set is resident
+/// from boot, so every distinct texture any instance's mesh uses must fit,
+/// together, in the texture VRAM (banks B + D) and the palette VRAM (bank F).
+fn validate_textures(zones: &[(String, Space)], meshes: &impl MeshLookup, out: &mut Vec<Issue>) {
+    let mut seen: std::collections::BTreeMap<&str, &TexUse> = std::collections::BTreeMap::new();
+    for (_, space) in zones {
+        for inst in &space.instances {
+            if let Some(m) = &inst.mesh {
+                for t in meshes.textures(m) {
+                    seen.entry(t.key.as_str()).or_insert(t);
+                }
+            }
+        }
+    }
+    let kb = |b: u32| format!("{:.1} KB", b as f32 / 1024.0);
+    let texels: u32 = seen.values().map(|t| t.texel_bytes).sum();
+    let palettes: u32 = seen.values().map(|t| t.palette_bytes).sum();
+    if texels > model2dsm::TEXTURE_VRAM_BYTES {
+        let mut largest: Vec<&TexUse> = seen.values().copied().collect();
+        largest.sort_by(|a, b| b.texel_bytes.cmp(&a.texel_bytes).then(a.key.cmp(&b.key)));
+        let top: Vec<String> = largest.iter().take(3).map(|t| format!("{} ({})", t.key, kb(t.texel_bytes))).collect();
+        out.push(Issue {
+            zone: None,
+            instance: None,
+            severity: Severity::Error,
+            msg: format!(
+                "textures need {} of texture VRAM; a level has {} (banks B + D, #66). Largest: {}",
+                kb(texels),
+                kb(model2dsm::TEXTURE_VRAM_BYTES),
+                top.join(", ")
+            ),
+        });
+    }
+    if palettes > model2dsm::PALETTE_VRAM_BYTES {
+        out.push(Issue {
+            zone: None,
+            instance: None,
+            severity: Severity::Error,
+            msg: format!(
+                "texture palettes need {} of palette VRAM; a level has {} (bank F, #66) — use fewer colours per texture",
+                kb(palettes),
+                kb(model2dsm::PALETTE_VRAM_BYTES)
+            ),
+        });
+    }
+}
+
 /// `"OBJECTIVE, LEVEL_OBJECTIVE"` — every defined instance-flag bit.
 fn flag_bit_names() -> String {
     flag_bits::NAMED
@@ -975,7 +1071,7 @@ fn named_bits(mask: u32) -> String {
 /// every finding at once.
 pub fn validate(space: &Space, mesh_exists: impl Fn(&str) -> bool) -> Result<(), String> {
     let mut issues = Vec::new();
-    validate_zone("", space, &mesh_exists, &mut issues);
+    validate_zone("", space, &ExistsOnly(mesh_exists), &mut issues);
     match issues.iter().find(|i| i.severity == Severity::Error) {
         Some(e) => Err(match e.instance {
             Some(i) => format!("instance {i}: {}", e.msg),
@@ -1251,17 +1347,18 @@ fn load_levels_dir(levels_root: &Path, prefab_dir: &Path) -> Result<Vec<LoadedLe
 /// anything**, returning every [`Issue`] from every level (the `scene2bin
 /// --check` / `just check-levels` path). Parse-level failures — malformed RON, a
 /// missing content file, an unknown prefab — still surface as `Err`, since
-/// there's nothing to validate then. `assets_dir` is the geometry root used to
-/// check referenced meshes; `prefab_dir` holds the prefab library.
+/// there's nothing to validate then. `assets_dir` is the geometry root; its
+/// legacy `*.obj` and `models/**` are scanned into a [`Catalog`] for mesh
+/// existence and the texture budget.
 pub fn validate_levels_dir(
     levels_root: &Path,
     assets_dir: &Path,
     prefab_dir: &Path,
 ) -> Result<Vec<Issue>, String> {
-    let mesh_exists = |name: &str| assets_dir.join(format!("{name}.obj")).is_file();
+    let catalog = Catalog::scan(assets_dir)?;
     let mut out = Vec::new();
     for lv in load_levels_dir(levels_root, prefab_dir)? {
-        out.extend(validate_all(&lv.level, &lv.zones, mesh_exists));
+        out.extend(validate_all_with_catalog(&lv.level, &lv.zones, &catalog));
     }
     Ok(out)
 }
@@ -1269,17 +1366,18 @@ pub fn validate_levels_dir(
 /// Bake every level directory under `levels_root` into
 /// `<dst_root>/<level>/<zone>.scene`. A *level directory* is any immediate
 /// subdirectory containing a [`MANIFEST_NAME`] manifest. `assets_dir` is the
-/// geometry root (`assets/`) used to validate referenced meshes have a source
-/// `.obj`; `prefab_dir` holds the shared [`Prefab`] library. Returns the
-/// compiled zones (with any warnings) so a `build.rs` can emit
-/// `rerun-if-changed` + `cargo:warning=` lines.
+/// geometry root; its legacy `*.obj` and `models/**` are scanned into a
+/// [`Catalog`] for mesh existence and the texture budget; `prefab_dir` holds
+/// the shared [`Prefab`] library. Returns the compiled zones (with any
+/// warnings) so a `build.rs` can emit `rerun-if-changed` + `cargo:warning=`
+/// lines.
 pub fn build_levels_dir(
     levels_root: &Path,
     dst_root: &Path,
     assets_dir: &Path,
     prefab_dir: &Path,
 ) -> Result<Vec<Built>, String> {
-    let mesh_exists = |name: &str| assets_dir.join(format!("{name}.obj")).is_file();
+    let catalog = Catalog::scan(assets_dir)?;
 
     let mut built = Vec::new();
     for LoadedLevel {
@@ -1293,7 +1391,7 @@ pub fn build_levels_dir(
         // One non-short-circuiting pass over the whole level (#27): every Error
         // is reported at once, named by zone + instance index, so an author fixes
         // the level in a single round trip. Warnings ride through onto `Built`.
-        let issues = validate_all(&level, &zones, mesh_exists);
+        let issues = validate_all_with_catalog(&level, &zones, &catalog);
         let errors: Vec<String> = issues
             .iter()
             .filter(|i| i.severity == Severity::Error)
@@ -2343,6 +2441,89 @@ mod tests {
         let warns = warnings(&issues);
         assert_eq!(warns.len(), 1, "{issues:#?}");
         assert!(warns[0].msg.contains("OBJECTIVE"), "{}", warns[0].msg);
+    }
+
+    fn prop(mesh: &str) -> Instance {
+        let mut i = inst("prop");
+        i.mesh = Some(mesh.to_string());
+        i
+    }
+
+    /// A catalogue where each listed mesh uses the given textures.
+    fn catalog(entries: &[(&str, Vec<TexUse>)]) -> Catalog {
+        Catalog {
+            meshes: entries
+                .iter()
+                .map(|(n, t)| {
+                    (
+                        n.to_string(),
+                        MeshEntry { source: std::path::PathBuf::from(format!("{n}.obj")), textures: t.clone() },
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    fn tex(key: &str, kb: u32) -> TexUse {
+        TexUse { key: key.to_string(), texel_bytes: kb * 1024, palette_bytes: 32 }
+    }
+
+    fn texture_errors(issues: &[Issue]) -> Vec<&Issue> {
+        issues
+            .iter()
+            .filter(|i| i.severity == Severity::Error && (i.msg.contains("texture") || i.msg.contains("palette")))
+            .collect()
+    }
+
+    #[test]
+    fn texture_budget_counts_shared_textures_once() {
+        let cat = catalog(&[("a", vec![tex("shared.png", 200)]), ("b", vec![tex("shared.png", 200)])]);
+        let (level, zones) =
+            one_zone_level("atrium", with_instances(std::vec![inst("avatar"), prop("a"), prop("b")]));
+        let issues = validate_all_with_catalog(&level, &zones, &cat);
+        assert!(texture_errors(&issues).is_empty(), "{issues:#?}");
+    }
+
+    #[test]
+    fn texture_budget_over_256_kb_is_a_level_error() {
+        let cat = catalog(&[("a", vec![tex("a.png", 200)]), ("b", vec![tex("b.png", 100)])]);
+        let (level, zones) =
+            one_zone_level("atrium", with_instances(std::vec![inst("avatar"), prop("a"), prop("b")]));
+        let issues = validate_all_with_catalog(&level, &zones, &cat);
+        let errs = texture_errors(&issues);
+        assert_eq!(errs.len(), 1, "{issues:#?}");
+        assert_eq!(errs[0].zone, None);
+        assert!(errs[0].msg.contains("300.0 KB"), "{}", errs[0].msg);
+        assert!(errs[0].msg.contains("a.png (200.0 KB)"), "{}", errs[0].msg);
+    }
+
+    #[test]
+    fn palette_budget_over_16_kb_is_a_level_error() {
+        let entries: Vec<(String, Vec<TexUse>)> = (0..33)
+            .map(|i| {
+                (
+                    format!("m{i}"),
+                    vec![TexUse { key: format!("t{i}.png"), texel_bytes: 64, palette_bytes: 512 }],
+                )
+            })
+            .collect();
+        let refs: Vec<(&str, Vec<TexUse>)> = entries.iter().map(|(n, t)| (n.as_str(), t.clone())).collect();
+        let cat = catalog(&refs);
+        let mut instances = std::vec![inst("avatar")];
+        instances.extend(entries.iter().map(|(n, _)| prop(n)));
+        let (level, zones) = one_zone_level("atrium", with_instances(instances));
+        let issues = validate_all_with_catalog(&level, &zones, &cat);
+        let errs = texture_errors(&issues);
+        assert_eq!(errs.len(), 1, "{issues:#?}");
+        assert!(errs[0].msg.contains("palette"), "{}", errs[0].msg);
+    }
+
+    #[test]
+    fn catalog_validation_reports_unknown_meshes() {
+        let cat = catalog(&[]);
+        let (level, zones) = one_zone_level("atrium", with_instances(std::vec![inst("avatar"), prop("ghost")]));
+        let issues = validate_all_with_catalog(&level, &zones, &cat);
+        assert!(errors(&issues).iter().any(|i| i.msg.contains("ghost.obj")), "{issues:#?}");
     }
 
     #[test]

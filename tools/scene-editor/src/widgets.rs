@@ -464,23 +464,6 @@ pub(crate) fn placement_label(p: &Placement, prefabs: &PrefabLib) -> String {
     }
 }
 
-/// List the file stems with `ext` under `dir`, sorted.
-pub(crate) fn stems(dir: &str, ext: &str) -> Vec<String> {
-    let mut out: Vec<String> = std::fs::read_dir(dir)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter_map(|e| {
-            let p = e.path();
-            (p.extension().and_then(|x| x.to_str()) == Some(ext))
-                .then(|| p.file_stem().and_then(|s| s.to_str()).map(String::from))
-                .flatten()
-        })
-        .collect();
-    out.sort();
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

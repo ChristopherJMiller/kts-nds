@@ -29,6 +29,9 @@ ron = "0.8"
 # re-exported as `scene2bin::schema` — the single access edge the detached
 # desktop editor reads it through, so the editor adds no dependency of its own.
 kts_schema = { path = "../kts_schema" }
+# Mesh-name catalogue + texture costs for the per-level texture budget (#66);
+# its `mesh_names` also feeds the detached editor's mesh picker through us.
+model2dsm = { path = "../model2dsm" }
 
 [dev-dependencies]
 # The true writer<->reader cross-check: `encode` here must round-trip through
