@@ -174,6 +174,19 @@ pub fn decode_png_rgba(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>), String> {
     let mut reader = dec
         .read_info()
         .map_err(|e| format!("not a readable PNG: {e}"))?;
+    // Check the size against the authoring contract from the header alone,
+    // before allocating a frame buffer for it — a huge PNG (e.g. a forgotten
+    // 4096×4096 source) would otherwise be fully decoded first just to be
+    // rejected.
+    let (width, height) = {
+        let info = reader.info();
+        (info.width, info.height)
+    };
+    if !SIZES.contains(&width) || !SIZES.contains(&height) {
+        return Err(format!(
+            "texture is {width}×{height}; each side must be a power of two from 8 to 256 (authoring contract v1, #66)"
+        ));
+    }
     let size = reader
         .output_buffer_size()
         .ok_or("PNG is too large to decode")?;
@@ -377,6 +390,17 @@ mod tests {
             encode_png(&png(8, 8, ::png::ColorType::Grayscale, &g, None)).unwrap(),
             encode_rgba(8, 8, &grey).unwrap()
         );
+    }
+
+    #[test]
+    fn huge_non_power_of_two_png_is_rejected_before_full_decode() {
+        // 512×8: not a power-of-two-from-8-to-256 width. If this were fully
+        // decoded first, a genuinely huge image would be slow to reject; the
+        // header-only check must catch it immediately.
+        let rgb = vec![0u8; 512 * 8 * 3];
+        let bytes = png(512, 8, ::png::ColorType::Rgb, &rgb, None);
+        let err = decode_png_rgba(&bytes).unwrap_err();
+        assert!(err.contains("power of two"), "{err}");
     }
 
     #[test]

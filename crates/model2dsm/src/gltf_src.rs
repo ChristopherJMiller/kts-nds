@@ -51,7 +51,7 @@ pub fn parse_gltf(
             gltf::buffer::Source::Uri(uri) if uri.starts_with("data:") => {
                 return Err(DATA_URI_ERR.into());
             }
-            gltf::buffer::Source::Uri(uri) => read_uri(uri)?,
+            gltf::buffer::Source::Uri(uri) => read_uri(&percent_decode(uri)?)?,
         });
     }
 
@@ -78,7 +78,7 @@ pub fn parse_gltf(
             gltf::image::Source::Uri { uri, .. } if uri.starts_with("data:") => {
                 return Err(DATA_URI_ERR.into());
             }
-            gltf::image::Source::Uri { uri, .. } => TextureSrc::File(uri.to_string()),
+            gltf::image::Source::Uri { uri, .. } => TextureSrc::File(percent_decode(uri)?),
         });
     }
 
@@ -285,18 +285,45 @@ fn apply3(n: &[[f32; 3]; 3], v: [f32; 3]) -> [f32; 3] {
     [0, 1, 2].map(|r| n[r][0] * v[0] + n[r][1] * v[1] + n[r][2] * v[2])
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use bevy_nds_3d_obj::ir::{TextureSrc, Wrap};
+/// Percent-decode a glTF URI (`%XX` → byte). Buffer/image URIs are
+/// percent-encoded by spec (Blender writes `Wooden%20Crate.bin`), so a file
+/// name with spaces or other reserved characters round-trips correctly. A
+/// URI with no `%` passes through unchanged; a malformed escape (not two hex
+/// digits, or decoding to invalid UTF-8) is an `Err` naming the URI.
+fn percent_decode(uri: &str) -> Result<String, String> {
+    let bytes = uri.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = bytes
+                .get(i + 1..i + 3)
+                .and_then(|h| std::str::from_utf8(h).ok())
+                .ok_or_else(|| format!("malformed percent-escape in URI `{uri}`"))?;
+            let byte = u8::from_str_radix(hex, 16)
+                .map_err(|_| format!("malformed percent-escape in URI `{uri}`"))?;
+            out.push(byte);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).map_err(|_| format!("URI `{uri}` decodes to invalid UTF-8"))
+}
 
+/// Test-only GLB fixture builders. `pub(crate)` (rather than private to
+/// `mod tests` below) so `model2dsm::lib`'s tests can reuse the same builder
+/// for its own embedded-texture fixtures (#66) instead of duplicating it.
+#[cfg(test)]
+pub(crate) mod fixtures {
     fn f32s(v: &[f32]) -> Vec<u8> {
         v.iter().flat_map(|x| x.to_le_bytes()).collect()
     }
 
     /// A GLB holding one triangle (0,0,0) (1,0,0) (0,1,0) under one node whose
     /// transform JSON is `node`, with an embedded PNG texture.
-    fn one_triangle_glb(node: &str, with_normals: bool, png: &[u8]) -> Vec<u8> {
+    pub(crate) fn one_triangle_glb(node: &str, with_normals: bool, png: &[u8]) -> Vec<u8> {
         let mut bin = Vec::new();
         bin.extend(f32s(&[0., 0., 0., 1., 0., 0., 0., 1., 0.])); // 0..36  POSITION
         bin.extend(f32s(&[0., 0., 1., 0., 0., 1., 0., 0., 1.])); // 36..72 NORMAL
@@ -341,7 +368,8 @@ mod tests {
         glb(&json, &bin)
     }
 
-    fn glb(json: &str, bin: &[u8]) -> Vec<u8> {
+    /// Pack a JSON chunk + a binary chunk into a `.glb` container.
+    pub(crate) fn glb(json: &str, bin: &[u8]) -> Vec<u8> {
         let mut j = json.as_bytes().to_vec();
         while j.len() % 4 != 0 {
             j.push(b' ');
@@ -363,6 +391,13 @@ mod tests {
         out.extend_from_slice(&b);
         out
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fixtures::{glb, one_triangle_glb};
+    use super::*;
+    use bevy_nds_3d_obj::ir::{TextureSrc, Wrap};
 
     fn no_files(uri: &str) -> Result<Vec<u8>, String> {
         Err(format!("unexpected external file {uri}"))
@@ -428,6 +463,49 @@ mod tests {
                 .iter()
                 .all(|v| v.normal == [0.0, 0.0, 1.0])
         );
+    }
+
+    #[test]
+    fn parent_child_transforms_compose() {
+        // Node 0 (the scene's only listed root) translates by (1,0,0) and has
+        // node 1 as a child; node 1 holds the mesh and translates by (0,2,0).
+        // The mesh's world transform must be the *composition* of both, not
+        // just its own local translation.
+        let pos: Vec<u8> = [0f32, 0., 0., 1., 0., 0., 0., 1., 0.]
+            .iter()
+            .flat_map(|x| x.to_le_bytes())
+            .collect();
+        let json = r#"{
+          "asset": {"version": "2.0"},
+          "scene": 0,
+          "scenes": [{"nodes": [0]}],
+          "nodes": [
+            {"translation": [1.0, 0.0, 0.0], "children": [1]},
+            {"translation": [0.0, 2.0, 0.0], "mesh": 0}
+          ],
+          "meshes": [{"primitives": [{"attributes": {"POSITION": 0}}]}],
+          "buffers": [{"byteLength": BUFLEN}],
+          "bufferViews": [{"buffer": 0, "byteOffset": 0, "byteLength": 36}],
+          "accessors": [
+            {"bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3", "min": [0, 0, 0], "max": [1, 1, 0]}
+          ]
+        }"#
+        .replace("BUFLEN", &pos.len().to_string());
+        let m = parse_gltf(&glb(&json, &pos), &no_files).unwrap();
+        assert_eq!(m.submeshes.len(), 1);
+        let t = m.submeshes[0].tris[0];
+        assert_eq!(t[0].pos, [1.0, 2.0, 0.0]);
+    }
+
+    #[test]
+    fn percent_decode_handles_escapes_and_passthrough() {
+        assert_eq!(
+            percent_decode("Wooden%20Crate.bin").unwrap(),
+            "Wooden Crate.bin"
+        );
+        assert_eq!(percent_decode("plain.png").unwrap(), "plain.png");
+        let err = percent_decode("bad%G1.png").unwrap_err();
+        assert!(err.contains("bad%G1.png"), "{err}");
     }
 
     #[test]

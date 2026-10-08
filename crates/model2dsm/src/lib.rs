@@ -125,9 +125,13 @@ pub struct ResolvedTexture {
     pub png: Vec<u8>,
 }
 
-/// Resolve each sub-mesh's texture for model `rel` under `root` (one entry per
-/// sub-mesh, `None` when untextured). File textures are keyed by their path
-/// relative to `root`; embedded ones by `"<model rel path>#<image index>"`.
+/// Resolve each sub-mesh's texture for model `rel` under `root` (one entry
+/// per sub-mesh, `None` when untextured, and also `None` for a sub-mesh with
+/// no triangles — a declared-but-unused material shouldn't bake or budget
+/// its texture, #66). File textures are keyed by their path relative to
+/// `root`; embedded ones by the content hash of their PNG bytes
+/// (`_embedded/<16-hex FNV-1a-64>`), so two models embedding byte-identical
+/// images share one bake and one budget entry — the key is model-independent.
 pub fn resolve_textures(
     root: &Path,
     rel: &Path,
@@ -136,50 +140,70 @@ pub fn resolve_textures(
     model
         .submeshes
         .iter()
-        .map(|s| match &s.material.texture {
-            None => Ok(None),
-            Some(TextureSrc::File(uri)) => {
-                let joined = rel.parent().unwrap_or(Path::new("")).join(uri);
-                let key_rel = normalize_rel(&joined).ok_or_else(|| {
-                    format!(
-                        "material `{}`: texture `{uri}` points outside {}",
-                        s.material.name,
-                        root.display()
-                    )
-                })?;
-                let source = root.join(&key_rel);
-                let png = std::fs::read(&source).map_err(|e| {
-                    format!(
-                        "material `{}`: could not read texture {}: {e}",
-                        s.material.name,
-                        source.display()
-                    )
-                })?;
-                Ok(Some(ResolvedTexture {
-                    key: slash(&key_rel),
-                    source,
-                    png,
-                }))
+        .map(|s| {
+            if s.tris.is_empty() {
+                return Ok(None);
             }
-            Some(TextureSrc::Embedded(i)) => {
-                let png = model
-                    .images
-                    .get(*i)
-                    .ok_or_else(|| {
+            match &s.material.texture {
+                None => Ok(None),
+                Some(TextureSrc::File(uri)) => {
+                    let joined = rel.parent().unwrap_or(Path::new("")).join(uri);
+                    let key_rel = normalize_rel(&joined).ok_or_else(|| {
                         format!(
-                            "material `{}`: embedded image {i} is missing",
-                            s.material.name
+                            "material `{}`: texture `{uri}` points outside {}",
+                            s.material.name,
+                            root.display()
                         )
-                    })?
-                    .clone();
-                Ok(Some(ResolvedTexture {
-                    key: format!("{}#{i}", slash(rel)),
-                    source: root.join(rel),
-                    png,
-                }))
+                    })?;
+                    let source = root.join(&key_rel);
+                    let png = std::fs::read(&source).map_err(|e| {
+                        format!(
+                            "material `{}`: could not read texture {}: {e}",
+                            s.material.name,
+                            source.display()
+                        )
+                    })?;
+                    Ok(Some(ResolvedTexture {
+                        key: slash(&key_rel),
+                        source,
+                        png,
+                    }))
+                }
+                Some(TextureSrc::Embedded(i)) => {
+                    let png = model
+                        .images
+                        .get(*i)
+                        .ok_or_else(|| {
+                            format!(
+                                "material `{}`: embedded image {i} is missing",
+                                s.material.name
+                            )
+                        })?
+                        .clone();
+                    let key = format!("_embedded/{:016x}", fnv1a64(&png));
+                    Ok(Some(ResolvedTexture {
+                        key,
+                        source: root.join(rel),
+                        png,
+                    }))
+                }
             }
         })
         .collect()
+}
+
+/// FNV-1a, 64-bit (offset basis `0xcbf29ce484222325`, prime
+/// `0x100000001b3`): a fast, dependency-free content hash used to key
+/// embedded images by their bytes rather than by which model embedded them
+/// (#66). Not cryptographic — collision resistance isn't the point, content
+/// addressing is.
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for &b in bytes {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
 }
 
 /// Lexically resolve `.` / `..` in a relative path; `None` if it escapes.
@@ -200,14 +224,11 @@ fn normalize_rel(p: &Path) -> Option<PathBuf> {
     Some(out)
 }
 
-/// The `.tex` path (relative to the models output root) a texture key bakes to:
-/// `props/crate.png` → `props/crate.tex`; `props/barrel.glb#0` →
-/// `props/barrel.glb.0.tex`.
+/// The `.tex` path (relative to the models output root) a texture key bakes
+/// to: `props/crate.png` → `props/crate.tex`; an embedded image's
+/// content-hash key `_embedded/<hash>` → `_embedded/<hash>.tex`.
 pub fn tex_out_rel(key: &str) -> String {
-    match key.split_once('#') {
-        Some((model, i)) => format!("{model}.{i}.{TEX_EXT}"),
-        None => slash(&Path::new(key).with_extension(TEX_EXT)),
-    }
+    slash(&Path::new(key).with_extension(TEX_EXT))
 }
 
 /// The NitroFS path a texture key is loaded from at runtime.
@@ -438,7 +459,10 @@ mod tests {
     #[test]
     fn tex_out_paths() {
         assert_eq!(tex_out_rel("props/crate.png"), "props/crate.tex");
-        assert_eq!(tex_out_rel("props/barrel.glb#0"), "props/barrel.glb.0.tex");
+        assert_eq!(
+            tex_out_rel("_embedded/0123456789abcdef"),
+            "_embedded/0123456789abcdef.tex"
+        );
         assert_eq!(
             nitro_tex_path("props/crate.png"),
             "nitro:/models/props/crate.tex"
@@ -494,6 +518,30 @@ mod tests {
     }
 
     #[test]
+    fn identical_embedded_images_across_glb_models_bake_once() {
+        // Two separate .glb models, each embedding byte-identical PNG bytes:
+        // the content-hash key must make them share one bake and one budget
+        // entry, exactly like two OBJs sharing a file texture (#66).
+        use crate::gltf_src::fixtures::one_triangle_glb;
+        let root = temp_dir("embedded-shared");
+        let src = root.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let glb_bytes = one_triangle_glb(r#""name": "n""#, true, &png_bytes());
+        std::fs::write(src.join("a.glb"), &glb_bytes).unwrap();
+        std::fs::write(src.join("b.glb"), &glb_bytes).unwrap();
+
+        let built = build_dir(&src, &root.join("out")).unwrap();
+        assert_eq!(built.models.len(), 2);
+        assert_eq!(built.textures.len(), 1, "{:?}", built.textures);
+        assert!(
+            built.textures[0].key.starts_with("_embedded/"),
+            "{}",
+            built.textures[0].key
+        );
+        assert_eq!(built.models[0].textures, built.models[1].textures);
+    }
+
+    #[test]
     fn duplicate_model_names_are_an_error() {
         let root = temp_dir("dup");
         write_quad(&root, "crate", "crate.png");
@@ -535,6 +583,38 @@ mod tests {
             built.warnings[0].contains("501 triangles"),
             "{}",
             built.warnings[0]
+        );
+    }
+
+    #[test]
+    fn material_with_no_faces_does_not_bake_or_budget_its_texture() {
+        // `usemtl skin` switches the current material but is immediately
+        // followed by `usemtl bare` before any face uses it — the `skin`
+        // sub-mesh exists (declared) but is empty. Its texture must not be
+        // baked or counted in the level's texture budget (#66).
+        let root = temp_dir("unused-mat");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("thing.obj"),
+            "mtllib thing.mtl\n\
+             v 0 0 0\nv 1 0 0\nv 0 1 0\n\
+             usemtl skin\nusemtl bare\nf 1 2 3\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("thing.mtl"),
+            "newmtl skin\nKd 1 1 1\nmap_Kd skin.png\nnewmtl bare\nKd 1 1 1\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("skin.png"), png_bytes()).unwrap();
+
+        let built = build_dir(&root, &root.join("out")).unwrap();
+        assert_eq!(built.models.len(), 1);
+        assert!(built.textures.is_empty(), "{:?}", built.textures);
+        assert!(
+            built.models[0].textures.is_empty(),
+            "{:?}",
+            built.models[0].textures
         );
     }
 }

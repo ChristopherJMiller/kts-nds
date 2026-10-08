@@ -44,7 +44,7 @@ pub fn wrap_bits(w: Wrap) -> u8 {
 /// | 28 | `u16` | texture count T |
 /// | 30 | `u16` | sub-mesh count S |
 /// | 32 | T × | `u16` path length incl. NUL, `u16` 0, path bytes + NUL, zero-pad to 4 |
-/// | … | S × | `u16` texture index ([`NO_TEXTURE`] = none), `u8` [`wrap_bits`], `u8` 0, `u8` × 3 diffuse, `u8` × 3 ambient, `u8` × 2 0, `u32` word count N, `u32` × N display list (leading body-length word included) |
+/// | … | S × | `u16` texture index ([`NO_TEXTURE`] = none), `u8` [`wrap_bits`], `u8` reserved (0) — future per-sub-mesh flags, `u8` × 3 diffuse, `u8` × 3 ambient, `u8` × 2 reserved (0) — future per-sub-mesh flags, `u32` word count N, `u32` × N display list (leading body-length word included) |
 pub fn encode(
     model: &SourceModel,
     table: &[TexRef],
