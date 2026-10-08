@@ -3,6 +3,9 @@
 //! 1. **Compile model assets.** Bakes every `assets/*.obj` into a display-list
 //!    blob under `build/nitrofs/` (via the `obj2dl` library), which `just rom`
 //!    packs into the ROM filesystem (NitroFS) for runtime loading.
+//! 1b. **Compile textured models (#66).** Bakes `assets/models/**`
+//!    (OBJ + MTL, glTF) into `build/nitrofs/models/**.dsm` + `.tex` via
+//!    `model2dsm`.
 //! 2. **Compile audio assets.** Bakes `audio/{music,sfx}/*.wav` into
 //!    `build/nitrofs/soundbank.bin` (via the `wav2bank` library, which wraps
 //!    `mmutil`) and emits a Rust module of the sound IDs into `OUT_DIR` for the
@@ -32,6 +35,7 @@ const NITROFS_DIR: &str = "build/nitrofs";
 
 fn main() {
     compile_assets();
+    compile_models();
     compile_audio();
     compile_sprites();
     compile_backgrounds();
@@ -116,6 +120,32 @@ fn compile_assets() {
             }
         }
         Err(e) => println!("cargo:warning=asset compilation failed: {e}"),
+    }
+}
+
+/// Bake every model under `assets/models/**` (OBJ + MTL, glTF / GLB) into
+/// `build/nitrofs/models/**.dsm`, plus each PNG texture they use into `.tex`,
+/// via the `model2dsm` library (#66). Pure Rust (no external tool), so it runs
+/// identically inside or outside `nix develop`. Unlike `compile_assets`, models
+/// keep their authored origin (no recentring).
+fn compile_models() {
+    let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let src = manifest.join(ASSET_DIR).join(model2dsm::MODELS_SUBDIR);
+    let dst = manifest.join(NITROFS_DIR).join(model2dsm::MODELS_SUBDIR);
+
+    println!("cargo:rerun-if-changed={}", src.display());
+    if !src.is_dir() {
+        return;
+    }
+    match model2dsm::build_dir(&src, &dst) {
+        Ok(built) => {
+            for w in &built.warnings {
+                println!("cargo:warning={w}");
+            }
+        }
+        Err(e) => println!(
+            "cargo:warning=model baking FAILED — build/nitrofs/models holds STALE or MISSING blobs: {e}"
+        ),
     }
 }
 

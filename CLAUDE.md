@@ -110,7 +110,7 @@ invocations split by dependency shape:
    `--target $host`.
 2. The platform subcrates (`bevy_nds_diagnostics`, `bevy_nds_time`,
    `bevy_nds_input`, `bevy_nds_gesture`, `bevy_nds_text`, `bevy_nds_bg`), `bevy_nds_3d_cull`,
-   `bevy_nds_collide`, `bevy_nds_math`, `bevy_nds_cothread`, `wav2bank`, `bevy_nds_audio`,
+   `bevy_nds_collide`, `bevy_nds_math`, `bevy_nds_cothread`, `wav2bank`, `model2dsm`, `bevy_nds_audio`,
    `bevy_nds_scene`, `scene2bin`, `kts_schema` — pull in code compiled against `core`, so they
    need `std` from source (`unstable.build-std=["std","panic_unwind","proc_macro"]`)
    and `panic = "unwind"` to avoid a duplicate-`core` lang-item clash and match
@@ -189,8 +189,12 @@ they don't need (e.g. drop `bevy_nds_text` for a sprite-only game).
 
 - **`crates/bevy_nds_3d`** — hardware 3D backend (`Transform3d`, `DsMesh`,
   `Camera3d`, frustum culling, NitroFS model loading).
-- **`crates/bevy_nds_3d_obj`** — host-side OBJ → display-list encoder, the
-  single source of truth for geometry packing.
+- **`crates/bevy_nds_3d_obj`** — host-side model core: the shared **source-model
+  IR** (`ir`: sub-meshes per material, UVs top-left, raw normals), the OBJ + MTL
+  front-end (`obj`), and the display-list encoders — legacy untextured
+  (`obj_to_display_list`, byte-identical, golden-hash tested) and per-material
+  textured (`submesh_display_list`, texcoords in texels). The single source of
+  truth for geometry packing.
 - **`crates/bevy_nds_3d_macros`** — `include_obj!` proc-macro that bakes a
   display list into the ARM9 binary at compile time.
 - **`crates/bevy_nds_3d_cull`** — pure, host-testable view-frustum math.
@@ -218,6 +222,15 @@ they don't need (e.g. drop `bevy_nds_text` for a sprite-only game).
   shipped hook).
 - **`crates/obj2dl`** — host CLI + library, used by `build.rs` to bake
   `assets/*.obj` into `build/nitrofs/*.dl`.
+- **`crates/model2dsm`** — host CLI + library (#66): bakes `assets/models/**`
+  (`.obj` + `.mtl`, `.gltf` + `.bin`, `.glb`) into `build/nitrofs/models/**.dsm`
+  (sub-meshes + material table, `"DSM1"`) and each PNG texture into `.tex`
+  (`"DST1"`, paletted 2/4/8 bpp picked from the colour count). Pure Rust — the
+  glTF front-end (node transforms baked in, mirrored nodes re-wound), the PNG
+  encoder and the container all host-tested. Models keep their authored origin.
+  Its `Catalog` (mesh names → texture costs) backs `scene2bin`'s per-level
+  texture budget (256 KB texture + 16 KB palette VRAM). Writer of both formats;
+  `bevy_nds_3d` will be the reader (Plan B) — keep them in sync.
 - **`crates/bevy_nds_audio`** — maxmod (ARM7) audio backend: declarative
   `Music` resource, `PlaySfx` events.
 - **`crates/wav2bank`** — host CLI + library wrapping BlocksDS `mmutil` to bake
@@ -393,6 +406,15 @@ Two delivery paths produce **byte-identical** geometry:
   `DsMesh::load("nitro:/model.dl")` (cache-flushes before the DMA).
 
 Meshes carry a local AABB used by `bevy_nds_3d_cull` for view-frustum culling.
+
+**Textured models (#66).** Blender exports go under `assets/models/**` — OBJ +
+MTL (`map_Kd` texture) or glTF / GLB — with PNG textures next to them. Mesh
+names are the path under `assets/models/` without extension
+(`props/crate.glb` → `props/crate`). `build.rs` → `model2dsm` writes
+`build/nitrofs/models/**.dsm` + `.tex`; `scene2bin` errors when a level's
+distinct textures exceed 256 KB (or palettes 16 KB). Authoring contract v1
+(scale, axes, ±8 range, 500-triangle guide, 8–256 px power-of-two textures) is
+Locked on #66. The DS runtime that draws them is the next plan.
 
 ### Sprite pipeline
 

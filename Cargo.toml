@@ -88,6 +88,9 @@ bevy_time = { version = "0.16", default-features = false, features = [
 # build time, so they can be packed into the ROM filesystem (NitroFS) and loaded
 # at runtime. Shares the encoder with `include_obj!`, so output is identical.
 obj2dl = { path = "crates/obj2dl" }
+# Bakes `assets/models/**` (OBJ+MTL, glTF) into `build/nitrofs/models/**.dsm`
+# plus their PNG textures as `.tex` (#66); loaded at runtime by bevy_nds_3d (Plan B).
+model2dsm = { path = "crates/model2dsm" }
 # Bakes `audio/{music,sfx}/*.wav` into `build/nitrofs/soundbank.bin` (via mmutil)
 # plus a generated Rust module of the sound IDs, included by the game.
 wav2bank = { path = "crates/wav2bank" }

@@ -844,6 +844,7 @@ dependencies = [
  "bevy_time",
  "kts_schema",
  "libm",
+ "model2dsm",
  "obj2dl",
  "png2bg",
  "png2sprite",
