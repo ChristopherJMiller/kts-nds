@@ -662,7 +662,7 @@ fn validate_with(level: &Level, zones: &[(String, Space)], meshes: &impl MeshLoo
         validate_zone(stem, space, meshes, &mut out);
     }
     validate_level(level, zones, &mut out);
-    validate_textures(zones, meshes, &mut out);
+    validate_textures(level, zones, meshes, &mut out);
     out
 }
 
@@ -994,7 +994,12 @@ fn validate_level(level: &Level, zones: &[(String, Space)], out: &mut Vec<Issue>
 /// Level-scope texture budget (#66): a level's whole texture set is resident
 /// from boot, so every distinct texture any instance's mesh uses must fit,
 /// together, in the texture VRAM (banks B + D) and the palette VRAM (bank F).
-fn validate_textures(zones: &[(String, Space)], meshes: &impl MeshLookup, out: &mut Vec<Issue>) {
+fn validate_textures(
+    level: &Level,
+    zones: &[(String, Space)],
+    meshes: &impl MeshLookup,
+    out: &mut Vec<Issue>,
+) {
     let mut seen: std::collections::BTreeMap<&str, &TexUse> = std::collections::BTreeMap::new();
     for (_, space) in zones {
         for inst in &space.instances {
@@ -1021,7 +1026,8 @@ fn validate_textures(zones: &[(String, Space)], meshes: &impl MeshLookup, out: &
             instance: None,
             severity: Severity::Error,
             msg: format!(
-                "textures need {} of texture VRAM; a level has {} (banks B + D, #66). Largest: {}",
+                "level `{}`: textures need {} of texture VRAM; a level has {} (banks B + D, #66). Largest: {}",
+                level.name,
                 kb(texels),
                 kb(model2dsm::TEXTURE_VRAM_BYTES),
                 top.join(", ")
@@ -1034,7 +1040,8 @@ fn validate_textures(zones: &[(String, Space)], meshes: &impl MeshLookup, out: &
             instance: None,
             severity: Severity::Error,
             msg: format!(
-                "texture palettes need {} of palette VRAM; a level has {} (bank F, #66) — use fewer colours per texture",
+                "level `{}`: texture palettes need {} of palette VRAM; a level has {} (bank F, #66) — use fewer colours per texture",
+                level.name,
                 kb(palettes),
                 kb(model2dsm::PALETTE_VRAM_BYTES)
             ),
@@ -2516,6 +2523,7 @@ mod tests {
         let errs = texture_errors(&issues);
         assert_eq!(errs.len(), 1, "{issues:#?}");
         assert_eq!(errs[0].zone, None);
+        assert!(errs[0].msg.contains("level `T`"), "{}", errs[0].msg);
         assert!(errs[0].msg.contains("300.0 KB"), "{}", errs[0].msg);
         assert!(errs[0].msg.contains("a.png (200.0 KB)"), "{}", errs[0].msg);
     }
@@ -2546,6 +2554,7 @@ mod tests {
         let errs = texture_errors(&issues);
         assert_eq!(errs.len(), 1, "{issues:#?}");
         assert!(errs[0].msg.contains("palette"), "{}", errs[0].msg);
+        assert!(errs[0].msg.contains("level `T`"), "{}", errs[0].msg);
     }
 
     #[test]
