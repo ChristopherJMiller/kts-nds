@@ -211,8 +211,8 @@ mod tests {
     }
 
     /// `scan` runs every model under `models/` through the same `dsm::encode`
-    /// path `build_dir` uses (#66 fix round 1) — a vertex outside the DS ±8
-    /// model-space range must fail `scan`, not just a real bake.
+    /// path `build_dir` uses (#66) — a vertex outside the DS ±8 model-space
+    /// range must fail `scan`, not just a real bake.
     #[test]
     fn out_of_range_vertex_is_an_error() {
         let assets = temp_dir("badvert");

@@ -89,7 +89,7 @@ The `Justfile` is the entry point (`just --list` for everything):
   `assets/levels/` with a **non-zero exit** on any validation Error. `build.rs`
   can only `cargo:warning=` and then falls back to stale blobs, so this is the
   gate that actually fails. It also bakes every model under `assets/models/`
-  in memory (`Catalog::scan` → `model2dsm::bake_model`, #66 fix round 1), so a
+  in memory (`Catalog::scan` → `model2dsm::bake_model`, #66), so a
   model `build.rs` would fail to bake — bad geometry, not just a bad name or
   texture path — fails this gate too.
 - `just fmt` — `cargo fmt`. `clippy` is installed but not wired to a task; run
@@ -233,7 +233,7 @@ they don't need (e.g. drop `bevy_nds_text` for a sprite-only game).
   encoder and the container all host-tested. Models keep their authored origin.
   Its `Catalog` (mesh names → texture costs) backs `scene2bin`'s per-level
   texture budget (256 KB texture + 16 KB palette VRAM). Writer of both formats;
-  `bevy_nds_3d` will be the reader (Plan B) — keep them in sync.
+  `bevy_nds_3d` will be the reader (#66, not yet built) — keep them in sync.
 - **`crates/bevy_nds_audio`** — maxmod (ARM7) audio backend: declarative
   `Music` resource, `PlaySfx` events.
 - **`crates/wav2bank`** — host CLI + library wrapping BlocksDS `mmutil` to bake
@@ -417,7 +417,8 @@ names are the path under `assets/models/` without extension
 `build/nitrofs/models/**.dsm` + `.tex`; `scene2bin` errors when a level's
 distinct textures exceed 256 KB (or palettes 16 KB). Authoring contract v1
 (scale, axes, ±8 range, 500-triangle guide, 8–256 px power-of-two textures) is
-Locked on #66. The DS runtime that draws them is the next plan.
+Locked on #66. The DS runtime that draws them — `bevy_nds_3d`'s reader — is
+not yet built (#66).
 
 ### Sprite pipeline
 
